@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useLive, api } from './api';
 import { Splash } from './components/Splash';
 import { ConnectSheet } from './components/ConnectSheet';
+import { Setup } from './components/Setup';
 import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, AgentsList, Decisions, Activity } from './components/Dashboard';
 import { TokenDetail } from './components/TokenDetail';
 import { Toasts, Confetti, Recap } from './components/Overlays';
@@ -14,7 +15,7 @@ type Tab = 'home' | 'agents' | 'activity' | 'account';
 export default function App() {
   const { snap, toasts, setToasts, approvals, setApprovals, online } = useLive();
   const q = new URLSearchParams(location.search);
-  const [stage, setStage] = useState<'splash' | 'connect' | 'app'>(q.get('skip') ? 'app' : 'splash');
+  const [stage, setStage] = useState<'splash' | 'connect' | 'setup' | 'app'>(q.get('skip') ? 'app' : 'splash');
   const [tab, setTab] = useState<Tab>((q.get('tab') as Tab) || 'home');
   const [theme, setTheme] = useState<string>(q.get('theme') || localStorage.getItem('theme') || 'light');
   const [token, setToken] = useState<string | null>(q.get('token'));
@@ -24,7 +25,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('theme', theme); document.documentElement.dataset.theme = theme; document.querySelector('meta[name=theme-color]')?.setAttribute('content', theme === 'dark' ? '#000000' : '#ffffff'); }, [theme]);
   useEffect(() => { if (snap?.appName) document.title = snap.appName; }, [snap?.appName]);
   useEffect(() => { if (toasts.some((t) => t.kind === 'profit')) setFire((f) => f + 1); }, [toasts]);
-  useEffect(() => { if (snap && stage === 'app' && !snap.wallet.connected) setStage('connect'); }, [snap, stage]);
+  useEffect(() => { if (snap && stage === 'app' && !snap.wallet.connected && !q.get('skip')) setStage('connect'); }, [snap, stage]);
   // ?toast=1 replays the latest winning paper trade as a take-profit toast (for demos/screenshots)
   useEffect(() => {
     if (!q.get('toast')) return;
@@ -34,10 +35,11 @@ export default function App() {
       setToasts([{ id: 999, kind: w.pnlUsd > 0 ? 'profit' : 'fill', title: w.pnlUsd > 0 ? `Risk sold ${w.symbol} - locked the gain` : `Risk sold ${w.symbol}`, usd: w.pnlUsd, pct: w.pnlPct, symbol: w.symbol, image: w.image, text: w.reason }]);
     }).catch(() => {});
   }, []);
-  const splashDone = useCallback(() => setStage(snap?.wallet?.connected ? 'app' : 'connect'), [snap?.wallet?.connected]);
+  const splashDone = useCallback(() => setStage('connect'), []);
 
   if (stage === 'splash' || !snap) return <Splash appName={snap?.appName || 'Grok Bot'} ready={!!snap} onDone={splashDone} />;
-  if (stage === 'connect') return <div className="app-shell"><Splash appName={snap.appName} ready={false} onDone={() => {}} /><ConnectSheet snap={snap} onConnected={() => setStage('app')} /></div>;
+  if (stage === 'connect') return <div className="app-shell"><Splash appName={snap.appName} ready={false} onDone={() => {}} /><ConnectSheet snap={snap} onStart={() => setStage('setup')} /></div>;
+  if (stage === 'setup') return <div className="app-shell"><Setup snap={snap} onDone={() => setStage('app')} /></div>;
 
   const open = (m: string) => setToken(m);
   return (

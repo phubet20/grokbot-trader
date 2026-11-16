@@ -29,7 +29,7 @@ type Decision = { ts: number; side: 'BUY' | 'SELL' | 'SKIP'; symbol: string; ima
 type Pending = { id: string; side: 'buy' | 'sell'; mint: string; createdAt: number; tx: string; meta: any; signature?: string };
 
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-const fakeAddr = () => 'Paper' + Array.from(randomBytes(39), (b) => B58[b % 58]).join('');
+const fakeAddr = () => Array.from(randomBytes(43), (b) => B58[b % 58]).join('');
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
 
 export class Engine extends EventEmitter {
@@ -38,6 +38,7 @@ export class Engine extends EventEmitter {
   store: Store;
   exec: PaperExecutor;
   wallet: Wallet;
+  private previewAddr = '';
   positions: Position[];
   solPrice = 0;
   candidates = new Map<string, Candidate & { score?: number; safety?: string; seenAt: number }>();
@@ -98,7 +99,7 @@ export class Engine extends EventEmitter {
     const fresh = !this.wallet.connected || this.wallet.depositUsd === 0;
     this.wallet = {
       ...this.wallet,
-      connected: true, type: opts.type, address: opts.address || this.wallet.address || fakeAddr(), realSol,
+      connected: true, type: opts.type, address: opts.address || this.wallet.address || this.previewAddr || fakeAddr(), realSol,
       solBalance: fresh ? solBalance : this.wallet.solBalance,
       depositUsd: fresh ? solBalance * this.solPrice : this.wallet.depositUsd,
       startedAt: fresh ? Date.now() : this.wallet.startedAt,
@@ -118,7 +119,8 @@ export class Engine extends EventEmitter {
     if (opts.type === 'phantom' && opts.address) realSol = await getSolBalance(this.cfg.rpcUrl, opts.address);
     const useReal = this.mode === 'live' && opts.type === 'phantom';
     const sol = useReal ? (realSol ?? 0) : startUsd / (this.solPrice || 1);
-    return { network: 'Solana', mode: this.mode, address: opts.address || this.wallet.address || '', sol, usd: sol * this.solPrice, realSol, solPrice: this.solPrice };
+    const address = opts.address || this.wallet.address || (opts.type === 'paper' ? (this.previewAddr ||= fakeAddr()) : '');
+    return { network: 'Solana', mode: this.mode, address, sol, usd: sol * this.solPrice, realSol, solPrice: this.solPrice };
   }
   disconnect() { this.wallet.connected = false; this.wallet.running = false; this.saveWallet(); this.emitState(); }
   setRunning(r: boolean) { this.wallet.running = r; this.saveWallet(); this.log('Core', 'info', r ? 'Bot resumed' : 'Bot paused - no new trades'); this.emitState(); }

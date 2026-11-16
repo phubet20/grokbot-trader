@@ -9,9 +9,9 @@ export function Splash({ appName, onDone, ready }: { appName: string; onDone: ()
   useEffect(() => {
     const t0 = Date.now();
     const iv = setInterval(() => {
-      const v = Math.min(1, (Date.now() - t0) / 2600);
+      const v = Math.min(1, (Date.now() - t0) / 2000);
       setP(v);
-      if (v >= 1 && ready) { clearInterval(iv); setTimeout(onDone, 350); }
+      if (v >= 1 && ready) { clearInterval(iv); setTimeout(onDone, 250); }
     }, 50);
     return () => clearInterval(iv);
   }, [ready, onDone]);
