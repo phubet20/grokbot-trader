@@ -121,3 +121,13 @@ test('even slot sizing: $81 gets 10 slots, $2 uses fewer so each trade stays via
   const nFull = usableSlots(P2, 81, 8, 0.35, 10);
   assert.equal(nFull, 0);
 });
+
+test('paper $8 book can still size a trade with up to 10 slots and fee reserve', () => {
+  const P2 = { ...P, minTradeUsd: 0.25, maxPositions: 10 };
+  const reserve = reserveSol(0.0002) * 140; // ~$0.34 at $140 SOL
+  const n = usableSlots(P2, 8, 8, reserve, 0);
+  assert.ok(n >= 1, 'usable slots for $8, n=' + n + ' reserve=' + reserve.toFixed(2));
+  const size = slotSizeUsd(P2, 8, 8, reserve, 0);
+  assert.ok(size >= P2.minTradeUsd, 'size=' + size);
+  assert.equal(lowBalanceReason(8, 8, reserve, P2.minTradeUsd), null);
+});

@@ -92,7 +92,7 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
           {a.scanner.top && <div className="tiny mono row"><TokenAvatar symbol={a.scanner.top} src={a.scanner.topImage} size={14} /> top: ${a.scanner.top}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ef4444' }}>🛡</span><div><b>Safety</b><div className="muted tiny">{a.safety.lastOk ? 'Guarding' : 'Rejected'}</div></div></div>
           <div className="big-num">{a.safety.rejected}</div><div className="muted tiny">rejected · {a.safety.passed} passed</div>
-          {a.safety.lastSymbol && <div className={`tiny mono ${a.safety.lastOk ? 'pos' : 'neg'}`}>${a.safety.lastSymbol} {a.safety.last}</div>}</div>
+          {a.safety.lastSymbol && <div className={`tiny mono ${a.safety.lastOk !== false ? 'pos' : 'neg'}`}>${a.safety.lastSymbol} {a.safety.last || '—'}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#8b5cf6' }}>🧠</span><div><b>Analyst</b><div className="muted tiny">Scoring</div></div></div>
           <div className="row"><Ring v={a.analyst.lastScore || 0} /><div className="tiny"><div className="mono"><TokenAvatar symbol={a.analyst.lastSymbol} src={a.analyst.lastImage} size={14} /> ${a.analyst.lastSymbol || '—'}</div><div className="muted">bull {a.analyst.bull} / bear {a.analyst.bear}</div></div></div>
           <div className="muted tiny">score /100 · buy ≥ {snap.config.minScore}</div></div>
@@ -110,16 +110,39 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
 
 export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => void }) {
   const pos = snap.positions || [];
+  const [closing, setClosing] = useState<string | null>(null);
+  const [err, setErr] = useState('');
+  const closeOne = async (p: any, ev: { preventDefault(): void; stopPropagation(): void }) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (closing) return;
+    if (!window.confirm(`Close ${p.symbol} now? This sells 100% of this position and leaves the others open.`)) return;
+    setClosing(p.id);
+    setErr('');
+    try {
+      await api('position/close', { id: p.id }, { timeoutMs: 20000 });
+    } catch (e: any) {
+      setErr(e?.message || 'close failed');
+    } finally {
+      setClosing(null);
+    }
+  };
   if (!pos.length) return null;
   return (
-    <div className="section card">
+    <div className="section card" data-testid="open-positions">
       <div className="sec-hd"><b>Open positions</b><span className="muted small">{pos.length}/{snap.config.maxPositions}</span></div>
+      {err && <div className="tiny neg" data-testid="close-error">{err}</div>}
       {pos.map((p: any) => (
-        <button key={p.id} className="act-row" onClick={() => onOpen(p.mint)}>
-          <TokenAvatar src={p.image} symbol={p.symbol} size={30} />
-          <div className="act-mid"><b>{p.symbol}</b><div className="muted tiny">{p.stop.kind === 'trailing' ? 'trailing' : 'stop'} at {((p.stop.level / p.entryPrice - 1) * 100).toFixed(1)}% · {hm(p.openedAt)}</div></div>
-          <div className="act-right"><b>{usd(p.valueUsd)}</b><div className={`tiny ${p.pnlPct >= 0 ? 'pos' : 'neg'}`}>{pct(p.pnlPct)}</div></div>
-        </button>
+        <div key={p.id} className="act-row" data-testid={`position-row-${p.symbol}`}>
+          <button type="button" className="act-main" onClick={() => onOpen(p.mint)}>
+            <TokenAvatar src={p.image} symbol={p.symbol} size={30} />
+            <div className="act-mid"><b>{p.symbol}</b><div className="muted tiny">{p.stop?.kind === 'trailing' ? 'trailing' : 'stop'} at {((p.stop.level / p.entryPrice - 1) * 100).toFixed(1)}% · {hm(p.openedAt)}</div></div>
+            <div className="act-right"><b>{usd(p.valueUsd)}</b><div className={`tiny ${p.pnlPct >= 0 ? 'pos' : 'neg'}`}>{pct(p.pnlPct)}</div></div>
+          </button>
+          <button type="button" className="close-pos" data-testid={`close-${p.symbol}`} disabled={!!closing} onClick={(e) => closeOne(p, e)}>
+            {closing === p.id ? 'Closing…' : 'Close'}
+          </button>
+        </div>
       ))}
     </div>
   );

@@ -116,3 +116,37 @@ test('re-connecting paper with a new test balance resets the book even if price 
   assert.equal(w.connected, true);
   e.stop();
 });
+
+test('manual close sells 100% of one paper position and leaves the others', async () => {
+  const dirm = mkdtempSync(join(tmpdir(), 'gb-mc-'));
+  const cfg = { ...DEFAULTS, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const m = new ReplayMarket(1);
+  const e = new Engine(cfg, m, new Store(join(dirm, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 20 });
+  e.setRunning(false); // no new entries while we test a manual close
+  const { list } = await m.candidates();
+  const a = list[0], b = list[1];
+  const mk = (c: any, id: string) => ({
+    id, mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, openedAt: Date.now(),
+    entryPrice: c.priceUsd, qty: 1000, decimals: 6, costUsd: 2, costSol: 2 / e.solPrice,
+    peakPrice: c.priceUsd, lastPrice: c.priceUsd, score: 60, rentSol: 0.00203928,
+  });
+  e.positions.push(mk(a, 'pos-a'), mk(b, 'pos-b'));
+  e.wallet.solBalance = Math.max(0, e.wallet.solBalance - 0.01);
+  const cashBefore = e.wallet.solBalance;
+  const othersBefore = e.positions.filter((p) => p.id !== 'pos-a').map((p) => p.id);
+  const miss = await e.manualClose('does-not-exist');
+  assert.equal(miss.ok, false);
+  const r = await e.manualClose('pos-a');
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.symbol, a.symbol);
+  assert.equal(e.positions.some((p) => p.id === 'pos-a'), false);
+  assert.deepEqual(e.positions.map((p) => p.id), othersBefore);
+  assert.ok(e.wallet.solBalance > cashBefore, 'cash returned');
+  const t = e.store.trades().find((x: any) => x.id === 'pos-a');
+  assert.ok(t, 'trade recorded');
+  assert.equal(t.kind, 'manual');
+  assert.match(String(t.reason), /manual/);
+  assert.ok(Math.abs(t.pnlUsd - (t.proceedsUsd - t.costUsd)) < 1e-9);
+  e.stop();
+});

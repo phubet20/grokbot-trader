@@ -10,7 +10,7 @@ import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, isEstablished, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -19,7 +19,6 @@ import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './rende
 import { rebuildPositions } from './reconcile.ts';
 import { getPumpFeed, mergePumpOnto } from './pump.ts';
 import { AutoTune, patternKey } from './autotune.ts';
-import { smcFromTimeframes } from './smc.ts';
 import { dailyNarrative, narrativeBoost, type Narrative } from './narrative.ts';
 
 export type Wallet = {
@@ -100,7 +99,6 @@ export class Engine extends EventEmitter {
   private narrative: Narrative | null = null;
   private solDayOpen = 0;
   private uni = { scannedNew: 0, scannedTrending: 0, enteredNew: 0, enteredTrending: 0, watch: 0 };
-  private smcBusy = false;
 
   private lastPairAt = 0;
   private lossPauseUntil = 0;
@@ -173,6 +171,7 @@ export class Engine extends EventEmitter {
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
     if (this.wallet.connected && this.wallet.running) {
       this.log('Core', 'info', 'resumed saved Start state — trading continues with the app closed');
+      void this.kickoffTrading('resume');
     } else if (this.wallet.connected) {
       this.log('Core', 'info', 'bot is paused (saved Stop state); open the app and tap Start to resume');
     }
@@ -226,8 +225,11 @@ export class Engine extends EventEmitter {
     this.wallet.dayStartEquity = this.wallet.depositUsd;
     this.store.addEquity(Date.now(), this.wallet.depositUsd);
     this.saveWallet();
+    this.lossPauseUntil = 0;
+    this.store.set('lossPauseUntil', 0);
     this.log('Core', 'info', `${opts.type === 'phantom' ? 'Phantom' : 'Paper'} wallet connected · ${this.mode.toUpperCase()} mode · $${this.equity().toFixed(2)}`);
     this.emitState();
+    void this.kickoffTrading('connect');
     return this.wallet;
   }
   /** Read-only preview used by the Connect sheet before connecting. */
@@ -250,7 +252,35 @@ export class Engine extends EventEmitter {
       if (res.ok) this.log('Core', 'info', 'Start/Stop saved to host env so it survives a restart');
     });
     this.emitState();
+    if (r && this.wallet.connected) {
+      this.lossPauseUntil = 0;
+      this.store.set('lossPauseUntil', 0);
+      void this.kickoffTrading('start');
+    }
   }
+
+  /** Immediate scan + entries on Connect/Start — do not wait for the interval loops. */
+  private kickingOff = false;
+  private async kickoffTrading(reason = 'start') {
+    if (!this.wallet.connected || !this.wallet.running) return;
+    if (this.kickingOff) return;
+    this.kickingOff = true;
+    try {
+      this.log('Core', 'info', `scanning for entries immediately (${reason})`);
+      const pump = this.ingestPump().catch(() => {});
+      const scan = this.scan().catch(() => {});
+      await Promise.race([
+        Promise.all([pump, scan]),
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+      if (!this.wallet.connected || !this.wallet.running) return;
+      await this.evaluateEntries().catch(() => {});
+      if (!this.positions.length && this.wallet.running) {
+        setTimeout(() => { if (this.wallet.running) void this.evaluateEntries(); }, 800);
+      }
+    } finally { this.kickingOff = false; }
+  }
+
   reset() {
     if (this.mode === 'live') throw new Error('reset is disabled in live mode');
     this.store.reset(); this.tuner = new AutoTune(); this.resetPaperBook();
@@ -267,7 +297,9 @@ export class Engine extends EventEmitter {
     this.inFlightChecks.clear();
     this.reservedSol = 0;
     this.cooldown = {};
+    this.lossPauseUntil = 0;
     this.store.clearPaperSession();
+    this.store.set('lossPauseUntil', 0);
   }
 
   equity() {
@@ -313,8 +345,16 @@ export class Engine extends EventEmitter {
   private alreadyOn(mint: string) {
     return this.alreadyHeld(mint) || this.buying.has(mint);
   }
-  private noteReject(reason: string) {
-    const key = (reason || 'unknown').slice(0, 80);
+  private rejectSeen = new Map<string, number>();
+  private noteReject(reason: string, mint?: string) {
+    let key = (reason || 'unknown').slice(0, 80);
+    if (key.startsWith('risk:daily loss limit')) key = 'risk:daily loss limit hit';
+    if (mint) {
+      const id = mint + '|' + key;
+      const prev = this.rejectSeen.get(id) || 0;
+      if (Date.now() - prev < 20_000) return;
+      this.rejectSeen.set(id, Date.now());
+    }
     const s = this.agents.safety as typeof this.agents.safety & { reasons: Record<string, number> };
     if (!s.reasons) s.reasons = {};
     s.reasons[key] = (s.reasons[key] || 0) + 1;
@@ -437,8 +477,8 @@ export class Engine extends EventEmitter {
       let nNew = 0, nTr = 0;
       for (const c of list) {
         const prev = this.candidates.get(c.mint);
-        const merged = { ...prev, ...c, seenAt: now, smc: c.smc || prev?.smc } as Candidate;
-        if (isEstablished(merged, now) || merged.universe === 'trending') { merged.universe = 'trending'; nTr++; }
+        const merged = { ...prev, ...c, seenAt: now } as Candidate;
+        if (merged.universe === 'trending') { nTr++; }
         else { merged.universe = merged.universe || 'new'; nNew++; }
         this.candidates.set(c.mint, merged);
         this.remember(merged, now);
@@ -461,7 +501,6 @@ export class Engine extends EventEmitter {
         cc.score = s.score;
         scored.push({ c: cc, s });
       }
-      void this.enrichSmc(scored.map((x) => x.c));
       this.agents.safety.checked += list.length;
       this.agents.safety.rejected += list.length - scored.length;
       this.agents.analyst.scored += scored.length;
@@ -494,7 +533,7 @@ export class Engine extends EventEmitter {
       const adapted = this.riskAdapted();
       const minScore = adapted.minScore;
       const recent = [...this.candidates.values()].filter((c) => now - c.seenAt < 180_000);
-      let watch = 0;
+      this.uni.watch = 0;
       for (const c of recent) {
         if (!c.score) c.score = scoreCandidate(c).score;
         const hist = this.mintHist.get(c.mint) || [];
@@ -503,17 +542,14 @@ export class Engine extends EventEmitter {
         const conf = momentumConfirm(c, hist, now);
         (c as any)._conf = conf.ok;
         if (!(c as any)._conf) (c as any)._confWhy = conf.reason;
-        const established = isEstablished(c, now);
-        // Trending/FOMO: queue and wait for timing (SMC/dip/candle/flow). New coins still need thrust.
-        if (established && !(c as any)._sig) { watch++; continue; }
+        else if (!(c as any)._sig) (c as any)._sig = conf.reason;
       }
-      this.uni.watch = watch;
       const scored = recent
         .filter((c) => {
-          const established = isEstablished(c, now);
-          if (!(c as any)._conf) { if ((c.score || 0) >= minScore || (c as any)._sig) this.noteReject('no thrust'); return false; }
-          if (established) return !!(c as any)._sig;
-          return (c.score || 0) >= minScore || !!(c as any)._sig;
+          // Immediate buy: score at or above the floor, or a momentum/entry signal.
+          // Soft "no thrust" is not a hard fail and must not block a qualifying score.
+          if ((c.score || 0) >= minScore || (c as any)._sig) return true;
+          return false;
         })
         .sort((a, b) => (b.score || 0) - (a.score || 0))
         .slice(0, 20);
@@ -573,10 +609,8 @@ export class Engine extends EventEmitter {
     try {
       const work = (async () => {
         const pump = isPumpCurve(c);
-        // Pump curve: don't wait on RugCheck (it isn't indexed yet). AMM still fail-closed.
-        const sec = pump
-          ? await withTimeout(this.m.security(c.mint), 1200, 'sec timeout').catch(() => null)
-          : await this.m.security(c.mint);
+        // Never block the first-entry path on a slow/failed RugCheck — timeout and fail open.
+        const sec = await withTimeout(this.m.security(c.mint), pump ? 1200 : 2000, 'sec timeout').catch(() => null);
         if (aborted) return;
         this.agents.safety.calls++;
         const sr = securityCheck(sec, this.cfg, { pumpCurve: pump, devHoldPct: c.flow?.devHoldPct });
@@ -593,13 +627,17 @@ export class Engine extends EventEmitter {
         const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
         const trialSize = slotSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd, this.occupied());
         if (!trialSize) { this.noteReject('risk:no size'); return; }
-        const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
-        if (aborted) return;
-        if (!okSell) {
-          this.noteReject(pump ? 'not sellable on curve' : 'not sellable on Jupiter');
-          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: pump ? 'safety: curve sell quote failed' : 'safety: Jupiter reverse quote failed (not sellable)' });
-          this.cooldown[c.mint] = Date.now() + 15 * 60_000;
-          return;
+        // Paper: a quote timeout or API error is unknown, not a hard fail — still buy.
+        // Live keeps the reverse-quote check so we don't enter a token we cannot sell.
+        if (this.mode !== 'paper') {
+          const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
+          if (aborted) return;
+          if (!okSell) {
+            this.noteReject(pump ? 'not sellable on curve' : 'not sellable on Jupiter');
+            this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: pump ? 'safety: curve sell quote failed' : 'safety: Jupiter reverse quote failed (not sellable)' });
+            this.cooldown[c.mint] = Date.now() + 15 * 60_000;
+            return;
+          }
         }
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
@@ -659,12 +697,14 @@ export class Engine extends EventEmitter {
     }
     if (!f || !f.ok) { this.agents.executor.failures++; this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `executor: ${f && !f.ok ? f.error : 'buy failed'}` }); return; }
     if (gen !== this.bookGen) return; // paper book was reset while this fill was in flight
+    const held = this.positions.find((p) => p.mint === c.mint) || existing;
     const costSol = f.solSpent + f.feesSol;
-    const debit = costSol + (adding ? 0 : f.rentSol);
+    const debit = costSol + (held ? 0 : f.rentSol);
     if (this.wallet.solBalance < debit) { this.agents.risk.label = 'not enough free cash'; return; }
     this.wallet.solBalance -= debit;
     const addUsd = costSol * this.solPrice;
-    if (adding && existing) {
+    if (held) {
+      const existing = held;
       const newQty = existing.qty + f.tokens;
       existing.entryPrice = (existing.entryPrice * existing.qty + f.fillPrice * f.tokens) / Math.max(1e-12, newQty);
       existing.qty = newQty;
@@ -692,7 +732,7 @@ export class Engine extends EventEmitter {
     } as Position;
     (pos as any).origCost = pos.costUsd; (pos as any).partialTaken = false; (pos as any).breakeven = false;
     this.positions.push(pos);
-    if (isEstablished(c) || c.universe === 'trending') this.uni.enteredTrending++; else this.uni.enteredNew++;
+    if (c.universe === 'trending') this.uni.enteredTrending++; else this.uni.enteredNew++;
     this.agents.executor.fills++; this.agents.executor.last = `BUY ${c.symbol}`;
     this.persist();
     const stake = (pos.costUsd / eq) * 100;
@@ -777,20 +817,41 @@ export class Engine extends EventEmitter {
     } finally { this.monitoring = false; }
   }
 
-  async closePosition(p: Position, kind: string, reason: string, fraction = 1) {
-    if (this.selling.has(p.id) && fraction >= 0.999) return;
+  /** User-tapped close: sell 100% of one position. Other positions are left alone. */
+  async manualClose(id: string): Promise<{ ok: boolean; symbol?: string; pnlUsd?: number; pending?: boolean; error?: string }> {
+    const key = String(id || '').trim();
+    if (!key) return { ok: false, error: 'position id required' };
+    const matches = this.positions.filter((x) => x.id === key || x.mint === key);
+    if (matches.length !== 1) return { ok: false, error: matches.length ? 'ambiguous position' : 'position not found' };
+    const p = matches[0];
+    if (this.selling.has(p.id)) return { ok: false, error: 'already closing' };
+    const others = this.positions.filter((x) => x.id !== p.id).map((x) => x.id);
+    const r = await this.closePosition(p, 'manual', 'manual', 1);
+    const stillOthers = this.positions.filter((x) => others.includes(x.id));
+    if (stillOthers.length !== others.length) return { ok: false, error: 'other positions were affected' };
+    if (!r.ok) return { ok: false, symbol: p.symbol, error: r.error || 'close failed' };
+    const last = this.store.trades(1)[0];
+    const pnlUsd = last && last.id === p.id ? last.pnlUsd : undefined;
+    if (this.mode === 'paper' && !r.pending && this.positions.some((x) => x.id === p.id))
+      return { ok: false, symbol: p.symbol, error: 'sell failed' };
+    return { ok: true, symbol: p.symbol, pnlUsd, pending: r.pending };
+  }
+
+  async closePosition(p: Position, kind: string, reason: string, fraction = 1): Promise<{ ok: boolean; error?: string; pending?: boolean }> {
+    if (this.selling.has(p.id) && fraction >= 0.999) return { ok: false, error: 'already closing' };
     this.selling.add(p.id);
     this.agents.scanner.inFlightSells = this.selling.size;
     try {
     const frac = Math.min(1, Math.max(0.05, fraction));
-    if (this.mode === 'live-auto') { await this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac }); return; }
-    if (this.mode === 'live') { await this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac }); return; }
+    if (this.mode === 'live-auto') { await this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac }); return { ok: true }; }
+    if (this.mode === 'live') { await this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac }); return { ok: true, pending: true }; }
     const qty = p.qty * frac;
     const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
     if (!f.ok) {
+      if (kind === 'manual') return { ok: false, error: f.error || 'sell failed' };
       this.sellFails[p.id] = (this.sellFails[p.id] || 0) + 1;
-      if (this.sellFails[p.id] < 6) return;
+      if (this.sellFails[p.id] < 6) return { ok: false, error: f.error || 'sell failed' };
       fillPrice = p.lastPrice * 0.85; solBack = (qty * fillPrice) / this.solPrice; note = ' (no route, est.)';
     } else { solBack = f.solReceived - f.feesSol; fillPrice = f.fillPrice; }
     delete this.sellFails[p.id];
@@ -807,13 +868,14 @@ export class Engine extends EventEmitter {
       this.log('Risk', 'sell', `Partial ${p.symbol} ${reason}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: solBack * this.solPrice, pct: (fillPrice / p.entryPrice - 1) * 100, text2: reason } as any);
       this.persist();
       this.emitState();
-      return;
+      return { ok: true };
     }
     this.wallet.solBalance += solBack + p.rentSol;
     const proceeds = solBack * this.solPrice + ((p as any).realizedUsd || 0);
     const cost = (p as any).origCost ?? p.costUsd;
     p.costUsd = cost;
     this.finishClose(p, fillPrice, proceeds, kind, reason + note);
+    return { ok: true };
     } finally {
       this.selling.delete(p.id);
       this.agents.scanner.inFlightSells = this.selling.size;
@@ -833,11 +895,12 @@ export class Engine extends EventEmitter {
     this.cooldown[p.mint] = Date.now() + (rug ? 8 * 60_000 : Math.max(15_000, this.cfg.cooldownMin * 60_000));
     this.agents.risk.exits++; this.agents.executor.fills++; this.agents.executor.last = `SELL ${p.symbol}`;
     this.persist();
-    const stopped = kind === 'hard_stop' || pnlUsd < 0;
+    const stopped = kind !== 'manual' && kind !== 'take_profit' && (kind === 'hard_stop' || pnlUsd < 0);
     this.decision({ ts: Date.now(), side: 'SELL', symbol: p.symbol, image: p.image, text: `${reason} · ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd).toFixed(2)} via Jupiter`, usd: pnlUsd });
     void notifyTrade({ side: 'SELL', symbol: p.symbol, sizeUsd: proceedsUsd, price: exitPrice, pnlPct: t.pnlPct });
     this.log('Risk', stopped ? 'stop' : 'sell', `${stopped ? 'Stopped' : 'Sold'} ${p.symbol}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: pnlUsd, pct: t.pnlPct, text2: reason } as any);
-    if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: kind === 'take_profit' ? `Take profit ${p.symbol}` : `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
+    if (kind === 'manual') this.emit('toast', { kind: pnlUsd > 0 ? 'profit' : 'fill', title: `Closed ${p.symbol}`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image, text: 'manual close' });
+    else if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: kind === 'take_profit' ? `Take profit ${p.symbol}` : `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
     const adapted = this.riskAdapted();
     if (pnlUsd < 0 && adapted.pauseMs) {
       this.lossPauseUntil = Date.now() + adapted.pauseMs;
@@ -1069,22 +1132,6 @@ export class Engine extends EventEmitter {
     };
   }
 
-  private async enrichSmc(list: Candidate[]) {
-    if (this.smcBusy || this.mode !== 'paper') return;
-    const want = list.filter((c) => c.pool && (c.universe === 'trending' || isEstablished(c)) && !c.smc?.ok).slice(0, 6);
-    if (!want.length) return;
-    this.smcBusy = true;
-    try {
-      await poolRun(want, 2, async (c) => {
-        const one = await withTimeout(this.m.ohlcv(c.pool, '1m'), 1800, 'ohlcv 1m').catch(() => [] as any);
-        await new Promise((r) => setImmediate(r));
-        const five = one && one.length >= 40 ? [] : await withTimeout(this.m.ohlcv(c.pool, '5m'), 1800, 'ohlcv 5m').catch(() => [] as any);
-        const sig = smcFromTimeframes(one || [], five || []);
-        const cc = this.candidates.get(c.mint);
-        if (cc && sig.ok) { cc.smc = sig; cc.score = scoreCandidate(cc).score; }
-      });
-    } finally { this.smcBusy = false; }
-  }
 
   /** Paper TP check: net % from an actual sell quote after extra slip and fees. */
   private async quotedNetPnlPct(p: Position): Promise<number | null> {

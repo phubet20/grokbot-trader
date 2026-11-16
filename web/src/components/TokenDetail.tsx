@@ -7,6 +7,7 @@ export function TokenDetail({ mint, onClose }: { mint: string; onClose: () => vo
   const [d, setD] = useState<any>(null);
   const [tf, setTf] = useState('1m');
   const [err, setErr] = useState('');
+  const [closing, setClosing] = useState(false);
   useEffect(() => {
     let on = true;
     const load = () => api(`token/${encodeURIComponent(mint)}?tf=${tf}`).then((x) => on && setD(x)).catch((e) => setErr(e.message));
@@ -34,8 +35,19 @@ export function TokenDetail({ mint, onClose }: { mint: string; onClose: () => vo
           <div><span className="muted tiny">24h volume</span><b>${compact(d.volume24h)}</b></div>
         </div>
         {pos ? (
+          <>
           <div className="tk-card"><span className="ag-ico" style={{ background: '#8b5cf6' }}>💼</span><div className="grow"><b>Your position</b><div className="muted tiny">{usd(pos.costUsd)} in · Executor</div></div>
             <div className="act-right"><b>{usd(pos.valueUsd)}</b><div className={`tiny ${pos.valueUsd >= pos.costUsd ? 'pos' : 'neg'}`}>{sUsd(pos.valueUsd - pos.costUsd)}</div></div></div>
+          <button type="button" className="pill-btn small-btn" data-testid="close-token-pos" disabled={closing} onClick={async () => {
+            if (!window.confirm(`Close ${d.symbol} now? This sells 100% of this position.`)) return;
+            setClosing(true);
+            try {
+              await api('position/close', { id: pos.id }, { timeoutMs: 20000 });
+              onClose();
+            } catch (e: any) { setErr(e?.message || 'close failed'); }
+            finally { setClosing(false); }
+          }}>{closing ? 'Closing…' : 'Close position'}</button>
+          </>
         ) : last ? (
           <div className="tk-card"><span className="ag-ico" style={{ background: '#8b5cf6' }}>💼</span><div className="grow"><b>Last trade</b><div className="muted tiny">{usd(last.costUsd)} in · {last.reason}</div></div>
             <div className="act-right"><b>{usd(last.proceedsUsd)}</b><div className={`tiny ${last.pnlUsd >= 0 ? 'pos' : 'neg'}`}>{sUsd(last.pnlUsd)}</div></div></div>

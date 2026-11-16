@@ -32,14 +32,17 @@ test('safety pre-check rejects thin/young/honeypot pools', () => {
   assert.ok(preCheck({ ...base, txns: { ...base.txns, h1b: 300, h1s: 0 } }, DEFAULTS, now).reasons.some((r) => r.includes('honeypot')));
   assert.ok(!preCheck({ ...base, quoteSymbol: 'BONK' }, DEFAULTS, now).ok);
 });
-test('safety security check: authorities, holders, missing data fail closed', () => {
+test('safety security check: only confirmed honeypot or mint/freeze authority block; unknown passes', () => {
   const s = { mintAuthority: null, freezeAuthority: null, holders: 1000, topHolderPct: 5, top10Pct: 25, dangerRisks: [], rugged: false, fetchedAt: now, available: true };
   assert.ok(securityCheck(s, DEFAULTS).ok);
   assert.ok(!securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS).ok);
   assert.ok(!securityCheck({ ...s, freezeAuthority: 'X' }, DEFAULTS).ok);
-  assert.ok(!securityCheck({ ...s, holders: 10 }, DEFAULTS).ok);
-  assert.ok(!securityCheck({ ...s, topHolderPct: 40 }, DEFAULTS).ok);
-  assert.ok(!securityCheck(null, DEFAULTS).ok);
+  assert.ok(!securityCheck({ ...s, rugged: true }, DEFAULTS).ok);
+  assert.ok(!securityCheck({ ...s, dangerRisks: ['Honeypot risk'] }, DEFAULTS).ok);
+  assert.ok(securityCheck({ ...s, holders: 10 }, DEFAULTS).ok, 'low holders is not a hard fail');
+  assert.ok(securityCheck({ ...s, topHolderPct: 40 }, DEFAULTS).ok, 'top holder % is not a hard fail');
+  assert.ok(securityCheck(null, DEFAULTS).ok, 'API miss / unknown must not block entries');
+  assert.ok(securityCheck({ ...s, available: false }, DEFAULTS).ok);
 });
 test('pump.fun bonding-curve security: missing RugCheck is ok, authorities and dev cap still reject', () => {
   const s = { mintAuthority: null, freezeAuthority: null, holders: 2, topHolderPct: 5, top10Pct: 25, dangerRisks: [], rugged: false, fetchedAt: now, available: true };
@@ -47,7 +50,7 @@ test('pump.fun bonding-curve security: missing RugCheck is ok, authorities and d
   assert.ok(securityCheck(s, DEFAULTS, { pumpCurve: true, devHoldPct: 4 }).ok);
   assert.ok(!securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS, { pumpCurve: true }).ok);
   assert.ok(!securityCheck({ ...s, freezeAuthority: 'X' }, DEFAULTS, { pumpCurve: true }).ok);
-  assert.ok(!securityCheck(null, DEFAULTS, { pumpCurve: true, devHoldPct: 40 }).ok);
+  assert.ok(securityCheck(null, DEFAULTS, { pumpCurve: true, devHoldPct: 40 }).ok, 'dev hold alone is not a hard fail');
 });
 test('live mode needs mode=live AND the exact confirmation phrase', () => {
   assert.equal(liveGate(DEFAULTS).live, false);

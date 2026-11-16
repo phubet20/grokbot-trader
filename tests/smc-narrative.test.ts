@@ -92,6 +92,25 @@ test('momentumConfirm requires buy pressure and thrust; rejects a dead tape', ()
   assert.equal(momentumConfirm(baseC, dead, 2).ok, false);
 });
 
+test('momentumConfirm allows a fresh pump curve with short tape and net buy flow', () => {
+  const now = Date.now();
+  const curveC = {
+    ...baseC,
+    universe: 'new',
+    createdAt: now - 60_000,
+    curve: { progress: 0.1, vSol: 32, vTokens: 1e9, graduated: false },
+    txns: { m5b: 1, m5s: 0, h1b: 1, h1s: 0, h24b: 1, h24s: 0 },
+    volume: { m5: 80, h1: 80, h6: 0, h24: 0 },
+    change: { m5: 4, m15: 4, h1: 4, h6: 0, h24: 0 },
+    flow: { netBuySol: 0.4, largeBuys: 0, largeSells: 0, uniqueBuyers: 1, uniqueSellers: 0, whaleBuyUsd: 40 },
+  } as Candidate;
+  const hist = [toSnap(now, curveC)];
+  const r = momentumConfirm(curveC, hist, now);
+  assert.equal(r.ok, true, r.reason);
+  const deadCurve = { ...curveC, volume: { m5: 0, h1: 0, h6: 0, h24: 0 }, flow: { ...curveC.flow!, netBuySol: 0 }, txns: { m5b: 0, m5s: 0, h1b: 0, h1s: 0, h24b: 0, h24s: 0 }, change: { m5: 0, m15: 0, h1: 0, h6: 0, h24: 0 } };
+  assert.equal(momentumConfirm(deadCurve, [toSnap(now, deadCurve)], now).ok, false);
+});
+
 test('isEstablished is true for trending or older coins, false for fresh pump curves', () => {
   const now = Date.now();
   assert.equal(isEstablished({ ...baseC, universe: 'trending', createdAt: now - 60_000 }, now), true);

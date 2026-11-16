@@ -62,8 +62,7 @@ export function scoreCandidate(c: Candidate): Score {
   const liq = c.liquidityUsd || 0;
   parts.liquidity = clamp((Math.log10(Math.max(1, liq)) - 2.5) / 2.5) * 10;
 
-  // 7. SMC timing (8) + daily narrative alignment (8) — additive, existing weights kept
-  parts.smc = c.smc?.ok ? 8 : 0;
+  // 7. daily narrative alignment (8) — additive, existing weights kept
   parts.narrative = Math.max(0, Math.min(8, c.narrativeBoost || 0));
 
   const raw = Object.values(parts).reduce((a, b) => a + b, 0);
@@ -71,6 +70,6 @@ export function scoreCandidate(c: Candidate): Score {
   const signals = [net5 > 0, r5 > 0.55, unique >= 8, whale > 20 || largeBuys > 0, !flow?.devSold, !flow?.bundled, (c.change.m5 || 0) > -3];
   const bull = signals.filter(Boolean).length;
   const bear = signals.length - bull;
-  const note = `whale ${parts.whale.toFixed(0)} · accel ${parts.accel.toFixed(0)} · buyers ${parts.buyers.toFixed(0)} · curve ${parts.curve.toFixed(0)} · qual ${parts.quality.toFixed(0)}` + (parts.smc ? ' · smc' : '') + (parts.narrative ? ' · meta' : '');
+  const note = `whale ${parts.whale.toFixed(0)} · accel ${parts.accel.toFixed(0)} · buyers ${parts.buyers.toFixed(0)} · curve ${parts.curve.toFixed(0)} · qual ${parts.quality.toFixed(0)}` + (parts.narrative ? ' · meta' : '');
   return { score, parts, bull, bear, note };
 }

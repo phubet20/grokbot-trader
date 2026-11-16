@@ -1,7 +1,7 @@
 // Market data: GeckoTerminal + DexScreener (discovery), RugCheck (security),
 // Jupiter (prices + swap quotes). All public, no API keys.
 import type { Candidate, TokenSecurity } from './types.ts';
-import { getPumpFeed, mergePumpOnto, curveQuote } from './pump.ts';
+import { getPumpFeed, mergePumpOnto, curveQuote, priceUsdFromCurve } from './pump.ts';
 import { fetchMintAuthorities } from './reconcile.ts';
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -343,6 +343,8 @@ export class LiveMarket implements MarketSource {
   async prices(mints: string[]) {
     const out: Record<string, number> = {};
     const uniq = [...new Set(mints)];
+    const held = uniq.filter((m) => m && m !== SOL_MINT);
+    if (held.length) this.pump.pin(held);
     for (let i = 0; i < uniq.length; i += 50) {
       const ids = uniq.slice(i, i + 50).join(',');
       try {
@@ -353,6 +355,17 @@ export class LiveMarket implements MarketSource {
         }
         if (out[SOL_MINT]) { this.lastSolPrice = out[SOL_MINT]; this.lastSolAt = Date.now(); }
       } catch {}
+    }
+    // Jupiter has no route/price for ungraduated pump.fun tokens — use the curve mid
+    // so marks, equity, and exits don't freeze on the entry fill.
+    const sol = out[SOL_MINT] || this.lastSolPrice;
+    for (const m of uniq) {
+      if (out[m] > 0) continue;
+      const t = this.pump.get(m);
+      if (t && sol > 0) {
+        const px = priceUsdFromCurve(t, sol);
+        if (px > 0) out[m] = px;
+      }
     }
     return out;
   }

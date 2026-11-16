@@ -209,7 +209,6 @@ export function liveEntryOk(c: Candidate, hist: TapeSnap[], p: StratParams = STR
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
-  if (c.smc?.ok) return { ok: true, reason: c.smc.reason };
   const pat = matchEntryPatterns(c, h, p, now);
   if (pat.ok) return pat;
   return entryReason(h, p, now);
@@ -352,21 +351,29 @@ export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.
   const s = hist[hist.length - 1] || toSnap(now, c);
   const r5 = buyRatio(s.b5, s.s5);
   const tot = s.b5 + s.s5;
-  const buyPress = r5 >= 0.55 && (s.b5 - s.s5) > 0 && tot >= 4;
+  const dumping = (s.m5 || 0) <= -5 || (c.change?.m5 || 0) <= -5 || !!c.flow?.devSold;
+  if (dumping) return { ok: false, reason: 'dumping' };
+  const net = (s.b5 - s.s5) > 0 || (c.flow?.netBuySol || 0) > 0;
+  const vol = (s.vol5 || 0) > 0 || (c.volume?.m5 || 0) > 0;
+  // Short DexScreener tapes (tot < 4) are common on new pump.fun coins — use flow/volume too.
+  const buyPress = net && (tot >= 3 ? r5 >= 0.52 : (r5 >= 0.55 || (c.flow?.netBuySol || 0) > 0 || tot >= 1));
   const prevVol = hist.length >= 2 ? (hist[hist.length - 2].vol5 || 0) : 0;
   const volAccel = s.vol5 > 0 && prevVol > 0 && s.vol5 >= prevVol * 1.15;
-  const freshVol = (c.volume?.m5 || 0) > 0 && (s.m5 >= 1.5 || (c.flow?.netBuySol || 0) > 0);
-  const thrust = s.m5 >= 1.5 || volAccel || freshVol;
+  const pxUp = s.m5 >= 0.8 || (c.change?.m5 || 0) >= 0.8;
+  const freshVol = vol && (pxUp || (c.flow?.netBuySol || 0) > 0);
+  const thrust = s.m5 >= 1.2 || volAccel || freshVol || (vol && pxUp);
   if (buyPress && thrust) return { ok: true, reason: 'buy pressure + volume thrust' };
+  // Fresh curve with net buy flow and some volume: enter immediately, still skip dead tape.
+  const freshCurve = !!c.curve && !c.curve.graduated;
+  if (freshCurve && tot < 4 && net && vol) return { ok: true, reason: 'fresh curve buy flow' };
   return { ok: false, reason: !buyPress ? 'no buy pressure' : 'no thrust' };
 }
 
-/** Immediate entry signals: fresh launch, dip-reclaim, buy candles, bounce, big-money flow, SMC. */
+/** Immediate entry signals: momentum thrust, fresh launch, dip-reclaim, buy candles, bounce, big-money flow. */
 export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()): { ok: boolean; reason: string } {
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
-  if (c.smc?.ok) return { ok: true, reason: c.smc.reason };
   const pat = matchEntryPatterns(c, h, p, now);
   if (pat.ok) return pat;
   const dip = dipReclaim(h);

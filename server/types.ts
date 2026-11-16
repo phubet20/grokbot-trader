@@ -19,7 +19,6 @@ export type Candidate = {
   flow?: FlowStats;
   entryPattern?: string;
   universe?: 'new' | 'trending';
-  smc?: { ok: boolean; reason: string; kind: string; tf?: string };
   narrativeBoost?: number;
 };
 

@@ -46,3 +46,36 @@ export class Store {
     this.set('agents', null);
   }
 }
+
+/** Keys that may be mirrored to the private GitHub state repo. Never include secrets. */
+export const SYNC_KV = ['wallet', 'positions', 'cooldown', 'autotune', 'agents', 'lossPauseUntil'] as const;
+
+export type PaperSnapshot = {
+  v: 1;
+  savedAt: number;
+  kv: Record<string, unknown>;
+  trades: any[];
+  equity: { ts: number; usd: number }[];
+};
+
+export function exportSnapshot(store: Store): PaperSnapshot {
+  const kv: Record<string, unknown> = {};
+  for (const k of SYNC_KV) kv[k] = store.get(k, null);
+  return { v: 1, savedAt: Date.now(), kv, trades: store.trades(1000), equity: store.equity(0).slice(-2000) };
+}
+
+export function importSnapshot(store: Store, snap: PaperSnapshot): boolean {
+  if (!snap || snap.v !== 1 || typeof snap !== 'object') return false;
+  const kv = snap.kv || {};
+  for (const k of SYNC_KV) {
+    if (k in kv && kv[k] != null) store.set(k, kv[k]);
+  }
+  for (const t of snap.trades || []) {
+    if (t && t.id && t.closedAt) store.addTrade(t);
+  }
+  for (const e of snap.equity || []) {
+    if (e && Number.isFinite(e.ts) && Number.isFinite(e.usd)) store.addEquity(e.ts, e.usd);
+  }
+  return true;
+}
+

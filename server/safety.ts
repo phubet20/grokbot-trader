@@ -37,33 +37,30 @@ export function preCheck(c: Candidate, cfg: Config, now = Date.now()): SafetyRes
 export type SecurityOpts = { pumpCurve?: boolean; devHoldPct?: number };
 
 /** Checks that need on-chain/RugCheck data.
- *  AMM tokens fail closed when the report is missing.
- *  pump.fun bonding-curve tokens: mint/freeze are revoked at create, so a missing
- *  RugCheck report is not a reject. We still reject if a report shows authorities
- *  or a rugged flag, and we apply the dev-holding cap. */
-export function securityCheck(s: TokenSecurity | null, cfg: Config, opts: SecurityOpts = {}): SafetyResult {
+ *  Missing/failed RugCheck or other API errors do not block (fail open).
+ *  Only confirmed hard fails reject: rugged, mint/freeze authority, extreme holders.
+ *  pump.fun bonding-curve tokens: mint/freeze are revoked at create. */
+function hardSecurityFails(s: TokenSecurity): string[] {
   const r: string[] = [];
-  if (opts.pumpCurve) {
-    if (s?.available) {
-      if (s.rugged) r.push('flagged rugged');
-      if (s.mintAuthority) r.push('mint authority active');
-      if (s.freezeAuthority) r.push('freeze authority active');
-      if (s.topHolderPct !== null && s.topHolderPct > cfg.maxTopHolderPct) r.push(`top holder ${s.topHolderPct.toFixed(0)}%`);
-    }
-    // No report yet: mint/freeze are always revoked on pump.fun creates.
-    if ((opts.devHoldPct || 0) > cfg.maxTopHolderPct) r.push(`dev holds ${opts.devHoldPct!.toFixed(0)}%`);
-    return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'pump curve · mint/freeze revoked · dev cap ✓' };
-  }
-  if (!s || !s.available) return { ok: false, reasons: ['security data unavailable'], label: 'no security data' };
   if (s.rugged) r.push('flagged rugged');
   if (s.mintAuthority) r.push('mint authority active');
   if (s.freezeAuthority) r.push('freeze authority active');
-  const minHolders = s.holders !== null && s.holders < 40 && (s as any).freshPump ? Math.min(8, cfg.minHolders) : cfg.minHolders;
-  if (s.holders !== null && s.holders < minHolders) r.push(`holders ${s.holders} < ${minHolders}`);
-  if (s.topHolderPct !== null && s.topHolderPct > cfg.maxTopHolderPct) r.push(`top holder ${s.topHolderPct.toFixed(0)}%`);
-  if (s.top10Pct !== null && s.top10Pct > 60) r.push(`top10 hold ${s.top10Pct.toFixed(0)}%`);
-  for (const d of s.dangerRisks.slice(0, 3)) r.push(d);
-  return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'honeypot ✓ · LP ✓ · auth ✓' };
+  for (const d of s.dangerRisks || []) {
+    if (/honeypot|rugged/i.test(String(d))) r.push(String(d));
+  }
+  return r;
+}
+
+export function securityCheck(s: TokenSecurity | null, cfg: Config, opts: SecurityOpts = {}): SafetyResult {
+  // Only definitive hard fails block: confirmed honeypot/rug, or mint/freeze authority.
+  // Missing reports, API errors, holder stats, and other unknowns must not block.
+  if (opts.pumpCurve) {
+    const r = s?.available ? hardSecurityFails(s) : [];
+    return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'passed · pump curve' };
+  }
+  if (!s || !s.available) return { ok: true, reasons: [], label: 'passed · security unknown' };
+  const r = hardSecurityFails(s);
+  return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'passed · LP · auth' };
 }
 
 function k(x: number) { return x >= 1e6 ? (x / 1e6).toFixed(1) + 'M' : x >= 1e3 ? (x / 1e3).toFixed(0) + 'k' : x.toFixed(0); }

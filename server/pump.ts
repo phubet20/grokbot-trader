@@ -25,6 +25,8 @@ export type PumpToken = {
   initialSol: number;
   pool: string;
   lastEventAt: number;
+  openVSol?: number;
+  openVTokens?: number;
 };
 
 export function curveProgress(vTokens: number, vSol: number): number {
@@ -37,6 +39,12 @@ export function curveProgress(vTokens: number, vSol: number): number {
 export function priceSol(vSol: number, vTokens: number): number {
   if (vTokens <= 0) return 0;
   return vSol / vTokens;
+}
+
+/** Mid USD price on an ungraduated pump.fun curve. */
+export function priceUsdFromCurve(t: { vSol: number; vTokens: number; graduated?: boolean }, solUsd: number): number {
+  if (!solUsd || t.graduated || t.vTokens <= 0) return 0;
+  return priceSol(t.vSol, t.vTokens) * solUsd;
 }
 
 /** Buy `solIn` (UI SOL) on the curve. Returns tokens out and new reserves. */
@@ -168,6 +176,8 @@ export class PumpFeed {
         initialBuy: num(j.initialBuy), initialSol: num(j.solAmount),
         pool: j.bondingCurveKey || j.pool || mint,
         lastEventAt: Date.now(),
+        openVSol: num(j.vSolInBondingCurve) || PUMP_VIRTUAL_SOL,
+        openVTokens: num(j.vTokensInBondingCurve) || PUMP_VIRTUAL_TOKENS,
       };
       this.tokens.set(mint, t);
     } else if (tx === 'migration' || tx === 'migrate' || j.pool === 'pump-amm' || j.pool === 'pumpswap' || j.pool === 'raydium') {
@@ -192,14 +202,19 @@ export class PumpFeed {
     this.status.tracked = this.tokens.size;
   }
 
+  private pinned = new Set<string>();
+  pin(mints: string[]) { this.pinned = new Set(mints.filter(Boolean)); }
+
   private gc() {
     const now = Date.now();
     for (const [m, t] of this.tokens) {
+      if (this.pinned.has(m)) continue;
       if (now - t.lastEventAt > 6 * 3600_000) this.tokens.delete(m);
     }
     if (this.tokens.size > 400) {
-      const oldest = [...this.tokens.values()].sort((a, b) => a.lastEventAt - b.lastEventAt);
-      for (const t of oldest.slice(0, this.tokens.size - 400)) this.tokens.delete(t.mint);
+      const oldest = [...this.tokens.values()].filter((t) => !this.pinned.has(t.mint)).sort((a, b) => a.lastEventAt - b.lastEventAt);
+      const overflow = this.tokens.size - 400;
+      for (const t of oldest.slice(0, Math.max(0, overflow))) this.tokens.delete(t.mint);
     }
   }
 
@@ -211,6 +226,8 @@ export class PumpFeed {
       if (now - t.lastEventAt > 90 * 60_000 && !t.graduated) continue;
       const pxSol = t.graduated ? 0 : priceSol(t.vSol, t.vTokens);
       const priceUsd = pxSol * solPrice;
+      const openPx = priceSol(t.openVSol || PUMP_VIRTUAL_SOL, t.openVTokens || PUMP_VIRTUAL_TOKENS);
+      const m5 = !t.graduated && openPx > 0 ? (pxSol / openPx - 1) * 100 : 0;
       const progress = t.graduated ? 1 : curveProgress(t.vTokens, t.vSol);
       const supply = 1_000_000_000;
       const mcap = priceUsd * supply;
@@ -223,7 +240,7 @@ export class PumpFeed {
         mint: t.mint, pool: t.pool, symbol: t.symbol, name: t.name, image: t.image,
         dex: t.graduated ? 'pumpswap' : 'pump',
         priceUsd, mcapUsd: mcap, liquidityUsd: liq, createdAt: t.createdAt,
-        change: { m5: 0, m15: 0, h1: 0, h6: 0, h24: 0 },
+        change: { m5, m15: m5, h1: m5, h6: 0, h24: 0 },
         volume: { m5: t.initialSol * solPrice, h1: t.initialSol * solPrice, h6: 0, h24: 0 },
         txns: { m5b: b5, m5s: 0, h1b: b5, h1s: 0, h24b: b5, h24s: 0 },
         traders1h: b5, quoteSymbol: 'SOL', source: 'pumpportal',

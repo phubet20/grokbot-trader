@@ -21,12 +21,16 @@ test('equityScore prefers a smooth uptrend over a jumpy path with similar end eq
   assert.ok(a.score > b.score, `smooth score ${a.score} vs jumpy ${b.score}`);
 });
 
-test('weights stay at 1 until the minimum sample size, then negative expectancy disables', () => {
+test('weights lean after 2 losses, then negative expectancy disables at min samples', () => {
   const t = new AutoTune();
-  for (let i = 0; i < MIN_SAMPLES - 1; i++) t.record({ reason: 'fresh-launch burst', pnlUsd: -2, costUsd: 10, pnlPct: -20, equity: 80 - i });
+  t.record({ reason: 'fresh-launch burst', pnlUsd: -2, costUsd: 10, pnlPct: -20, equity: 80 });
+  const one = t.snapshot().patterns.find((p) => p.key === 'fresh-launch')!;
+  assert.equal(one.disabled, false);
+  assert.equal(one.weight, 1);
+  t.record({ reason: 'fresh-launch burst', pnlUsd: -2, costUsd: 10, pnlPct: -20, equity: 78 });
   const early = t.snapshot().patterns.find((p) => p.key === 'fresh-launch')!;
   assert.equal(early.disabled, false);
-  assert.equal(early.weight, 1);
+  assert.ok(early.weight < 1, 'should lean after 2 losses, weight=' + early.weight);
   t.record({ reason: 'fresh-launch burst', pnlUsd: -2, costUsd: 10, pnlPct: -20, equity: 70 });
   const later = t.snapshot().patterns.find((p) => p.key === 'fresh-launch')!;
   assert.equal(later.n, MIN_SAMPLES);

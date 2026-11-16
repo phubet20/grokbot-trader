@@ -2,7 +2,7 @@
 // adjusts weights / score floors / exit sensitivity with tight guardrails.
 // Objective: equity-curve slope and smoothness (Sharpe-like), not raw PnL alone.
 
-export const MIN_SAMPLES = 8;
+export const MIN_SAMPLES = 3;
 export const EPS = 0.08;
 const W_MIN = 0;
 const W_MAX = 1.8;
@@ -71,7 +71,7 @@ function classify(reason: string): PatternKey {
   if (r.includes('whale') || r.includes('big-money inflow') || r.includes('big money')) return 'whale-inflow';
   if (r.includes('net buy volume')) return 'big-money';
   if (r.includes('bounce')) return 'bounce';
-  if (r.includes('momentum burst') || (r.includes('breakout') && !r.includes('curve'))) return 'momentum-burst';
+  if (r.includes('momentum thrust') || r.includes('momentum burst') || r.includes('buy pressure') || (r.includes('breakout') && !r.includes('curve'))) return 'momentum-burst';
   if (r.includes('ob pullback') || r.includes('order block')) return 'ob-pullback';
   if (r.includes('fvg pullback') || r.includes('fair value')) return 'fvg-pullback';
   if (r.startsWith('score') || r.includes('score ')) return 'score';
@@ -200,6 +200,20 @@ export class AutoTune {
           if (s.immediateRate >= 0.45) s.minScoreAdj = clamp(s.minScoreAdj + 6, SCORE_ADJ_MIN, SCORE_ADJ_MAX);
           if (s.immediateRate >= 0.7 && s.expectancy <= 0) { s.disabled = true; s.weight = 0; }
         }
+      } else if (s.n >= 2) {
+        // Lean after 2 closes so a losing pattern is cut without waiting for a full sample.
+        s.disabled = false;
+        if (s.expectancy < 0 && s.losses >= 2) {
+          s.weight = clamp(0.65 + s.expectancy, 0.4, 1);
+          s.minScoreAdj = clamp(4 + Math.round(-s.expectancy * 15), 2, 10);
+          if (s.immediateRate >= 0.5) s.minScoreAdj = clamp(s.minScoreAdj + 4, 2, 12);
+        } else if (s.expectancy > 0 && s.wins >= 2) {
+          s.weight = clamp(1 + s.expectancy * 1.5, 1, 1.3);
+          s.minScoreAdj = 0;
+        } else {
+          s.weight = 1;
+          s.minScoreAdj = 0;
+        }
       } else {
         s.weight = 1;
         s.disabled = false;
@@ -270,7 +284,7 @@ export class AutoTune {
       minSamples: this.minSamples,
       updatedAt: this.updatedAt,
       note: this.trades.length < this.minSamples
-        ? `learning — need ${this.minSamples} closes per pattern before weights move`
+        ? `learning — leaning after 2 closes, full weights at ${this.minSamples} per pattern`
         : 'tuning from rolling expectancy and equity-curve smoothness',
     };
   }

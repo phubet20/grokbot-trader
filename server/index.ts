@@ -88,6 +88,10 @@ const server = createServer(async (req, res) => {
       if (p === '/api/withdraw') return json(200, await engine.withdraw());
       if (p === '/api/push/subscribe') return json(200, addSubscription(b));
       if (p === '/api/push/unsubscribe') return json(200, removeSubscription(String(b.endpoint || '')));
+      if (p === '/api/position/close') {
+        const r = await engine.manualClose(String(b.id || b.mint || ''));
+        return json(r.ok ? 200 : 400, r);
+      }
       if (p === '/api/deposit/prepare') {
         const to = botPublicKey();
         if (!to) return json(400, { error: 'bot wallet is not configured' });
