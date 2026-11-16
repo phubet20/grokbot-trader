@@ -93,7 +93,7 @@ test('scan cadence continues while a candidate check hangs', async () => {
   assert.ok(st.cadenceMs > 0 && st.cadenceMs < 1500, 'cadence stalled at ' + st.cadenceMs + 'ms');
 });
 
-test('re-connecting paper with a new test balance resets the book even if price fetch hangs', async () => {
+test('re-connecting paper resumes the saved book and does not reset it', async () => {
   const dirp = mkdtempSync(join(tmpdir(), 'gb-reconn-'));
   const cfg = { ...DEFAULTS, startUsd: 81, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
   const m = new ReplayMarket(10);
@@ -107,11 +107,27 @@ test('re-connecting paper with a new test balance resets the book even if price 
   const w = await e.connect({ type: 'paper', startUsd: 12 });
   const ms = Date.now() - t0;
   assert.ok(ms < 1000, 'connect took ' + ms + 'ms');
-  assert.equal(e.positions.length, 0);
-  assert.ok(Math.abs(e.wallet.depositUsd - 12) < 0.05, 'deposit=' + e.wallet.depositUsd);
-  assert.ok(Math.abs(e.equity() - 12) < 0.05, 'equity=' + e.equity());
+  assert.equal(e.positions.length, 1, 'reconnect must keep open positions');
+  assert.ok(Math.abs(e.wallet.depositUsd - 81) < 0.05, 'deposit should stay 81, got ' + e.wallet.depositUsd);
   assert.equal(w.connected, true);
   e.stop();
+});
+
+test('explicit reset paper book is the only way to start a new test balance', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-reset-'));
+  const cfg = { ...DEFAULTS, startUsd: 81, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const m = new ReplayMarket(10);
+  const store = new Store(join(dirp, 't.db'));
+  const e = new Engine(cfg, m, store);
+  await e.connect({ type: 'paper', startUsd: 81 });
+  e.positions.push({ id: 'x', mint: 'M', pool: 'P', symbol: 'X', name: 'X', openedAt: Date.now(), entryPrice: 1, qty: 1, decimals: 6, costUsd: 10, costSol: 0.1, peakPrice: 1, lastPrice: 1, score: 50, rentSol: 0 } as any);
+  e.reset();
+  assert.equal(e.positions.length, 0);
+  assert.equal(e.wallet.connected, false);
+  const e2 = new Engine(cfg, m, store);
+  await e2.connect({ type: 'paper', startUsd: 12 });
+  assert.ok(Math.abs(e2.wallet.depositUsd - 12) < 0.05, 'deposit=' + e2.wallet.depositUsd);
+  e2.stop();
 });
 
 test('manual close sells 100% of one paper position and leaves the others', async () => {
@@ -145,5 +161,35 @@ test('manual close sells 100% of one paper position and leaves the others', asyn
   assert.equal(t.kind, 'manual');
   assert.match(String(t.reason), /manual/);
   assert.ok(Math.abs(t.pnlUsd - (t.proceedsUsd - t.costUsd)) < 1e-9);
+  e.stop();
+});
+
+test('close all sells every paper position and returns a per-coin result', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-ca-'));
+  const cfg = { ...DEFAULTS, scanIntervalSec: 9999, monitorIntervalSec: 9999, realisticPaper: true };
+  const m = new ReplayMarket(1);
+  const e = new Engine(cfg, m, new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 20 });
+  e.setRunning(false);
+  const { list } = await m.candidates();
+  const mk = (c: any, id: string) => ({
+    id, mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, openedAt: Date.now(),
+    entryPrice: c.priceUsd, qty: 1000, decimals: 6, costUsd: 2, costSol: 2 / e.solPrice,
+    peakPrice: c.priceUsd, lastPrice: c.priceUsd, score: 60, rentSol: 0.00203928,
+  });
+  e.positions.push(mk(list[0], 'pos-a'), mk(list[1], 'pos-b'), mk(list[2], 'pos-c'));
+  const r = await e.closeAll();
+  assert.equal(r.results.length, 3);
+  assert.equal(r.closed, 3, JSON.stringify(r.results));
+  assert.equal(r.failed, 0);
+  assert.equal(e.positions.length, 0);
+  e.stop();
+});
+
+test('paper withdraw is refused', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-wd-'));
+  const e = new Engine({ ...DEFAULTS, scanIntervalSec: 9999, monitorIntervalSec: 9999 }, new ReplayMarket(1), new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 10 });
+  await assert.rejects(() => e.withdraw({ max: true }), /disabled in paper/);
   e.stop();
 });

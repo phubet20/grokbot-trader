@@ -112,7 +112,9 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
 export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => void }) {
   const pos = snap.positions || [];
   const [closing, setClosing] = useState<string | null>(null);
+  const [closingAll, setClosingAll] = useState(false);
   const [err, setErr] = useState('');
+  const [allResults, setAllResults] = useState<{ symbol: string; ok: boolean; pnlUsd?: number; error?: string }[] | null>(null);
   const closeOne = async (p: any, ev: { preventDefault(): void; stopPropagation(): void }) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -128,11 +130,43 @@ export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => 
       setClosing(null);
     }
   };
-  if (!pos.length) return null;
+  const closeAll = async () => {
+    if (closing || closingAll) return;
+    if (!window.confirm(`Sell all ${pos.length} open position${pos.length === 1 ? '' : 's'} now? Each coin is sold. In paper this uses simulated fills; in live/live-auto it sends real swaps.`)) return;
+    setClosingAll(true);
+    setErr('');
+    setAllResults(null);
+    try {
+      const r = await api('position/close-all', {}, { timeoutMs: 60000 });
+      setAllResults(r.results || []);
+      if (r.failed) setErr(`${r.failed} of ${r.closed + r.failed} did not close`);
+    } catch (e: any) {
+      setErr(e?.message || 'close all failed');
+    } finally {
+      setClosingAll(false);
+    }
+  };
+  if (!pos.length && !allResults?.length) return null;
   return (
     <div className="section card" data-testid="open-positions">
-      <div className="sec-hd"><b>Open positions</b><span className="muted small">{pos.length} open</span></div>
+      <div className="sec-hd">
+        <b>Open positions</b>
+        {pos.length > 0 ? (
+          <button type="button" className="close-all" data-testid="close-all" disabled={!!closing || closingAll} onClick={closeAll}>
+            {closingAll ? 'Selling…' : `Close all · ${pos.length} open`}
+          </button>
+        ) : <span className="muted small">0 open</span>}
+      </div>
       {err && <div className="tiny neg" data-testid="close-error">{err}</div>}
+      {allResults && (
+        <div className="close-all-results tiny mono" data-testid="close-all-results">
+          {allResults.map((r, i) => (
+            <div key={i} className={r.ok ? 'pos' : 'neg'}>
+              {r.symbol}: {r.ok ? (r.pnlUsd != null ? `${r.pnlUsd >= 0 ? '+' : ''}${r.pnlUsd.toFixed(3)}` : 'sold') : (r.error || 'failed')}
+            </div>
+          ))}
+        </div>
+      )}
       {pos.map((p: any) => (
         <div key={p.id} className="act-row" data-testid={`position-row-${p.symbol}`}>
           <button type="button" className="act-main" onClick={() => onOpen(p.mint)}>

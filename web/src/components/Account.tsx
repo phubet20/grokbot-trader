@@ -37,7 +37,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
           <button className="pill-btn small-btn" data-testid="bot-toggle" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Stop bot' : 'Start bot'}</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
         </div>
-        <p className="tiny muted" data-testid="background-note">The bot trades on the server — you can close the app. Start/Stop is written to AUTO_START on the host when possible, so live/live-auto can auto-resume after a sleep or redeploy. Paper balances stay ephemeral. On the free host, sleep after ~15 min idle is still possible; keepalive is not guaranteed.</p>
+        <p className="tiny muted" data-testid="background-note">The bot trades on the server — you can close or reload the app without resetting the book. Connect / AUTO_START resume a saved book; they do not overwrite it. Only <b>Reset paper book</b> starts a fresh test balance. {snap.background?.remoteState?.configured ? 'Paper state is also saved off-disk so a redeploy can restore it.' : 'To keep the paper book across redeploys, add STATE_GITHUB_TOKEN on the host.'} On the free host, sleep after ~15 min idle is still possible; keepalive is not guaranteed.</p>
       </div>
       <NotifyPanel snap={snap} />
       {snap.botWallet?.publicKey && <div className="section card"><BotWalletPanel snap={snap} /></div>}
@@ -47,15 +47,27 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
           <label key={k} className="field small" data-testid={k === "takeProfitPct" ? "take-profit-field" : undefined}><span>{label}</span><input type="number" min={min} max={max} step={step} value={cfg[k]} onChange={(e) => setCfg({ ...cfg, [k]: Number(e.target.value) })} data-testid={k === "takeProfitPct" ? "take-profit-input" : undefined} /></label>
         ))}
         <label className="field small"><span>App name</span><input type="text" value={cfg.appName} onChange={(e) => setCfg({ ...cfg, appName: e.target.value })} /></label>
+        <label className="field small" data-testid="realistic-paper-field">
+          <span>Realistic paper (settle TP on the real sell quote)</span>
+          <input type="checkbox" checked={cfg.realisticPaper !== false} onChange={(e) => setCfg({ ...cfg, realisticPaper: e.target.checked })} data-testid="realistic-paper-input" />
+        </label>
+        <p className="tiny muted">On by default. Paper take-profit and sells use the live sell quote so results look like live. Turn off only if you want the optimistic mark fill.</p>
         <button className="pill-btn" onClick={save}>Save settings</button>
       </div>
       <div className="section card">
         <div className="sec-hd"><b>Go live (later)</b></div>
         <p className="small muted">{snap.mode === 'live-auto' ? 'LIVE AUTO is on: the bot wallet signs swaps. Withdrawals go only to the locked Phantom address. The app never shows or asks for a private key.' : snap.mode === 'live' ? 'LIVE (Phantom): every swap still needs your approval in Phantom. No private keys are stored.' : 'Real trading is locked unless the owner sets MODE=live or MODE=live-auto plus LIVE_CONFIRM and restarts.'}</p>
       </div>
-      {snap.mode !== 'live' && <div className="section card">
+      {snap.mode === 'paper' && <div className="section card">
+        <div className="sec-hd"><b>Reset paper book</b></div>
+        <p className="tiny muted">This is the only way to wipe paper positions, trades, equity, and learning. Leaving the app, reloading, or tapping Connect will not reset.</p>
         <div className="btn-row">
-          <button className="pill-btn small-btn ghost" onClick={async () => { if (confirm('Reset the paper account? All test trades are deleted.')) { await api('reset', {}); onDisconnected(); } }}>Reset test account</button>
+          <button className="pill-btn small-btn ghost" data-testid="reset-paper-book" onClick={async () => { if (confirm('Reset the paper book? This deletes all paper positions, trades, equity and learning. This cannot be undone.')) { await api('paper/reset', {}); onDisconnected(); } }}>Reset paper book</button>
+          <button className="pill-btn small-btn ghost" onClick={async () => { await api('wallet/disconnect', {}); onDisconnected(); }}>Disconnect</button>
+        </div>
+      </div>}
+      {snap.mode !== 'paper' && <div className="section card">
+        <div className="btn-row">
           <button className="pill-btn small-btn ghost" onClick={async () => { await api('wallet/disconnect', {}); onDisconnected(); }}>Disconnect</button>
         </div>
       </div>}

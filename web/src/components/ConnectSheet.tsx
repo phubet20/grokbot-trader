@@ -57,10 +57,12 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   }
 
   const shownAddr = address || pv?.address || '';
-  const btnLabel = ready ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? (isAuto ? 'Starting…' : 'Approving…') : (isAuto ? 'Start bot' : 'Connect');
-  const btnTestId = ready ? 'start' : 'connect';
+  const alreadyOn = !!snap?.wallet?.connected;
   const solPx = pv?.solPrice || snap?.solPrice || snap?.stats?.solPrice || 0;
-  const paperUsd = Math.max(2, startUsd);
+  const hasBook = !isLive && !!(snap?.wallet?.depositUsd || snap?.wallet?.solBalance || (snap?.positions || []).length || snap?.stats?.closed);
+  const btnLabel = ready || alreadyOn ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? (isAuto ? 'Starting…' : 'Approving…') : (hasBook ? 'Resume book' : (isAuto ? 'Start bot' : 'Connect'));
+  const btnTestId = (ready || alreadyOn) ? 'start' : 'connect';
+  const paperUsd = hasBook ? (snap?.stats?.equity || snap?.wallet?.depositUsd || startUsd) : Math.max(2, startUsd);
   const paperSol = solPx ? paperUsd / solPx : 0;
   const bal = isLive
     ? (pv && (pv.address || address) ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : (pv ? 'open Phantom to read balance' : '…'))
@@ -80,10 +82,13 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
           <div><span className="muted">balance</span><span data-testid="connect-balance">{bal}</span></div>
           <div><span className="muted">mode</span><span className={isLive ? 'neg' : 'warn'}>{isLive ? 'LIVE · real funds' : 'TEST · simulated fills'}</span></div>
         </div>
-        {!isLive && (
+        {!isLive && !hasBook && (
           <label className="start-usd mono"><span className="muted">test balance (min $2)</span>
             <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => setStartUsd(Math.max(2, Number(e.target.value) || 2))} /></span>
           </label>
+        )}
+        {!isLive && hasBook && (
+          <p className="note" data-testid="resume-book-note">A paper book is already saved. Connect resumes it — it will not reset. Use Reset paper book in Account to start over.</p>
         )}
         {needPhantomApp && (
           <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Connect. Never enter a seed phrase here.</p>
@@ -104,7 +109,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
           {(!needPhantomApp || ready) && (
             <button
               className={`pill-btn sheet-btn ${state === 'busy' ? 'approving' : ''} ${state === 'done' && !ready ? 'ok' : ''} ${ready ? 'go' : ''}`}
-              onClick={ready ? onStart : connect}
+              onClick={(ready || alreadyOn) ? onStart : connect}
               disabled={state === 'busy' || (state === 'done' && !ready)}
               data-testid={btnTestId}
             >

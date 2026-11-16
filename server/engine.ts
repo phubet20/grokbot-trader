@@ -17,6 +17,7 @@ import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
 import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './render-env.ts';
+import { remoteStateStatus } from './remote-state.ts';
 import { rebuildPositions } from './reconcile.ts';
 import { getPumpFeed, mergePumpOnto } from './pump.ts';
 import { AutoTune, patternKey } from './autotune.ts';
@@ -142,9 +143,16 @@ export class Engine extends EventEmitter {
       this.wallet.running = true;
       this.saveWallet();
     }
-    // Paper: start entries as soon as a paper book exists (or create one on AUTO_START).
-    if (this.mode === 'paper' && autoStartEnabled() && !this.wallet.connected) {
-      await this.connect({ type: 'paper', startUsd: this.cfg.startUsd });
+    // Paper: resume a saved book. AUTO_START may only create a book when none exists.
+    if (this.mode === 'paper' && autoStartEnabled()) {
+      if (this.hasPaperBook() || this.wallet.connected) {
+        this.wallet.connected = true;
+        this.wallet.running = true;
+        this.saveWallet();
+        this.log('Core', 'info', `Paper book resumed · $${this.equity().toFixed(2)}`);
+      } else {
+        await this.connect({ type: 'paper', startUsd: this.cfg.startUsd });
+      }
     }
     if (this.mode === 'live-auto' && hasBotWallet()) {
       await this.syncBotBalance();
@@ -209,11 +217,22 @@ export class Engine extends EventEmitter {
       this.emitState();
       return this.wallet;
     }
+    // Paper: never wipe an existing book on Connect / reload / AUTO_START.
+    // Only the explicit "Reset paper book" path may start a fresh test balance.
+    if (opts.type === 'paper' && this.mode === 'paper' && this.hasPaperBook()) {
+      this.wallet.connected = true;
+      this.wallet.running = true;
+      this.wallet.type = 'paper';
+      this.wallet.address = opts.address || this.wallet.address || this.previewAddr || fakeAddr();
+      this.wallet.startedAt = this.wallet.startedAt || Date.now();
+      if (!this.wallet.dayKey) { this.wallet.dayKey = dayKey(); this.wallet.dayStartEquity = this.equity(); }
+      this.saveWallet();
+      this.log('Core', 'info', `Paper book resumed · ${this.mode.toUpperCase()} mode · $${this.equity().toFixed(2)}`);
+      this.emitState();
+      void this.kickoffTrading('resume');
+      return this.wallet;
+    }
     const solBalance = livePhantom ? (realSol ?? 0) : startUsd / this.solPrice;
-    // Paper: an explicit Connect with a test balance always resets the sim book
-    // (close open paper positions) so a new amount is not stuck behind AUTO_START.
-    const resetPaper = opts.type === 'paper' && this.mode === 'paper' && (this.wallet.connected || this.positions.length > 0 || this.wallet.depositUsd > 0);
-    if (resetPaper) this.resetPaperBook();
     this.wallet = {
       ...this.wallet,
       connected: true, type: opts.type, address: opts.address || this.wallet.address || this.previewAddr || fakeAddr(), realSol,
@@ -282,11 +301,18 @@ export class Engine extends EventEmitter {
     } finally { this.kickingOff = false; }
   }
 
+  /** Explicit "Reset paper book" only. Never called from Connect, reload, or AUTO_START. */
   reset() {
-    if (this.mode === 'live') throw new Error('reset is disabled in live mode');
+    if (this.mode === 'live' || this.mode === 'live-auto') throw new Error('reset is disabled in live mode');
     this.store.reset(); this.tuner = new AutoTune(); this.resetPaperBook();
     this.wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
     this.emitState();
+  }
+  private hasPaperBook() {
+    return this.positions.length > 0
+      || (this.wallet.depositUsd || 0) > 0
+      || (this.wallet.solBalance || 0) > 0
+      || this.store.trades(1).length > 0;
   }
   /** Drop simulated positions and session history so a new test balance starts clean. */
   private resetPaperBook() {
@@ -825,6 +851,13 @@ export class Engine extends EventEmitter {
         await poolRun(tpMarks, 3, async ({ p, markNet }) => {
           if (this.selling.has(p.id)) return;
           const quoted = await this.quotedNetPnlPct(p);
+          const realistic = this.cfg.realisticPaper !== false;
+          if (realistic) {
+            // Only close when a real sell quote is in profit. No mark fallback.
+            if (quoted == null || quoted < target) return;
+            await this.closePosition(p, 'take_profit', `take profit +${quoted.toFixed(1)}% net (quote, target +${target}%)`, 1);
+            return;
+          }
           const useQuote = quoted != null && quoted >= target;
           const net = useQuote ? quoted! : markNet;
           if (net < target) return;
@@ -895,6 +928,32 @@ export class Engine extends EventEmitter {
     return { ok: true, symbol: p.symbol, pnlUsd, pending: r.pending };
   }
 
+  /** Sell every open position in parallel with retries. Paper uses sim fills; live/live-auto use the real swap path. */
+  async closeAll(): Promise<{ ok: boolean; closed: number; failed: number; results: { id: string; symbol: string; ok: boolean; pnlUsd?: number; error?: string; pending?: boolean }[] }> {
+    const list = [...this.positions];
+    const results: { id: string; symbol: string; ok: boolean; pnlUsd?: number; error?: string; pending?: boolean }[] = [];
+    await poolRun(list, 6, async (p) => {
+      let lastErr = 'close failed';
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await this.closePosition(p, 'manual', 'close all', 1);
+          if (r.ok) {
+            const last = this.store.trades(1)[0];
+            results.push({ id: p.id, symbol: p.symbol, ok: true, pending: r.pending, pnlUsd: last && last.id === p.id ? last.pnlUsd : undefined });
+            return;
+          }
+          lastErr = r.error || lastErr;
+        } catch (e: any) {
+          lastErr = e?.message || String(e);
+        }
+        await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
+      }
+      results.push({ id: p.id, symbol: p.symbol, ok: false, error: lastErr });
+    });
+    this.emitState();
+    return { ok: results.every((r) => r.ok), closed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+  }
+
   async closePosition(p: Position, kind: string, reason: string, fraction = 1): Promise<{ ok: boolean; error?: string; pending?: boolean }> {
     if (this.selling.has(p.id) && fraction >= 0.999) return { ok: false, error: 'already closing' };
     this.selling.add(p.id);
@@ -909,8 +968,12 @@ export class Engine extends EventEmitter {
     const hair = (SWAP_FEE_BPS + (this.cfg.extraSlippageBps || 0)) / 1e4;
     const markPx = p.lastPrice * (1 - hair);
     const markBack = this.solPrice > 0 ? (qty * markPx) / this.solPrice : 0;
+    const realistic = this.mode === 'paper' && this.cfg.realisticPaper !== false;
     if (!f.ok) {
-      const allowMark = this.mode === 'paper' && (kind === 'manual' || kind === 'take_profit');
+      // Realistic TP never invents a fill. Manual Close / Close all may still
+      // settle on the mark after a failed quote so the user can flatten.
+      const allowMark = this.mode === 'paper' && (kind === 'manual' || (!realistic && kind === 'take_profit'));
+      if (realistic && kind === 'take_profit') return { ok: false, error: f.error || 'no sell quote' };
       if (!allowMark && kind === 'manual') return { ok: false, error: f.error || 'sell failed' };
       this.sellFails[p.id] = (this.sellFails[p.id] || 0) + 1;
       if (!allowMark && this.sellFails[p.id] < 6) return { ok: false, error: f.error || 'sell failed' };
@@ -920,9 +983,9 @@ export class Engine extends EventEmitter {
     } else {
       solBack = f.solReceived - f.feesSol;
       fillPrice = f.fillPrice;
-      // Paper TP: if the live quote would lock in a loss (or miss the target)
-      // while the mark is in profit, close on the mark estimate instead.
-      if (this.mode === 'paper' && kind === 'take_profit' && this.solPrice > 0) {
+      // Optimistic paper only: if the quote would miss the TP target while the
+      // mark is in profit, settle on the mark. Realistic paper always books the quote.
+      if (!realistic && this.mode === 'paper' && kind === 'take_profit' && this.solPrice > 0) {
         const fillPnl = solBack * this.solPrice - (p.costUsd * frac);
         const markPnl = markBack * this.solPrice - (p.costUsd * frac);
         const targetUsd = p.costUsd * frac * (this.tuner.takeProfitPct(this.cfg.takeProfitPct ?? 3) / 100);
@@ -1107,16 +1170,56 @@ export class Engine extends EventEmitter {
     });
     return { ok: true, withdrawTo: address, persisted: canPersistRenderEnv() };
   }
-  async withdraw() {
+  async withdraw(opts: { sol?: number; max?: boolean } = {}) {
+    if (this.mode === 'paper') throw new Error('Withdraw is disabled in paper mode. It only sends real SOL from the bot wallet to the locked Phantom address in live-auto.');
     const to = this.lockedWithdrawTo();
     if (!to) throw new Error('lock a withdraw address first (connect Phantom once and sign) or set WITHDRAW_TO');
     if (this.positions.length) throw new Error('close open positions and pause the bot before withdrawing');
     if (this.pending.size) throw new Error('a swap is still pending');
-    const r = await withdrawToLocked(this.cfg.rpcUrl, to);
+    if (this.wallet.running) this.setRunning(false);
+    const lamports = opts.max || opts.sol == null || !Number.isFinite(Number(opts.sol))
+      ? undefined
+      : Math.floor(Number(opts.sol) * 1e9);
+    if (lamports !== undefined && lamports <= 0) throw new Error('enter an amount greater than 0, or use max');
+    const r = await withdrawToLocked(this.cfg.rpcUrl, to, lamports);
     await this.syncBotBalance();
-    this.log('Core', 'info', `withdrew ${(r.lamports / 1e9).toFixed(4)} SOL to locked address (closed ${r.closedAccounts} empty token accounts)`);
+    const rec = {
+      ts: Date.now(),
+      sol: r.lamports / 1e9,
+      to,
+      signature: r.signature,
+      solscan: `https://solscan.io/tx/${r.signature}`,
+      closedAccounts: r.closedAccounts,
+    };
+    const hist = this.store.get<any[]>('withdrawHistory', []);
+    hist.unshift(rec);
+    this.store.set('withdrawHistory', hist.slice(0, 50));
+    this.log('Core', 'info', `withdrew ${rec.sol.toFixed(4)} SOL to locked address (closed ${r.closedAccounts} empty token accounts)`);
     this.emitState();
-    return { ok: true, signature: r.signature, sol: r.lamports / 1e9, closedAccounts: r.closedAccounts, to };
+    return { ok: true, ...rec };
+  }
+
+  async fundsView() {
+    const bot = botPublicKey();
+    const onchain = bot ? await getSolBalance(this.cfg.rpcUrl, bot) : null;
+    if (this.mode !== 'paper' && bot && onchain != null) {
+      this.wallet.realSol = onchain;
+      if (this.mode === 'live-auto') this.wallet.solBalance = onchain;
+    }
+    return {
+      mode: this.mode,
+      paperDisabled: this.mode === 'paper',
+      botAddress: bot || '2VscQ33yZudTXXNjCpfB5X4jsJVL4ZoZxGDzS5xCtLYo',
+      onchainSol: onchain,
+      onchainUsd: onchain != null ? onchain * (this.solPrice || 0) : null,
+      solPrice: this.solPrice,
+      withdrawTo: this.lockedWithdrawTo(),
+      withdrawLocked: !!this.lockedWithdrawTo(),
+      lockedBy: this.withdrawLockedBy(),
+      history: this.store.get<any[]>('withdrawHistory', []).slice(0, 50),
+      positionsOpen: this.positions.length,
+      running: this.wallet.running,
+    };
   }
 
   // ---------------------------------------------------------------- views
@@ -1165,7 +1268,7 @@ export class Engine extends EventEmitter {
       sizeMult: adapted.sizeMult, pauseUntil: this.lossPauseUntil, scan: this.scanStatus(),
       keepalive: keepaliveSnapshot(),
       push: { enabled: pushEnabled(), subscribers: subscriberCount() },
-      background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, autoStart: autoStartEnabled(), ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH, withdrawPersist: canPersistRenderEnv() ? 'env' : 'local-until-saved' },
+      background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, autoStart: autoStartEnabled(), ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH, withdrawPersist: canPersistRenderEnv() ? 'env' : 'local-until-saved', remoteState: remoteStateStatus() },
       pump: getPumpFeed().status,
       autotune: this.tuner.snapshot(),
       narrative: this.narrative,
@@ -1235,8 +1338,22 @@ export class Engine extends EventEmitter {
   }
 
   // ---------------------------------------------------------------- helpers
-  private persist() { this.store.set('positions', this.positions); this.saveWallet(); }
+  private lastReconcileAt = 0;
+  async maybeReconcile() {
+    if (this.mode === 'paper') return;
+    if (Date.now() - this.lastReconcileAt < 8000) return;
+    this.lastReconcileAt = Date.now();
+    await this.reconcileOnchain();
+  }
+  private persist() {
+    this.store.set('positions', this.positions);
+    this.saveWallet();
+    const cfg = { ...this.cfg } as any;
+    delete cfg.liveConfirm; delete cfg.mode; delete cfg.rpcUrl; delete cfg.port;
+    this.store.set('config', cfg);
+  }
   private saveWallet() { this.store.set('wallet', this.wallet); }
+
   private decision(d: Decision) { this.store.addDecision(d); this.emit('decision', d); }
   log(agent: ActivityItem['agent'], kind: ActivityItem['kind'], text: string, extra: Partial<ActivityItem> & { text2?: string } = {}) {
     const a = { id: randomUUID(), ts: Date.now(), agent, kind, text, ...extra } as ActivityItem;

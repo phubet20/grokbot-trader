@@ -13,10 +13,23 @@ import { Engine } from './engine.ts';
 import { initPush, vapidPublicKey, pushEnabled, addSubscription, removeSubscription, subscriberCount } from './push.ts';
 import { startKeepalive, keepaliveSnapshot } from './keepalive.ts';
 import { prepareDepositTx } from './deposit.ts';
+import { hydrateStore, attachRemoteSync, flushRemote, remoteStateConfigured, remoteStateStatus } from './remote-state.ts';
 
 const market = config.dataSource === 'replay' ? new ReplayMarket(Number(process.env.REPLAY_SPEED) || 6) : new LiveMarket();
 const store = new Store();
-const engine = new Engine(config, market, store);
+let engine!: Engine;
+
+async function bootEngine() {
+  const restored = await hydrateStore(store);
+  attachRemoteSync(store);
+  const savedCfg = store.get<any>('config', null);
+  if (savedCfg) updateConfig(savedCfg);
+  engine = new Engine(config, market, store);
+  if (restored) console.log('[boot] paper book restored from remote state');
+  else if (remoteStateConfigured()) console.log('[boot] remote state configured, no snapshot yet');
+  return engine;
+}
+const booted = bootEngine();
 const DIST = join(ROOT, 'web/dist');
 const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 
@@ -58,6 +71,7 @@ const server = createServer(async (req, res) => {
   const p = inner;
   const json = (code: number, d: unknown) => { res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(d)); };
   try {
+    await booted;
     if (p === '/api/events') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       res.write(`event: state\ndata: ${JSON.stringify(engine.snapshot())}\n\n`);
@@ -66,7 +80,8 @@ const server = createServer(async (req, res) => {
       req.on('close', () => { clients.delete(res); clearInterval(ka); });
       return;
     }
-    if (p === '/api/state') return json(200, engine.snapshot());
+    if (p === '/api/state') { await engine.maybeReconcile(); return json(200, engine.snapshot()); }
+    if (p === '/api/funds') return json(200, await engine.fundsView());
     if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
     if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt });
@@ -82,15 +97,20 @@ const server = createServer(async (req, res) => {
       if (p === '/api/bot/run') { engine.setRunning(!!b.running); return json(200, { ok: true }); }
       if (p === '/api/config') { updateConfig(b); engine.emitState(); return json(200, { ...config, liveConfirm: undefined }); }
       if (p === '/api/reset') { engine.reset(); return json(200, { ok: true }); }
+      if (p === '/api/paper/reset') { engine.reset(); return json(200, { ok: true }); }
       if (p === '/api/live/signed') { if (!liveGate().live || liveGate().auto) return json(403, { error: 'live disabled' }); engine.liveSigned(String(b.id), String(b.signature)); return json(200, { ok: true }); }
       if (p === '/api/live/rejected') { engine.liveRejected(String(b.id)); return json(200, { ok: true }); }
       if (p === '/api/withdraw/lock') return json(200, engine.lockWithdraw(String(b.address || ''), String(b.message || ''), String(b.signature || '')));
-      if (p === '/api/withdraw') return json(200, await engine.withdraw());
+      if (p === '/api/withdraw') return json(200, await engine.withdraw(b || {}));
       if (p === '/api/push/subscribe') return json(200, addSubscription(b));
       if (p === '/api/push/unsubscribe') return json(200, removeSubscription(String(b.endpoint || '')));
       if (p === '/api/position/close') {
         const r = await engine.manualClose(String(b.id || b.mint || ''));
         return json(r.ok ? 200 : 400, r);
+      }
+      if (p === '/api/position/close-all') {
+        const r = await engine.closeAll();
+        return json(200, r);
       }
       if (p === '/api/deposit/prepare') {
         const to = botPublicKey();
@@ -123,11 +143,21 @@ server.listen(config.port, host, async () => {
   console.log(`  ${g.reason}`);
   if (g.auto) console.log(`  bot wallet: ${botPublicKey() || '(not configured)'}`);
   console.log(`  open http://${host === '0.0.0.0' ? 'localhost' : host}:${config.port}/${ACCESS_TOKEN ? '<ACCESS_TOKEN>/' : ''}\n`);
+  await booted;
+  const rs = remoteStateStatus();
+  if (rs.configured) console.log(`  remote paper state: on (${rs.repo || 'configured'})`);
+  else console.log('  remote paper state: off (set STATE_GITHUB_TOKEN to persist across deploys)');
   initPush(store);
   if (typeof (market as any).start === 'function') (market as any).start();
   await engine.start();
   startKeepalive();
 });
-const shutdown = () => { engine.stop(); server.close(); process.exit(0); };
-process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
+const shutdown = async () => {
+  try { await flushRemote(store); } catch {}
+  if (engine) engine.stop();
+  server.close();
+  process.exit(0);
+};
+process.on('SIGINT', () => { void shutdown(); });
+process.on('SIGTERM', () => { void shutdown(); });
 

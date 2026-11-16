@@ -7,10 +7,11 @@ import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, Agen
 import { TokenDetail } from './components/TokenDetail';
 import { Toasts, Confetti, Recap } from './components/Overlays';
 import { Account } from './components/Account';
+import { Funds } from './components/Funds';
 import { Approvals } from './components/Approvals';
-import { HomeI, AgentsI, PulseI, UserI, BotIcon } from './components/Icons';
+import { HomeI, AgentsI, PulseI, UserI, WalletI, BotIcon } from './components/Icons';
 
-type Tab = 'home' | 'agents' | 'activity' | 'account';
+type Tab = 'home' | 'funds' | 'agents' | 'activity' | 'account';
 
 export default function App() {
   const { snap, toasts, setToasts, approvals, setApprovals, online } = useLive();
@@ -35,7 +36,7 @@ export default function App() {
       setToasts([{ id: 999, kind: w.pnlUsd > 0 ? 'profit' : 'fill', title: w.pnlUsd > 0 ? `Risk sold ${w.symbol} - locked the gain` : `Risk sold ${w.symbol}`, usd: w.pnlUsd, pct: w.pnlPct, symbol: w.symbol, image: w.image, text: w.reason }]);
     }).catch(() => {});
   }, []);
-  const splashDone = useCallback(() => setStage('connect'), []);
+  const splashDone = useCallback(() => setStage(snap?.wallet?.connected ? 'app' : 'connect'), [snap]);
 
   if (stage === 'splash' || !snap) return <Splash appName={snap?.appName || 'Grok Bot'} ready={!!snap} onDone={splashDone} />;
   if (stage === 'connect') return <div className="app-shell"><Splash appName={snap.appName} ready={false} onDone={() => {}} /><ConnectSheet snap={snap} onStart={() => setStage('setup')} /></div>;
@@ -62,11 +63,12 @@ export default function App() {
         </>}
         {tab === 'agents' && <div className="page"><div className="page-title"><BotIcon size={28} /> Agents</div><ScanStatus snap={snap} /><AgentCards snap={snap} onOpen={open} /><AutoTunePanel snap={snap} /><AgentsList snap={snap} /><Repos snap={snap} /><Decisions snap={snap} limit={30} /></div>}
         {tab === 'activity' && <div className="page"><div className="page-title"><BotIcon size={28} /> Activity</div><Positions snap={snap} onOpen={open} /><Activity snap={snap} onOpen={open} limit={100} title={false} /></div>}
+        {tab === 'funds' && <Funds snap={snap} />}
         {tab === 'account' && <><div className="page-title" style={{ padding: '16px 16px 0' }}><BotIcon size={28} /> Account</div><Account snap={snap} onRecap={() => setRecap(true)} onDisconnected={() => setStage('connect')} /></>}
         <div style={{ height: 90 }} />
       </div>
       <nav className="tabbar">
-        {([['home', 'Home', HomeI], ['agents', 'Agents', AgentsI], ['activity', 'Activity', PulseI], ['account', 'Account', UserI]] as const).map(([k, l, I]) => (
+        {([['home', 'Home', HomeI], ['funds', 'Funds', WalletI], ['agents', 'Agents', AgentsI], ['activity', 'Activity', PulseI], ['account', 'Account', UserI]] as const).map(([k, l, I]) => (
           <button key={k} className={tab === k ? 'on' : ''} onClick={() => { setTab(k); setToken(null); window.scrollTo(0, 0); }}><I size={21} /><span>{l}</span></button>
         ))}
       </nav>

@@ -48,7 +48,7 @@ export class Store {
 }
 
 /** Keys that may be mirrored to the private GitHub state repo. Never include secrets. */
-export const SYNC_KV = ['wallet', 'positions', 'cooldown', 'autotune', 'agents', 'lossPauseUntil'] as const;
+export const SYNC_KV = ['wallet', 'positions', 'cooldown', 'autotune', 'agents', 'lossPauseUntil', 'config', 'withdrawHistory', 'withdrawTo'] as const;
 
 export type PaperSnapshot = {
   v: 1;
@@ -61,14 +61,27 @@ export type PaperSnapshot = {
 export function exportSnapshot(store: Store): PaperSnapshot {
   const kv: Record<string, unknown> = {};
   for (const k of SYNC_KV) kv[k] = store.get(k, null);
+  if (kv.config && typeof kv.config === 'object') {
+    const cfg = { ...(kv.config as any) };
+    delete cfg.liveConfirm; delete cfg.mode; delete cfg.rpcUrl;
+    kv.config = cfg;
+  }
   return { v: 1, savedAt: Date.now(), kv, trades: store.trades(1000), equity: store.equity(0).slice(-2000) };
 }
 
 export function importSnapshot(store: Store, snap: PaperSnapshot): boolean {
   if (!snap || snap.v !== 1 || typeof snap !== 'object') return false;
   const kv = snap.kv || {};
+  const forbidden = /secret|token|private|seed|mnemonic|password|api[_-]?key/i;
   for (const k of SYNC_KV) {
+    if (forbidden.test(k)) continue;
     if (k in kv && kv[k] != null) store.set(k, kv[k]);
+  }
+  // Never import live mode / confirm / rpc from a snapshot.
+  if (kv.config && typeof kv.config === 'object') {
+    const cfg = { ...(kv.config as any) };
+    delete cfg.liveConfirm; delete cfg.mode; delete cfg.rpcUrl; delete cfg.port;
+    store.set('config', cfg);
   }
   for (const t of snap.trades || []) {
     if (t && t.id && t.closedAt) store.addTrade(t);

@@ -41,6 +41,7 @@ export type Config = {
   monitorIntervalSec: number;
   rpcUrl: string;
   liveConfirm: string;         // must equal LIVE_CONFIRM_PHRASE for live mode
+  realisticPaper: boolean;     // paper TP/close settles on the real sell quote (default)
 };
 
 export const DEFAULTS: Config = {
@@ -74,6 +75,7 @@ export const DEFAULTS: Config = {
   monitorIntervalSec: 1,
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   liveConfirm: '',
+  realisticPaper: true,
 };
 
 const NUM_KEYS = Object.keys(DEFAULTS).filter((k) => typeof (DEFAULTS as any)[k] === 'number');
@@ -100,6 +102,8 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
     if (NUM_KEYS.includes(k)) {
       const n = Number(v);
       if (Number.isFinite(n)) out[k] = n;
+    } else if (typeof (DEFAULTS as any)[k] === 'boolean') {
+      out[k] = v === true || v === 'true' || v === 1 || v === '1';
     } else if (typeof v === 'string') out[k] = v;
   }
   if (out.startUsd !== undefined) out.startUsd = Math.max(2, out.startUsd);
