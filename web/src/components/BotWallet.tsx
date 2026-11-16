@@ -16,6 +16,7 @@ export function BotWalletPanel({ snap, compact = false }: { snap: any; compact?:
   const bw = snap.botWallet;
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
+  const [solAmt, setSolAmt] = useState('0.05');
   const phantom = getPhantom();
   if (!bw?.publicKey) return <p className="note">Bot wallet is not configured on the server.</p>;
   const qr = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=8&data=${encodeURIComponent(bw.publicKey)}`;
@@ -48,6 +49,36 @@ export function BotWalletPanel({ snap, compact = false }: { snap: any; compact?:
     setBusy(false);
   }
 
+  async function deposit() {
+    setMsg(''); setBusy(true);
+    try {
+      const ph = getPhantom();
+      const amount = Number(solAmt);
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error('Enter an amount of SOL greater than 0');
+      if (!ph) {
+        setMsg('Open this page in Phantom to sign the deposit, or send SOL to the address / QR above.');
+        setBusy(false);
+        return;
+      }
+      const r = await ph.connect();
+      const from = r.publicKey.toString();
+      const built = await api('deposit/prepare', { from, sol: amount });
+      // Paper / dry-run: never send. Live modes sign in Phantom after confirm.
+      if (snap.mode === 'paper') {
+        setMsg(`Dry-run: would send ${built.sol} SOL from ${from.slice(0, 4)}…${from.slice(-4)} to the bot wallet. Not sent (paper mode).`);
+        setBusy(false);
+        return;
+      }
+      if (!confirm(`Send ${built.sol} SOL from your Phantom wallet to the bot wallet?`)) { setBusy(false); return; }
+      const { Transaction } = await import('@solana/web3.js');
+      const raw = Uint8Array.from(atob(built.txBase64), (c) => c.charCodeAt(0));
+      const tx = Transaction.from(raw);
+      const sig = await ph.signAndSendTransaction(tx);
+      setMsg('Deposit sent ' + (sig.signature || sig));
+    } catch (e: any) { setMsg(e.message || String(e)); }
+    setBusy(false);
+  }
+
   return (
     <div className="bot-wallet" data-testid="bot-wallet">
       {!compact && <div className="sec-hd"><b>Bot wallet</b><span className="chip-live chip mono">LIVE AUTO</span></div>}
@@ -68,7 +99,17 @@ export function BotWalletPanel({ snap, compact = false }: { snap: any; compact?:
       ) : (
         <p className="note">Connect Phantom once and sign to lock withdrawals to <b>your</b> address. After that, nobody with the link can send funds elsewhere.</p>
       )}
-      {msg && <p className="tiny">{msg}</p>}
+      {msg && <p className="tiny" data-testid="deposit-msg">{msg}</p>}
+      <div className="deposit-box">
+        <div className="muted tiny">Deposit from Phantom</div>
+        <div className="deposit-row">
+          <input type="number" min="0.001" step="0.001" value={solAmt} onChange={(e) => setSolAmt(e.target.value)} aria-label="SOL amount" data-testid="deposit-sol" />
+          {phantom
+            ? <button type="button" className="pill-btn small-btn" disabled={busy} onClick={deposit} data-testid="deposit-from-phantom">Deposit from Phantom</button>
+            : <a className="pill-btn small-btn sheet-btn phantom-open" href={phantomBrowseUrl()} data-testid="open-in-phantom-deposit"><PhantomIcon size={18} /> Open in Phantom to deposit</a>}
+        </div>
+        <p className="tiny muted">{snap.mode === 'paper' ? 'Paper mode: this builds the transfer and does not send it. Use the QR or address as a fallback.' : 'Signs a SOL transfer from your Phantom wallet to the bot address. You can also send to the QR / address above.'}</p>
+      </div>
       <div className="btn-row">
         {!bw.withdrawLocked && (
           phantom

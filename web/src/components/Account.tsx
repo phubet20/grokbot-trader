@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api, usd, short } from '../api';
 import { BotWalletPanel } from './BotWallet';
+import { NotifyPanel } from './NotifyPanel';
 
 const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of portfolio)', 1, 50, 1],
@@ -36,8 +37,10 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
           <button className="pill-btn small-btn" data-testid="bot-toggle" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Stop bot' : 'Start bot'}</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
         </div>
+        <p className="tiny muted" data-testid="background-note">The bot trades on the server — you can close the app. Start/Stop is saved and comes back after a restart. On the free host, sleep after ~15 min idle is still possible; a keepalive ping tries to prevent it but is not guaranteed, and without a persistent disk a sleep or redeploy can reset the saved state.</p>
       </div>
-      {snap.mode === 'live-auto' && <div className="section card"><BotWalletPanel snap={snap} /></div>}
+      <NotifyPanel snap={snap} />
+      {snap.botWallet?.publicKey && <div className="section card"><BotWalletPanel snap={snap} /></div>}
       <div className="section card">
         <div className="sec-hd"><b>Risk & strategy</b><span className="pos small">{msg}</span></div>
         {FIELDS.map(([k, label, min, max, step]) => (

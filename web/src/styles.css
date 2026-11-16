@@ -217,3 +217,9 @@ code { font-family: var(--mono); font-size: 12px; background: var(--chip); paddi
 .low-bal { margin: 8px 16px; padding: 10px 12px; border-radius: 12px; background: #fff3f0; color: #b42318; font-size: 13px; }
 [data-theme='dark'] .low-bal { background: #2a1210; color: #ff8a80; }
 .note.neg { background: #fff3f0; color: #b42318; }
+
+.scan-status { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; color: var(--muted); justify-content: space-between; }
+.scan-status span { white-space: nowrap; }
+.notify-box .hint { margin-top: 8px; }
+.deposit-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.deposit-row input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); }

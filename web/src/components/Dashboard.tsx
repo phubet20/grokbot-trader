@@ -189,3 +189,22 @@ export function Activity({ snap, onOpen, limit = 8, title = true }: { snap: any;
     </div>
   );
 }
+
+export function ScanStatus({ snap }: { snap: any }) {
+  const sc = snap.scan || {};
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const i = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(i); }, []);
+  const ago = sc.lastScanAt ? (now - sc.lastScanAt) / 1000 : null;
+  const agoTxt = ago == null ? 'not yet' : ago < 1.5 ? 'just now' : `${Math.round(ago)}s ago`;
+  const cadence = sc.cadenceMs ? `${(sc.cadenceMs / 1000).toFixed(1)}s` : '—';
+  const ka = snap.keepalive;
+  return (
+    <div className="scan-status mono tiny" data-testid="scan-status">
+      <span>scan {agoTxt}</span>
+      <span>{sc.candidatesPerMin || 0}/min</span>
+      <span>{sc.inFlightChecks || 0} in-flight</span>
+      <span>{cadence} cadence</span>
+      {ka?.enabled && <span className="muted" title={ka.officialGuarantee ? 'guaranteed' : 'best-effort keepalive, not officially guaranteed'}>keep {ka.lastOkAt ? `${Math.round((now - ka.lastOkAt) / 60000)}m ago` : 'pending'}</span>}
+    </div>
+  );
+}

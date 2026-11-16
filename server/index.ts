@@ -10,6 +10,9 @@ import { LiveMarket } from './market.ts';
 import { ReplayMarket } from './replay.ts';
 import { Store } from './store.ts';
 import { Engine } from './engine.ts';
+import { initPush, vapidPublicKey, pushEnabled, addSubscription, removeSubscription, subscriberCount } from './push.ts';
+import { startKeepalive, keepaliveSnapshot } from './keepalive.ts';
+import { prepareDepositTx } from './deposit.ts';
 
 const market = config.dataSource === 'replay' ? new ReplayMarket(Number(process.env.REPLAY_SPEED) || 6) : new LiveMarket();
 const store = new Store();
@@ -64,12 +67,13 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (p === '/api/state') return json(200, engine.snapshot());
-    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError });
+    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
     if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt });
     if (p === '/api/trades') return json(200, store.trades(500));
     if (p === '/api/activity') return json(200, store.activity(Number(url.searchParams.get('limit')) || 200));
     if (p.startsWith('/api/token/')) return json(200, await engine.tokenDetail(decodeURIComponent(p.slice(11)), url.searchParams.get('tf') || '1m'));
+    if (p === '/api/push/vapid') return json(200, { enabled: pushEnabled(), publicKey: vapidPublicKey() || '', subscribers: subscriberCount() });
     if (req.method === 'POST') {
       const b = await body(req);
       if (p === '/api/wallet/preview') return json(200, await engine.preview(b));
@@ -82,13 +86,23 @@ const server = createServer(async (req, res) => {
       if (p === '/api/live/rejected') { engine.liveRejected(String(b.id)); return json(200, { ok: true }); }
       if (p === '/api/withdraw/lock') return json(200, engine.lockWithdraw(String(b.address || ''), String(b.message || ''), String(b.signature || '')));
       if (p === '/api/withdraw') return json(200, await engine.withdraw());
+      if (p === '/api/push/subscribe') return json(200, addSubscription(b));
+      if (p === '/api/push/unsubscribe') return json(200, removeSubscription(String(b.endpoint || '')));
+      if (p === '/api/deposit/prepare') {
+        const to = botPublicKey();
+        if (!to) return json(400, { error: 'bot wallet is not configured' });
+        const from = String(b.from || '');
+        const built = await prepareDepositTx(config.rpcUrl, from, to, Number(b.sol));
+        return json(200, built); // unsigned; never sent here
+      }
     }
     if (p.startsWith('/api/')) return json(404, { error: 'not found' });
     // static
     let f = normalize(join(DIST, p === '/' ? 'index.html' : p));
     if (!f.startsWith(DIST)) return json(403, { error: 'forbidden' });
     try { if (!(await stat(f)).isFile()) throw 0; } catch { f = join(DIST, 'index.html'); }
-    res.writeHead(200, { 'content-type': MIME[extname(f)] || 'application/octet-stream', 'cache-control': f.endsWith('index.html') ? 'no-cache' : 'public, max-age=86400' });
+    const nocache = f.endsWith('index.html') || f.endsWith('sw.js') || f.endsWith('manifest.webmanifest');
+    res.writeHead(200, { 'content-type': MIME[extname(f)] || 'application/octet-stream', 'cache-control': nocache ? 'no-cache' : 'public, max-age=86400' });
     res.end(await readFile(f));
   } catch (e: any) {
     json(400, { error: redactSecrets(e?.message || String(e)) });
@@ -105,21 +119,10 @@ server.listen(config.port, host, async () => {
   console.log(`  ${g.reason}`);
   if (g.auto) console.log(`  bot wallet: ${botPublicKey() || '(not configured)'}`);
   console.log(`  open http://${host === '0.0.0.0' ? 'localhost' : host}:${config.port}/${ACCESS_TOKEN ? '<ACCESS_TOKEN>/' : ''}\n`);
+  initPush(store);
   await engine.start();
   startKeepalive();
 });
 const shutdown = () => { engine.stop(); server.close(); process.exit(0); };
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 
-/** Render free instances sleep after ~15 min without inbound HTTP. Pinging the
- *  public /healthz may count as inbound traffic and keep the process awake.
- *  This is not officially guaranteed. The free plan also caps 750 instance-hours
- *  per month (~24/7 uses ~720–744 hours). Localhost pings do not prevent sleep. */
-function startKeepalive() {
-  const url = process.env.KEEPALIVE_URL || (process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '') + '/healthz' : '');
-  if (!url) return;
-  const tick = () => fetch(url, { method: 'GET' }).then((r) => { if (!r.ok) console.log('keepalive', r.status); }).catch((e) => console.log('keepalive fail', e?.message || e));
-  setTimeout(tick, 15_000);
-  setInterval(tick, 8 * 60_000);
-  console.log('  keepalive -> public /healthz every 8 minutes');
-}

@@ -13,6 +13,8 @@ import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, re
 import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, momentumFadeStrict, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
+import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
+import { keepaliveSnapshot } from './keepalive.ts';
 
 export type Wallet = {
   connected: boolean;
@@ -33,6 +35,27 @@ type Pending = { id: string; side: 'buy' | 'sell'; mint: string; createdAt: numb
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const fakeAddr = () => Array.from(randomBytes(43), (b) => B58[b % 58]).join('');
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
+const CHECK_TIMEOUT_MS = 4000;
+const SCAN_FETCH_TIMEOUT_MS = 5500;
+
+export function withTimeout<T>(p: Promise<T>, ms: number, label = 'timeout'): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+async function poolRun<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
+  let i = 0;
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      await fn(item);
+    }
+  }));
+}
+
 
 export class Engine extends EventEmitter {
   cfg: Config;
@@ -47,7 +70,7 @@ export class Engine extends EventEmitter {
   cooldown: Record<string, number>;
   pending = new Map<string, Pending>();
   agents = {
-    scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, top: '' as string, topImage: '' as string | undefined, calls: 0 },
+    scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0 },
     safety: { checked: 0, rejected: 0, passed: 0, last: '', lastSymbol: '', lastOk: true, calls: 0 },
     analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
     risk: { status: 'Guarding', label: '', exits: 0 },
@@ -57,7 +80,12 @@ export class Engine extends EventEmitter {
   private timers: NodeJS.Timeout[] = [];
   private scanning = false;
   private monitoring = false;
+  private evaluating = false;
   private scanHistory: { t: number; n: number }[] = [];
+  private scanTimes: number[] = [];
+  private inFlightChecks = new Set<string>();
+  private buying = new Set<string>();
+  private selling = new Set<string>();
   private lastPairAt = 0;
   private lossPauseUntil = 0;
   private mintHist = new Map<string, TapeSnap[]>();
@@ -96,13 +124,24 @@ export class Engine extends EventEmitter {
     await this.refreshSol();
     if (this.mode === 'live-auto') await this.syncBotBalance();
     this.lossPauseUntil = this.store.get('lossPauseUntil', 0);
-    const loop = (fn: () => Promise<void>, sec: () => number) => {
-      const tick = async () => { try { await fn(); } catch (e: any) { this.log('Core', 'info', `error: ${e?.message || e}`); } this.timers.push(setTimeout(tick, sec() * 1000)); };
+    // Independent loops: the next tick is scheduled immediately, so a slow
+    // scan, buy, or sell never delays the cadence of the others.
+    const loop = (fn: () => Promise<void>, sec: () => number, name: string) => {
+      const tick = () => {
+        this.timers.push(setTimeout(tick, Math.max(0.25, sec()) * 1000));
+        fn().catch((e: any) => this.log('Core', 'info', `${name}: ${e?.message || e}`));
+      };
       tick();
     };
-    loop(() => this.scan(), () => this.cfg.scanIntervalSec);
-    loop(() => this.monitor(), () => this.cfg.monitorIntervalSec);
+    loop(() => this.scan(), () => this.cfg.scanIntervalSec, 'scan');
+    loop(() => this.evaluateEntries(), () => Math.max(1, Math.min(2, this.cfg.scanIntervalSec)), 'eval');
+    loop(() => this.monitor(), () => this.cfg.monitorIntervalSec, 'monitor');
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
+    if (this.wallet.connected && this.wallet.running) {
+      this.log('Core', 'info', 'resumed saved Start state — trading continues with the app closed');
+    } else if (this.wallet.connected) {
+      this.log('Core', 'info', 'bot is paused (saved Stop state); open the app and tap Start to resume');
+    }
   }
   stop() { for (const t of this.timers) clearTimeout(t); this.timers = []; }
 
@@ -194,19 +233,72 @@ export class Engine extends EventEmitter {
     return adaptFilters({ minScore: this.cfg.minScore, trailingStopPct: this.cfg.trailingStopPct, hardStopPct: this.cfg.hardStopPct }, this.recentPnls());
   }
 
+  private occupied() {
+    const s = new Set(this.positions.map((p) => p.mint));
+    for (const p of this.pending.values()) if (p.side === 'buy') s.add(p.mint);
+    for (const m of this.buying) s.add(m);
+    return s.size;
+  }
+  private alreadyHeld(mint: string) {
+    return this.positions.some((p) => p.mint === mint) || [...this.pending.values()].some((p) => p.mint === mint && p.side === 'buy');
+  }
+  private alreadyOn(mint: string) {
+    return this.alreadyHeld(mint) || this.buying.has(mint);
+  }
+  private bumpScanStats(now: number, scanned: number, pools: number) {
+    const sc = this.agents.scanner;
+    sc.pools = pools; sc.total += scanned; sc.lastScanAt = now; sc.calls++;
+    this.scanHistory.push({ t: now, n: scanned });
+    this.scanHistory = this.scanHistory.filter((x) => now - x.t < 3600_000);
+    this.scanTimes.push(now);
+    this.scanTimes = this.scanTimes.filter((t) => now - t < 5 * 60_000);
+    const span = Math.max(60_000, now - this.scanHistory[0].t);
+    sc.perHour = Math.round((this.scanHistory.reduce((a, x) => a + x.n, 0) / span) * 3600_000);
+    const lastMin = this.scanHistory.filter((x) => now - x.t <= 60_000);
+    sc.perMin = lastMin.reduce((a, x) => a + x.n, 0);
+    if (this.scanTimes.length >= 2) {
+      const gaps: number[] = [];
+      for (let i = 1; i < this.scanTimes.length; i++) gaps.push(this.scanTimes[i] - this.scanTimes[i - 1]);
+      gaps.sort((a, b) => a - b);
+      sc.cadenceMs = gaps[Math.floor(gaps.length / 2)] || 0;
+    }
+    sc.inFlightChecks = this.inFlightChecks.size;
+    sc.inFlightBuys = this.buying.size;
+    sc.inFlightSells = this.selling.size;
+  }
+  scanStatus() {
+    const sc = this.agents.scanner;
+    return {
+      lastScanAt: sc.lastScanAt,
+      lastScanAgoSec: sc.lastScanAt ? Math.max(0, (Date.now() - sc.lastScanAt) / 1000) : null,
+      candidatesPerMin: sc.perMin,
+      inFlightChecks: this.inFlightChecks.size,
+      inFlightBuys: this.buying.size,
+      inFlightSells: this.selling.size,
+      cadenceMs: sc.cadenceMs,
+    };
+  }
+  async flushWork(ms = 8000) {
+    const start = Date.now();
+    await Promise.resolve();
+    while (Date.now() - start < ms) {
+      const idle = !this.scanning && !this.evaluating && !this.monitoring && !this.inFlightChecks.size && !this.buying.size && !this.selling.size;
+      if (idle) {
+        await new Promise((r) => setTimeout(r, 25));
+        if (!this.scanning && !this.evaluating && !this.monitoring && !this.inFlightChecks.size && !this.buying.size && !this.selling.size) return;
+      }
+      await this.evaluateEntries().catch(() => {});
+      await new Promise((r) => setTimeout(r, 40));
+    }
+  }
+
   // ---------------------------------------------------------------- SCANNER
   async scan() {
     if (this.scanning) return;
     this.scanning = true;
     try {
-      const { list, scanned } = await this.m.candidates();
+      const { list, scanned } = await withTimeout(this.m.candidates(), SCAN_FETCH_TIMEOUT_MS, 'scan fetch timeout');
       const now = Date.now();
-      const sc = this.agents.scanner;
-      sc.pools = list.length; sc.total += scanned; sc.lastScanAt = now; sc.calls++;
-      this.scanHistory.push({ t: now, n: scanned });
-      this.scanHistory = this.scanHistory.filter((x) => now - x.t < 3600_000);
-      const span = Math.max(60_000, now - this.scanHistory[0].t);
-      sc.perHour = Math.round((this.scanHistory.reduce((a, x) => a + x.n, 0) / span) * 3600_000);
       for (const c of list) { this.candidates.set(c.mint, { ...this.candidates.get(c.mint), ...c, seenAt: now }); this.remember(c, now); }
       for (const [k, v] of this.candidates) if (now - v.seenAt > 3 * 3600_000 && !this.positions.some((p) => p.mint === k)) this.candidates.delete(k);
 
@@ -228,65 +320,12 @@ export class Engine extends EventEmitter {
       if (scored[0]) {
         const t = scored[0];
         Object.assign(this.agents.analyst, { lastScore: t.s.score, lastSymbol: t.c.symbol, lastImage: t.c.image, bull: t.s.bull, bear: t.s.bear, note: t.s.note });
-        sc.top = t.c.symbol; sc.topImage = t.c.image;
+        this.agents.scanner.top = t.c.symbol; this.agents.scanner.topImage = t.c.image;
       }
       this.emit('agents', this.agents);
-
-      if (!this.wallet.connected || !this.wallet.running) return;
-      this.rollDay();
-      const reservedOpen = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
-      const adapted = this.riskAdapted();
-      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
-      const slots = usableSlots(this.cfg, this.equity(), this.cashUsd(), reserveUsd, reservedOpen);
-      if (!slots || reservedOpen >= this.cfg.maxPositions) {
-        this.agents.risk.label = reservedOpen ? `holding ${reservedOpen}/${this.cfg.maxPositions}` : (lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) || 'no free slot');
-        return;
-      }
-      let checks = 0;
-      for (const { c, s } of scored) {
-        if (this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length >= this.cfg.maxPositions) break;
-        if (s.score < adapted.minScore) continue;
-        const ent = liveEntryOk(c, this.mintHist.get(c.mint) || [], this.strat(), now);
-        if (!ent.ok) continue;
-        if (checks >= 10) break;
-        const blocked = entryBlocked(this.cfg, {
-          openPositions: this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length,
-          dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
-          alreadyHolding: this.positions.some((p) => p.mint === c.mint) || [...this.pending.values()].some((p) => p.mint === c.mint),
-          inCooldown: (this.cooldown[c.mint] || 0) > now,
-          pausedUntil: this.lossPauseUntil, now,
-        });
-        if (blocked) {
-          if (blocked.startsWith('max') || blocked.startsWith('daily') || blocked.startsWith('cooldown after consecutive')) { this.agents.risk.label = blocked; break; }
-          continue;
-        }
-        checks++;
-        const sec = await this.m.security(c.mint);
-        this.agents.safety.calls++;
-        const sr = securityCheck(sec, this.cfg);
-        Object.assign(this.agents.safety, { last: sr.label, lastSymbol: c.symbol, lastOk: sr.ok });
-        this.candidates.get(c.mint)!.safety = sr.label;
-        if (!sr.ok) {
-          this.agents.safety.rejected++;
-          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `safety: ${sr.reasons.slice(0, 2).join(', ')}` });
-          this.cooldown[c.mint] = Date.now() + 20 * 60_000;
-          continue;
-        }
-        const openNow = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
-        const trialSize = slotSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, openNow);
-        if (!trialSize) { this.agents.risk.label = lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) || 'not enough free cash'; break; }
-        const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
-        if (!okSell) {
-          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'safety: Jupiter reverse quote failed (not sellable)' });
-          this.cooldown[c.mint] = Date.now() + 15 * 60_000;
-          continue;
-        }
-        this.agents.safety.passed++;
-        this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
-        await this.openPosition(c, s.score, `${ent.reason} · score ${s.score}`);
-        // keep filling free slots in this scan
-      }
-      this.store.set('cooldown', this.cooldown);
+      this.bumpScanStats(now, scanned, list.length);
+      // Evaluation, buys, and sells run on their own loops — do not await them here.
+      void this.evaluateEntries();
     } finally {
       this.scanning = false;
       this.store.set('agents', this.agents);
@@ -294,21 +333,129 @@ export class Engine extends EventEmitter {
     }
   }
 
+  // ---------------------------------------------------------------- concurrent evaluation (does not block scanning)
+  async evaluateEntries() {
+    if (this.evaluating) return;
+    if (!this.wallet.connected || !this.wallet.running) return;
+    this.evaluating = true;
+    try {
+      this.rollDay();
+      const now = Date.now();
+      const adapted = this.riskAdapted();
+      const scored = [...this.candidates.values()]
+        .filter((c) => now - c.seenAt < 120_000)
+        .map((c) => ({ c, s: { score: c.score || 0, bull: 0, bear: 0, note: '', parts: {} } }))
+        .filter(({ c, s }) => (s.score || 0) >= adapted.minScore)
+        .sort((a, b) => (b.s.score || 0) - (a.s.score || 0))
+        .slice(0, 16);
+      if (!scored.length) return;
+      // Re-score those missing a score from the last ingest
+      for (const row of scored) {
+        if (!row.c.score) {
+          const s = scoreCandidate(row.c);
+          row.c.score = s.score; row.s = s as any;
+        }
+      }
+      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
+      if (this.occupied() >= this.cfg.maxPositions) {
+        this.agents.risk.label = `holding ${this.occupied()}/${this.cfg.maxPositions}`;
+        return;
+      }
+      const todo = scored.filter(({ c }) => {
+        if (this.inFlightChecks.has(c.mint) || this.alreadyOn(c.mint)) return false;
+        const ent = liveEntryOk(c, this.mintHist.get(c.mint) || [], this.strat(), now);
+        if (!ent.ok) return false;
+        (c as any)._ent = ent.reason;
+        const blocked = entryBlocked(this.cfg, {
+          openPositions: this.occupied(),
+          dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
+          alreadyHolding: this.alreadyOn(c.mint),
+          inCooldown: (this.cooldown[c.mint] || 0) > now,
+          pausedUntil: this.lossPauseUntil, now,
+        });
+        if (blocked) return false;
+        return true;
+      }).slice(0, 10);
+      await poolRun(todo, 4, async ({ c, s }) => {
+        await this.checkCandidate(c, s.score, (c as any)._ent || `score ${s.score}`).catch(() => {});
+      });
+      this.store.set('cooldown', this.cooldown);
+    } finally {
+      this.evaluating = false;
+      this.agents.scanner.inFlightChecks = this.inFlightChecks.size;
+      this.store.set('agents', this.agents);
+      this.emit('agents', this.agents);
+    }
+  }
+
+  private async checkCandidate(c: Candidate, score: number, why: string) {
+    if (this.alreadyOn(c.mint) || this.occupied() >= this.cfg.maxPositions) return;
+    this.inFlightChecks.add(c.mint);
+    this.agents.scanner.inFlightChecks = this.inFlightChecks.size;
+    this.emit('agents', this.agents);
+    let aborted = false;
+    try {
+      const work = (async () => {
+        const sec = await this.m.security(c.mint);
+        if (aborted) return;
+        this.agents.safety.calls++;
+        const sr = securityCheck(sec, this.cfg);
+        Object.assign(this.agents.safety, { last: sr.label, lastSymbol: c.symbol, lastOk: sr.ok });
+        const cc = this.candidates.get(c.mint);
+        if (cc) cc.safety = sr.label;
+        if (!sr.ok) {
+          this.agents.safety.rejected++;
+          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `safety: ${sr.reasons.slice(0, 2).join(', ')}` });
+          this.cooldown[c.mint] = Date.now() + 20 * 60_000;
+          return;
+        }
+        const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
+        const trialSize = slotSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, this.occupied());
+        if (!trialSize) return;
+        const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
+        if (aborted) return;
+        if (!okSell) {
+          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'safety: Jupiter reverse quote failed (not sellable)' });
+          this.cooldown[c.mint] = Date.now() + 15 * 60_000;
+          return;
+        }
+        this.agents.safety.passed++;
+        this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
+        // Buy is async: mark in-flight now, never await the fill here.
+        this.buying.add(c.mint);
+        this.agents.scanner.inFlightBuys = this.buying.size;
+        void this.openPosition(c, score, why);
+      })();
+      await withTimeout(work, CHECK_TIMEOUT_MS, `check ${c.symbol} timeout`);
+    } catch {
+      aborted = true;
+      this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'check timed out — skipped, scan continues' });
+    } finally {
+      this.inFlightChecks.delete(c.mint);
+      this.agents.scanner.inFlightChecks = this.inFlightChecks.size;
+    }
+  }
+
   // ---------------------------------------------------------------- RISK sizing + EXECUTOR buy
   async openPosition(c: Candidate, score: number, why: string) {
-    await this.refreshSol();
+    if (this.alreadyHeld(c.mint)) return;
+    if (this.occupied() >= this.cfg.maxPositions && !this.buying.has(c.mint)) return;
+    this.buying.add(c.mint);
+    this.agents.scanner.inFlightBuys = this.buying.size;
+    try {
+    if (!this.solPrice) await this.refreshSol();
     if (!this.solPrice) return;
     const eq = this.equity();
     const adapted = this.riskAdapted();
     const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
     const low = lowBalanceReason(eq, this.cashUsd(), reserveUsd, this.cfg.minTradeUsd);
     if (low) { this.agents.risk.label = low; return; }
-    const openNow = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
+    const openNow = Math.max(0, this.occupied() - (this.buying.has(c.mint) ? 1 : 0));
     const size = slotSizeUsd(this.cfg, eq, this.cashUsd(), reserveUsd, openNow);
     if (!size) { this.agents.risk.label = 'not enough free cash'; return; }
     const solAmt = size / this.solPrice;
-    if (this.mode === 'live-auto') return this.execLiveAuto('buy', c, { solAmt, score, why });
-    if (this.mode === 'live') return this.requestLive('buy', c, { solAmt, score, why });
+    if (this.mode === 'live-auto') { await this.execLiveAuto('buy', c, { solAmt, score, why }); return; }
+    if (this.mode === 'live') { await this.requestLive('buy', c, { solAmt, score, why }); return; }
 
     const f = await this.exec.buy(c.mint, solAmt, this.solPrice);
     if (!f.ok) { this.agents.executor.failures++; this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `executor: ${f.error}` }); return; }
@@ -327,7 +474,12 @@ export class Engine extends EventEmitter {
     this.decision({ ts: Date.now(), side: 'BUY', symbol: c.symbol, image: c.image, text: `${why} · $${pos.costUsd.toFixed(2)} via Jupiter (${f.route}, impact ${f.impactPct.toFixed(2)}%)`, usd: pos.costUsd });
     this.log('Executor', 'buy', `Bought ${c.symbol}`, { symbol: c.symbol, mint: c.mint, image: c.image, usd: pos.costUsd, stakePct: stake });
     this.emit('toast', { kind: 'fill', title: 'Paper fill', text: `${this.cfg.appName} · swap via Jupiter quote · simulated`, symbol: c.symbol });
+    void notifyTrade({ side: 'BUY', symbol: c.symbol, sizeUsd: pos.costUsd, price: f.fillPrice });
     this.emitState();
+    } finally {
+      this.buying.delete(c.mint);
+      this.agents.scanner.inFlightBuys = this.buying.size;
+    }
   }
 
   // ---------------------------------------------------------------- RISK monitor + EXECUTOR sell
@@ -342,25 +494,22 @@ export class Engine extends EventEmitter {
       const strat = { ...this.strat(), hardStopPct: adapted.hardStopPct, trailingStopPct: adapted.trailingStopPct };
       if (this.positions.length && now - this.lastPairAt > 3000) {
         this.lastPairAt = now;
-        for (const p of this.positions) {
-          const fresh = await this.m.pair(p.mint).catch(() => null);
-          if (fresh) {
-            this.candidates.set(p.mint, { ...this.candidates.get(p.mint), ...fresh, seenAt: now } as any);
-            this.remember(fresh, now);
-            const fade = momentumFadeStrict(toSnap(now, fresh));
-            const d = exitReason(p as any, fresh.priceUsd || p.lastPrice, strat, now, fade.exit, fade.reason);
-            p.peakPrice = d.peak;
-            if (d.exit) { await this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1); continue; }
-          }
+        const freshList = await withTimeout((this.m as any).pairs ? (this.m as any).pairs(this.positions.map((p) => p.mint)) : Promise.all(this.positions.map((p) => this.m.pair(p.mint))).then((xs: any[]) => xs.filter(Boolean)), 4000, 'pair refresh timeout').catch(() => [] as any[]);
+        for (const fresh of freshList || []) {
+          this.candidates.set(fresh.mint, { ...this.candidates.get(fresh.mint), ...fresh, seenAt: now } as any);
+          this.remember(fresh, now);
         }
       }
       for (const p of [...this.positions]) {
-        const px = prices[p.mint];
+        if (this.selling.has(p.id)) continue;
+        const fresh = this.candidates.get(p.mint);
+        const px = prices[p.mint] || fresh?.priceUsd || p.lastPrice;
         if (!px) continue;
         p.lastPrice = px;
-        const d = exitReason(p as any, px, strat, now);
+        const fade = fresh ? momentumFadeStrict(toSnap(now, fresh)) : { exit: false, reason: '' };
+        const d = exitReason(p as any, px, strat, now, fade.exit, fade.reason);
         p.peakPrice = d.peak;
-        if (d.exit) await this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1);
+        if (d.exit) void this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1);
       }
       const trailing = this.positions.filter((p) => activeStop(this.cfg, p).kind === 'trailing');
       this.agents.risk.status = trailing.length ? `Trailing ${trailing.length}` : this.positions.length ? 'Guarding' : 'Idle';
@@ -384,9 +533,13 @@ export class Engine extends EventEmitter {
   }
 
   async closePosition(p: Position, kind: string, reason: string, fraction = 1) {
+    if (this.selling.has(p.id) && fraction >= 0.999) return;
+    this.selling.add(p.id);
+    this.agents.scanner.inFlightSells = this.selling.size;
+    try {
     const frac = Math.min(1, Math.max(0.05, fraction));
-    if (this.mode === 'live-auto') return this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac });
-    if (this.mode === 'live') return this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac });
+    if (this.mode === 'live-auto') { await this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac }); return; }
+    if (this.mode === 'live') { await this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac }); return; }
     const qty = p.qty * frac;
     const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
@@ -416,6 +569,10 @@ export class Engine extends EventEmitter {
     const cost = (p as any).origCost ?? p.costUsd;
     p.costUsd = cost;
     this.finishClose(p, fillPrice, proceeds, kind, reason + note);
+    } finally {
+      this.selling.delete(p.id);
+      this.agents.scanner.inFlightSells = this.selling.size;
+    }
   }
 
   private finishClose(p: Position, exitPrice: number, proceedsUsd: number, kind: string, reason: string) {
@@ -428,6 +585,7 @@ export class Engine extends EventEmitter {
     this.persist();
     const stopped = kind === 'hard_stop' || pnlUsd < 0;
     this.decision({ ts: Date.now(), side: 'SELL', symbol: p.symbol, image: p.image, text: `${reason} · ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd).toFixed(2)} via Jupiter`, usd: pnlUsd });
+    void notifyTrade({ side: 'SELL', symbol: p.symbol, sizeUsd: proceedsUsd, price: exitPrice, pnlPct: t.pnlPct });
     this.log('Risk', stopped ? 'stop' : 'sell', `${stopped ? 'Stopped' : 'Sold'} ${p.symbol}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: pnlUsd, pct: t.pnlPct, text2: reason } as any);
     if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
     const adapted = this.riskAdapted();
@@ -437,8 +595,8 @@ export class Engine extends EventEmitter {
       this.log('Risk', 'info', `consecutive losses — pausing new entries ${Math.round(adapted.pauseMs / 60000)}m`);
     }
     this.emitState();
-    // Rotate immediately into the next candidate once the slot is free.
-    if (this.wallet.running) setTimeout(() => { this.scan().catch(() => {}); }, 80);
+    // Refill free slots without going through a market scan wait.
+    if (this.wallet.running) void this.evaluateEntries();
   }
 
   // ---------------------------------------------------------------- LIVE (Phantom approval) path
@@ -472,6 +630,7 @@ export class Engine extends EventEmitter {
       const costSol = p.meta.solAmt; const price = (costSol * this.solPrice) / tokens;
       this.positions.push({ id, mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(), entryPrice: price, qty: tokens, decimals: p.meta.decimals, costUsd: costSol * this.solPrice, costSol, peakPrice: price, lastPrice: price, score: p.meta.score, rentSol: 0 });
       this.log('Executor', 'buy', `Bought ${c.symbol}`, { symbol: c.symbol, mint: c.mint, image: c.image, usd: costSol * this.solPrice });
+      void notifyTrade({ side: 'BUY', symbol: c.symbol, sizeUsd: costSol * this.solPrice, price });
     } else {
       const pos: Position = p.meta.position; const sol = p.meta.outAmount / 1e9;
       this.finishClose(pos, (sol * this.solPrice) / pos.qty, sol * this.solPrice, p.meta.kind, p.meta.reason);
@@ -585,7 +744,10 @@ export class Engine extends EventEmitter {
       config: { ...this.cfg, liveConfirm: undefined },
       pending: [...this.pending.values()].map((p) => ({ id: p.id, side: p.side, mint: p.mint, tx: p.tx, signature: p.signature })),
       lowBalance: low, reserveSol: reserve, reserveUsd, spendableUsd: Math.max(0, this.cashUsd() - reserveUsd),
-      sizeMult: adapted.sizeMult, pauseUntil: this.lossPauseUntil,
+      sizeMult: adapted.sizeMult, pauseUntil: this.lossPauseUntil, scan: this.scanStatus(),
+      keepalive: keepaliveSnapshot(),
+      push: { enabled: pushEnabled(), subscribers: subscriberCount() },
+      background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH },
       botWallet: botPub ? {
         publicKey: botPub,
         withdrawTo: this.lockedWithdrawTo(),

@@ -117,6 +117,12 @@ export class ReplayMarket implements MarketSource {
     return list.find((c) => c.mint === mint) || null;
   }
 
+  async pairs(mints: string[]) {
+    const { list } = await this.candidates();
+    const want = new Set(mints);
+    return list.filter((c) => want.has(c.mint));
+  }
+
   async ohlcv(pool: string, tf: string): Promise<Candle[]> {
     const s = this.sims.find((x) => x.pool === pool); if (!s) return [];
     const agg = ({ '1m': 1, '5m': 5, '15m': 15, '1h': 60 } as Record<string, number>)[tf] || 1;

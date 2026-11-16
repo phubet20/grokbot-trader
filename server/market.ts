@@ -20,6 +20,7 @@ export interface MarketSource {
   decimals(mint: string): Promise<number>;
   ohlcv(pool: string, tf: string): Promise<Candle[]>;
   pair(mint: string): Promise<Candidate | null>;
+  pairs(mints: string[]): Promise<Candidate[]>;
 }
 
 const UA = { 'user-agent': 'grokbot-trader/1.0', accept: 'application/json' };
@@ -111,48 +112,55 @@ export class LiveMarket implements MarketSource {
       'new_pools?page=2',
       'trending_pools?page=1&duration=1h',
     ];
-    // Always prefer brand-new pools; rotate a second GT page so we stay under ~30 req/min.
     const gtPages = ['new_pools?page=1', rot[this.scanTick % rot.length]];
-    for (const p of gtPages) {
-      try {
-        const sep = p.includes('?') ? '&' : '?';
-        const d = await this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${p}${sep}include=base_token,quote_token,dex`, 'geckoterminal'));
-        scanned += this.ingestGt(d, out);
-      } catch {}
-    }
-    try {
-      const feed = this.scanTick % 2 ? 'token-profiles/latest/v1' : 'token-boosts/latest/v1';
-      const prof = await this.ds.run(() => this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener'));
-      const mints = [...new Set<string>((Array.isArray(prof) ? prof : []).filter((x: any) => x.chainId === 'solana').map((x: any) => x.tokenAddress))].slice(0, 30);
-      if (mints.length) {
-        const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener'));
-        const best = new Map<string, any>();
-        for (const p of Array.isArray(pairs) ? pairs : []) {
-          scanned++;
-          const m = p.baseToken?.address;
-          if (!m) continue;
-          if (!best.has(m) || num(p.liquidity?.usd) > num(best.get(m).liquidity?.usd)) best.set(m, p);
-        }
-        for (const p of best.values()) {
-          const c = mapDs(p);
-          if (c && !out.has(c.mint)) out.set(c.mint, c);
-        }
+    const addGt = (d: any) => { if (d) scanned += this.ingestGt(d, out); };
+    const addDsPairs = (pairs: any) => {
+      const best = new Map<string, any>();
+      for (const p of Array.isArray(pairs) ? pairs : []) {
+        scanned++;
+        const m = p.baseToken?.address;
+        if (!m) continue;
+        if (!best.has(m) || num(p.liquidity?.usd) > num(best.get(m).liquidity?.usd)) best.set(m, p);
       }
-    } catch {}
-    if (this.scanTick % 3 === 0) {
+      for (const p of best.values()) {
+        const c = mapDs(p);
+        if (c && !out.has(c.mint)) out.set(c.mint, c);
+      }
+    };
+    // Each source has its own limiter/backoff. They run in parallel so a slow
+    // or 429'd API does not hold up the others.
+    const gtJobs = gtPages.map((p) => {
+      const sep = p.includes('?') ? '&' : '?';
+      return this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${p}${sep}include=base_token,quote_token,dex`, 'geckoterminal', 5000))
+        .then(addGt).catch(() => {});
+    });
+    const dsJob = (async () => {
       try {
-        const d = await this.jup.run(() => this.get('https://lite-api.jup.ag/tokens/v2/recent', 'jupiter', 8000, false));
+        const feed = this.scanTick % 2 ? 'token-profiles/latest/v1' : 'token-boosts/latest/v1';
+        const prof = await this.ds.run(() => this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener', 5000));
+        const mints = [...new Set<string>((Array.isArray(prof) ? prof : []).filter((x: any) => x.chainId === 'solana').map((x: any) => x.tokenAddress))].slice(0, 30);
+        if (mints.length) {
+          const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
+          addDsPairs(pairs);
+        }
+      } catch {}
+    })();
+    const jupJob = (async () => {
+      if (this.scanTick % 3 !== 0) return;
+      try {
+        const d = await this.jup.run(() => this.get('https://lite-api.jup.ag/tokens/v2/recent', 'jupiter', 5000, false));
         const addrs = (Array.isArray(d) ? d : d?.tokens || []).map((x: any) => x.id || x.address).filter(Boolean).slice(0, 20);
         if (addrs.length) {
-          const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${addrs.join(',')}`, 'dexscreener'));
-          for (const p of Array.isArray(pairs) ? pairs : []) {
-            scanned++;
-            const c = mapDs(p);
-            if (c && !out.has(c.mint)) out.set(c.mint, c);
-          }
+          const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${addrs.join(',')}`, 'dexscreener', 5000));
+          addDsPairs(pairs);
         }
       } catch {}
-    }
+    })();
+    // Hard deadline: a slow second hop on one source must not hold the scan loop.
+    await Promise.race([
+      Promise.all([...gtJobs, dsJob, jupJob]),
+      new Promise((r) => setTimeout(r, 4500)),
+    ]);
     return { list: [...out.values()], scanned };
   }
 
