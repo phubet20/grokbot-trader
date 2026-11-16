@@ -81,8 +81,15 @@ export function openSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: numbe
   const pct = Math.max(1, Math.min(100, p.positionPct || 8)) / 100;
   let size = spendable * pct;
   if (size < p.minTradeUsd) size = p.minTradeUsd;
+  // Tiny books: size at least 20% of spendable (still capped at 24% of equity)
+  // so a $2 account does not open fee-dominated dust trades.
+  if (equityUsd > 0 && equityUsd <= 10) {
+    const floor = Math.min(spendable, equityUsd * 0.24, Math.max(p.minTradeUsd, spendable * 0.2));
+    if (floor >= p.minTradeUsd) size = Math.max(size, floor);
+  }
   if (size > spendable) return 0;
   if (equityUsd > 0) size = Math.min(size, equityUsd * 0.24);
+  if (size < p.minTradeUsd) return 0;
   return round2(size);
 }
 

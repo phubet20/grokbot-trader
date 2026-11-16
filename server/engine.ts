@@ -11,7 +11,7 @@ import { preCheck, securityCheck, isPumpCurve, clampScore } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, SWAP_FEE_BPS, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -781,15 +781,13 @@ export class Engine extends EventEmitter {
       if (prices[SOL_MINT]) this.solPrice = prices[SOL_MINT];
       const now = Date.now();
       const adapted = this.riskAdapted();
-      if (this.positions.length && now - this.lastPairAt > 3000) {
-        this.lastPairAt = now;
-        const freshList = await withTimeout((this.m as any).pairs ? (this.m as any).pairs(this.positions.map((p) => p.mint)) : Promise.all(this.positions.map((p) => this.m.pair(p.mint))).then((xs: any[]) => xs.filter(Boolean)), 4000, 'pair refresh timeout').catch(() => [] as any[]);
-        for (const fresh of freshList || []) {
-          this.candidates.set(fresh.mint, { ...this.candidates.get(fresh.mint), ...fresh, seenAt: now } as any);
-          this.remember(fresh, now);
-        }
-      }
-      const tpMarks: Position[] = [];
+      const target = this.mode === 'paper' ? (this.cfg.takeProfitPct ?? 0) : 0;
+      const tpOpts = {
+        extraSlippageBps: this.cfg.extraSlippageBps,
+        swapFeeBps: SWAP_FEE_BPS,
+        feeUsd: (BASE_FEE_SOL + this.cfg.priorityFeeSol) * (this.solPrice || 0),
+      };
+      const tpMarks: { p: Position; markNet: number }[] = [];
       for (const p of [...this.positions]) {
         if (this.selling.has(p.id)) continue;
         const fresh = this.candidates.get(p.mint);
@@ -799,27 +797,39 @@ export class Engine extends EventEmitter {
         const fromEntry = (px / p.entryPrice - 1) * 100;
         p.maePct = Math.min(p.maePct ?? 0, fromEntry);
         if (now - p.openedAt < 45_000 && fromEntry <= -2) p.immediateRed = true;
+        p.peakPrice = Math.max(p.peakPrice, px);
+        const markNet = estimatedNetPnlPct(p, px, tpOpts);
+        if (target > 0 && markNet >= target) { tpMarks.push({ p, markNet }); continue; }
         const hist = this.mintHist.get(p.mint) || [];
-        const d = liveExit({ ...p, peakPrice: Math.max(p.peakPrice, px) }, px, fresh, hist, {
+        const d = liveExit({ ...p, peakPrice: p.peakPrice }, px, fresh, hist, {
           catStopPct: this.cfg.hardStopPct,
           sensitivity: this.mode === 'paper' ? this.tuner.exitSensitivity : 1,
-          takeProfitPct: this.mode === 'paper' ? (this.cfg.takeProfitPct ?? 0) : 0,
+          takeProfitPct: target,
           extraSlippageBps: this.cfg.extraSlippageBps,
-          feeUsd: (BASE_FEE_SOL + this.cfg.priorityFeeSol) * this.solPrice,
+          feeUsd: tpOpts.feeUsd,
         });
-        p.peakPrice = Math.max(p.peakPrice, px);
-        if (d.exit && d.kind === 'take_profit') { tpMarks.push(p); continue; }
+        if (d.exit && d.kind === 'take_profit') { tpMarks.push({ p, markNet }); continue; }
         if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);
       }
-      // Confirm TP against a real sell quote so a stale mark cannot lock in a loss.
+      // Prefer a live sell quote, but if it fails or times out, close on the mark-based net.
       if (tpMarks.length) {
-        const target = this.cfg.takeProfitPct ?? 3;
-        await poolRun(tpMarks, 3, async (p) => {
+        await poolRun(tpMarks, 3, async ({ p, markNet }) => {
           if (this.selling.has(p.id)) return;
-          const net = await this.quotedNetPnlPct(p);
-          if (net == null || net < target) return;
-          await this.closePosition(p, 'take_profit', `take profit +${net.toFixed(1)}% net (target +${target}%)`, 1);
+          const quoted = await this.quotedNetPnlPct(p);
+          const useQuote = quoted != null && quoted >= target;
+          const net = useQuote ? quoted! : markNet;
+          if (net < target) return;
+          const how = useQuote ? 'quote' : 'mark';
+          await this.closePosition(p, 'take_profit', `take profit +${net.toFixed(1)}% net (${how}, target +${target}%)`, 1);
         });
+      }
+      if (this.positions.length && now - this.lastPairAt > 3000) {
+        this.lastPairAt = now;
+        const freshList = await withTimeout((this.m as any).pairs ? (this.m as any).pairs(this.positions.map((p) => p.mint)) : Promise.all(this.positions.map((p) => this.m.pair(p.mint))).then((xs: any[]) => xs.filter(Boolean)), 4000, 'pair refresh timeout').catch(() => [] as any[]);
+        for (const fresh of freshList || []) {
+          this.candidates.set(fresh.mint, { ...this.candidates.get(fresh.mint), ...fresh, seenAt: now } as any);
+          this.remember(fresh, now);
+        }
       }
       const trailing = this.positions.filter((p) => activeStop(this.cfg, p).kind === 'trailing');
       this.agents.risk.status = trailing.length ? `Trailing ${trailing.length}` : this.positions.length ? 'Guarding' : 'Idle';
@@ -874,10 +884,14 @@ export class Engine extends EventEmitter {
     const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
     if (!f.ok) {
-      if (kind === 'manual') return { ok: false, error: f.error || 'sell failed' };
+      const allowMark = this.mode === 'paper' && (kind === 'manual' || kind === 'take_profit');
+      if (!allowMark && kind === 'manual') return { ok: false, error: f.error || 'sell failed' };
       this.sellFails[p.id] = (this.sellFails[p.id] || 0) + 1;
-      if (this.sellFails[p.id] < 6) return { ok: false, error: f.error || 'sell failed' };
-      fillPrice = p.lastPrice * 0.85; solBack = (qty * fillPrice) / this.solPrice; note = ' (no route, est.)';
+      if (!allowMark && this.sellFails[p.id] < 6) return { ok: false, error: f.error || 'sell failed' };
+      const hair = (SWAP_FEE_BPS + (this.cfg.extraSlippageBps || 0)) / 1e4;
+      fillPrice = p.lastPrice * (1 - hair);
+      solBack = this.solPrice > 0 ? (qty * fillPrice) / this.solPrice : 0;
+      note = ' (mark estimate, no quote)';
     } else { solBack = f.solReceived - f.feesSol; fillPrice = f.fillPrice; }
     delete this.sellFails[p.id];
     if (frac < 0.999 && p.qty - qty > 0) {

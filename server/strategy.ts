@@ -491,27 +491,51 @@ export function momentumBreakdown(c: Candidate | undefined, s: TapeSnap, hist: T
   return { exit: false, reason: '' };
 }
 
-/** Estimated net PnL % after a paper sell: mark proceeds minus extra slippage and sell fees, vs cost. Rent is refunded and ignored. */
+/** Typical AMM/curve swap fee, used as a percentage haircut on mark-based TP. */
+export const SWAP_FEE_BPS = 25;
+/** Fixed network fees (priority/base) are capped at this % of cost so tiny paper
+ *  positions can still reach the take-profit target. ATA rent is refundable and ignored. */
+export const FIXED_FEE_CAP_PCT = 1;
+
+export type NetPnlOpts = { extraSlippageBps?: number; feeUsd?: number; swapFeeBps?: number; fixedFeeCapPct?: number };
+
+function cappedFeeUsd(costUsd: number, feeUsd: number, capPct = FIXED_FEE_CAP_PCT): number {
+  const raw = Math.max(0, feeUsd || 0);
+  if (!(costUsd > 0)) return 0;
+  return Math.min(raw, costUsd * (Math.max(0, capPct) / 100));
+}
+
+function pctHaircut(opts: NetPnlOpts): number {
+  const slip = Math.max(0, opts.extraSlippageBps || 0);
+  const swap = Math.max(0, opts.swapFeeBps ?? SWAP_FEE_BPS);
+  return (slip + swap) / 1e4;
+}
+
+/** Estimated net PnL % after a paper sell on the mark: percentage swap fee + slippage,
+ *  minus a capped slice of fixed network fees. Rent is refunded and not deducted. */
 export function estimatedNetPnlPct(
   pos: { entryPrice: number; qty?: number; costUsd?: number },
   price: number,
-  opts: { extraSlippageBps?: number; feeUsd?: number } = {},
+  opts: NetPnlOpts = {},
 ): number {
   if (!(price > 0) || !(pos.entryPrice > 0)) return 0;
-  const slip = Math.max(0, opts.extraSlippageBps || 0) / 1e4;
-  const fee = Math.max(0, opts.feeUsd || 0);
-  if ((pos.qty || 0) > 0 && (pos.costUsd || 0) > 0) {
-    const net = pos.qty! * price * (1 - slip) - fee;
-    return ((net - pos.costUsd!) / pos.costUsd!) * 100;
+  const hair = pctHaircut(opts);
+  const cost = pos.costUsd || 0;
+  const fee = cappedFeeUsd(cost, opts.feeUsd || 0, opts.fixedFeeCapPct);
+  if ((pos.qty || 0) > 0 && cost > 0) {
+    const net = pos.qty! * price * (1 - hair) - fee;
+    return ((net - cost) / cost) * 100;
   }
   const fromEntry = (price / pos.entryPrice - 1) * 100;
-  return fromEntry - slip * 100;
+  return fromEntry - hair * 100;
 }
 
-/** Realized-style net PnL % from a sell quote (SOL out after extra slip, minus fees). */
-export function netPnlFromSellQuote(costUsd: number, solReceived: number, feesSol: number, solPrice: number): number {
+/** Realized-style net PnL % from a sell quote. Fixed fees are capped as a % of cost;
+ *  rent is not included in feesSol and is not deducted. */
+export function netPnlFromSellQuote(costUsd: number, solReceived: number, feesSol: number, solPrice: number, opts: { fixedFeeCapPct?: number } = {}): number {
   if (!(costUsd > 0) || !(solPrice > 0)) return 0;
-  const proceeds = (solReceived - feesSol) * solPrice;
+  const feeUsd = cappedFeeUsd(costUsd, Math.max(0, feesSol) * solPrice, opts.fixedFeeCapPct);
+  const proceeds = solReceived * solPrice - feeUsd;
   return ((proceeds - costUsd) / costUsd) * 100;
 }
 

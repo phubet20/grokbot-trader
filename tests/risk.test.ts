@@ -153,3 +153,13 @@ test('openSizeUsd is a % of free cash, never exceeds spendable, and is not cappe
   assert.equal(openSizeUsd(P2, 8, 0.20, reserve), 0);
   assert.ok(openSizeUsd(P2, 8, 8, reserve) >= P2.minTradeUsd);
 });
+
+test('tiny $2 book sizes a meaningful share of spendable, not fee-dominated dust', () => {
+  const P2 = { ...P, minTradeUsd: 0.25, positionPct: 8 };
+  const reserve = 0.17;
+  const s = openSizeUsd(P2, 2, 2, reserve);
+  assert.ok(s >= 0.25, 'size=' + s);
+  assert.ok(s >= 0.36, 'should be ~20% of spendable after rounding, size=' + s);
+  assert.ok(s <= 2 * 0.24 + 1e-9, 'capped at 24% equity, size=' + s);
+  assert.ok(s <= 2 - reserve);
+});

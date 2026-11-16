@@ -194,3 +194,24 @@ test('already-pumped coins take a penalty, they are not hard-skipped', () => {
   const r = firstPullback(c, second, t0 + 4000);
   assert.equal(r.ok, false, r.reason);
 });
+
+test('tiny paper position still hits +3% TP when fixed fees are large vs size', () => {
+  // $0.26 fill, $0.02 priority fee would be ~8% of cost un-capped and could block TP.
+  const pos = { entryPrice: 1, qty: 0.26, costUsd: 0.26, peakPrice: 1, openedAt: 0 };
+  const opts = { catStopPct: 35, takeProfitPct: 3, extraSlippageBps: 50, feeUsd: 0.02 };
+  const miss = liveExit(pos, 1.03, undefined, [], opts);
+  assert.equal(miss.exit, false, 'a bare +3% mark is still under after % costs, net=' + estimatedNetPnlPct(pos, 1.03, opts));
+  const hit = liveExit(pos, 1.06, undefined, [], opts);
+  assert.equal(hit.exit, true, 'net=' + estimatedNetPnlPct(pos, 1.06, opts) + ' ' + hit.reason);
+  assert.equal(hit.kind, 'take_profit');
+  // Uncapped, $0.02 fees on $0.26 would require a much bigger move; the cap keeps +6% reachable.
+  assert.ok(estimatedNetPnlPct(pos, 1.06, opts) >= 3);
+});
+
+test('netPnlFromSellQuote caps fixed fees so a tiny winner stays a winner', () => {
+  // 0.01 SOL received at $80 = $0.80, 0.0003 SOL fees = $0.024 on a $0.26 cost.
+  const net = netPnlFromSellQuote(0.26, 0.01, 0.0003, 80);
+  assert.ok(net > 100, 'net=' + net); // proceeds ~$0.80 minus capped ~$0.0026
+  const loss = netPnlFromSellQuote(0.26, 0.003, 0.0003, 80);
+  assert.ok(loss < 0, 'loss=' + loss);
+});
