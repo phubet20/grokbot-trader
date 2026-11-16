@@ -134,7 +134,10 @@ export function Funds({ snap }: { snap: any }) {
         </div>
         {paper
           ? <p className="tiny muted">Paper mode: USDC is shown only. Auto-swap to SOL is disabled until you go live-auto.</p>
-          : <p className="tiny muted">In live-auto, USDC received here is automatically swapped to SOL via Jupiter (a small SOL fee reserve is kept). Withdrawals are SOL to your locked Phantom address; leftover USDC is sent there too.</p>}
+          : <p className="tiny muted">In live-auto, USDC received here is automatically swapped to SOL via Jupiter (gasless when available). Withdrawals are SOL to your locked Phantom address; leftover USDC is sent there too.</p>}
+        {!paper && Number(funds?.onchainUsdc || 0) > 0 && Number(funds?.onchainSol || 0) < 0.01 && (
+          <p className="note" data-testid="need-sol-fees">Need ~0.01 SOL for fees</p>
+        )}
         <div className="deposit-box">
           <div className="muted tiny">Deposit from Phantom</div>
           <div className="deposit-row">

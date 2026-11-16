@@ -93,9 +93,10 @@ export function openSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: numbe
   return round2(size);
 }
 
-export function lowBalanceReason(portfolioUsd: number, freeCashUsd: number, reserveUsd: number, minTradeUsd: number): string | null {
-  if (freeCashUsd <= 0) return 'wallet is empty — deposit SOL to the bot address';
-  if (freeCashUsd <= reserveUsd) return `balance too low to cover fees and token-account rent (need ~$${reserveUsd.toFixed(2)} reserved, have $${freeCashUsd.toFixed(2)})`;
+export function lowBalanceReason(portfolioUsd: number, freeCashUsd: number, reserveUsd: number, minTradeUsd: number, usdcUi = 0): string | null {
+  const needSol = 'Need ~0.01 SOL for fees';
+  if (freeCashUsd <= 0) return usdcUi > 0 ? needSol : needSol + ' — deposit SOL to the bot address';
+  if (freeCashUsd <= reserveUsd) return usdcUi > 0 ? needSol : `balance too low to cover fees and token-account rent (need ~$${reserveUsd.toFixed(2)} reserved, have $${freeCashUsd.toFixed(2)})`;
   if (freeCashUsd - reserveUsd < minTradeUsd) return `balance too low for a viable trade (spendable $${Math.max(0, freeCashUsd - reserveUsd).toFixed(2)}, minimum $${minTradeUsd.toFixed(2)})`;
   return null;
 }

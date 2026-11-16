@@ -53,6 +53,12 @@ export function Balance({ snap }: { snap: any }) {
         <span className="mult mono">{s.multiplier.toFixed(2)}×</span>
       </div>
       <div className="mono small bal-line"><span className={s.pnlUsd >= 0 ? 'pos' : 'neg'}>{sUsd(s.pnlUsd)} ({pct(s.pnlPct, 2)}) · {s.wins}W {s.losses}L</span><span className="muted">{hhmm(Date.now())}</span></div>
+      {snap.mode !== 'paper' && (
+        <div className="mono small muted" data-testid="onchain-breakdown">
+          {(s.solBalance ?? snap.wallet?.solBalance ?? 0).toFixed(4)} SOL
+          {typeof s.usdc === 'number' ? ` · ${Number(s.usdc).toFixed(2)} USDC` : ''}
+        </div>
+      )}
     </div>
   );
 }
@@ -102,7 +108,7 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
           <div className="tiny mono">size {snap.config.positionPct}% · catastrophic -{snap.config.hardStopPct}%</div>
           {a.risk.label && <div className="tiny muted">{a.risk.label}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#10b981' }}>⚡</span><div><b>Executor</b><div className="muted tiny">{pos.length} active trades</div></div></div>
-          <div className="big-num">{pos.length}</div><div className="muted tiny">{a.executor.fills} fills · {snap.mode === 'live' ? 'Phantom' : 'paper'}</div>
+          <div className="big-num">{pos.length}</div><div className="muted tiny">{a.executor.fills} fills · {snap.mode === 'paper' ? 'paper' : snap.mode === 'live-auto' ? 'bot wallet' : 'Phantom'}</div>
           {a.executor.last && <div className="tiny mono pos">✓ {a.executor.last}</div>}</div>
       </div>
     </div>
@@ -313,7 +319,7 @@ export function AutoTunePanel({ snap }: { snap: any }) {
         )}
       </div>
       {rows.length === 0 ? (
-        <div className="mono tiny muted">No closed paper trades yet — patterns will appear here after the first exits.</div>
+        <div className="mono tiny muted">{snap.mode === 'paper' ? 'No closed paper trades yet — patterns will appear here after the first exits.' : 'No closed live trades yet — patterns will appear here after the first exits.'}</div>
       ) : (
         <table className="tune-table mono">
           <thead>

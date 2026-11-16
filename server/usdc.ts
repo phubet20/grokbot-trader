@@ -4,7 +4,7 @@ import { Connection, PublicKey, SystemProgram, Transaction, TransactionInstructi
 import { USDC_MINT, SOL_MINT } from './market.ts';
 import { liveGate, type Config } from './config.ts';
 import { botKeypair, botPublicKey, hasBotWallet, redactSecrets } from './wallet.ts';
-import { buildLiveSwapTx, signAndSendSwap, getSolBalance } from './executor.ts';
+import { buildLiveSwapTx, signAndSendSwap, getSolBalance, fetchSwapOrder, isGaslessOrder, signAndExecuteOrder } from './executor.ts';
 import type { MarketSource } from './market.ts';
 import { reserveSol } from './risk.ts';
 
@@ -52,15 +52,15 @@ export async function getUsdcBalance(rpcUrl: string, owner: string): Promise<Usd
   }
 }
 
-export function canAutoSwapUsdc(mode: string, usdcUi: number, solBalance: number, reserveSolAmt = USDC_FEE_RESERVE_SOL): { ok: boolean; reason: string } {
-  if (mode === 'paper') return { ok: false, reason: 'paper' };
-  if (usdcUi < MIN_USDC_SWAP) return { ok: false, reason: 'dust' };
-  if (solBalance < reserveSolAmt) return { ok: false, reason: 'need SOL for fees' };
-  return { ok: true, reason: '' };
+export function canAutoSwapUsdc(mode: string, usdcUi: number, solBalance: number, reserveSolAmt = USDC_FEE_RESERVE_SOL): { ok: boolean; reason: string; needGasless: boolean } {
+  if (mode === 'paper') return { ok: false, reason: 'paper', needGasless: false };
+  if (usdcUi < MIN_USDC_SWAP) return { ok: false, reason: 'dust', needGasless: false };
+  if (solBalance < reserveSolAmt) return { ok: true, reason: 'need SOL for fees', needGasless: true };
+  return { ok: true, reason: '', needGasless: false };
 }
 
 /** Live-auto only: swap the bot wallet's USDC to SOL via Jupiter, keeping a SOL fee reserve. */
-export async function swapUsdcToSol(cfg: Config, m: MarketSource, amountRaw?: bigint): Promise<{ signature: string; usdcIn: number; solOutEst: number }> {
+export async function swapUsdcToSol(cfg: Config, m: MarketSource, amountRaw?: bigint): Promise<{ signature: string; usdcIn: number; solOutEst: number; gasless?: boolean }> {
   const gate = liveGate(cfg);
   if (!gate.live) throw new Error('USDC auto-swap is live-only: ' + gate.reason);
   if (!hasBotWallet()) throw new Error('bot wallet is not configured');
@@ -70,7 +70,16 @@ export async function swapUsdcToSol(cfg: Config, m: MarketSource, amountRaw?: bi
   if (raw <= 0n || Number(raw) / 1e6 < MIN_USDC_SWAP) throw new Error('no USDC to swap');
   const sol = (await getSolBalance(cfg.rpcUrl, pub)) || 0;
   const reserve = Math.max(USDC_FEE_RESERVE_SOL, reserveSol(cfg.priorityFeeSol) + 0.002);
-  if (sol < reserve) throw new Error(`need at least ${reserve} SOL in the bot wallet to pay swap fees (have ${sol.toFixed(4)})`);
+  const usdcIn = Number(raw) / 10 ** USDC_DECIMALS;
+  if (sol < reserve) {
+    const order = await fetchSwapOrder({ inputMint: USDC_MINT, outputMint: SOL_MINT, amountRaw: raw, taker: pub });
+    if (!isGaslessOrder(order, pub)) {
+      throw new Error('Need ~0.01 SOL for fees (no gasless Jupiter route for this size)');
+    }
+    const signature = await signAndExecuteOrder({ transaction: order.transaction!, requestId: order.requestId! });
+    const solOutEst = Number(order.outAmount || 0) / 1e9;
+    return { signature, usdcIn, solOutEst, gasless: true };
+  }
   const built = await buildLiveSwapTx(cfg, m, {
     inputMint: USDC_MINT,
     outputMint: SOL_MINT,
@@ -78,9 +87,8 @@ export async function swapUsdcToSol(cfg: Config, m: MarketSource, amountRaw?: bi
     userPublicKey: pub,
   });
   const signature = await signAndSendSwap(cfg.rpcUrl, built.swapTransaction);
-  const usdcIn = Number(raw) / 10 ** USDC_DECIMALS;
   const solOutEst = built.quote.outAmount / 1e9;
-  return { signature, usdcIn, solOutEst };
+  return { signature, usdcIn, solOutEst, gasless: false };
 }
 
 function createAtaIdempotentIx(payer: PublicKey, owner: PublicKey, mint: PublicKey, ata: PublicKey) {

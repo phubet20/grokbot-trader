@@ -1,7 +1,7 @@
 /** Splash and boot helpers. The splash never waits on the network. */
 
 export const SPLASH_MS = 1500;
-export const SNAP_CACHE_KEY = 'grokbot.snap.v1';
+export const SNAP_CACHE_KEY = 'grokbot.snap.v2';
 
 export function splashProgress(elapsedMs: number, durationMs = SPLASH_MS): number {
   return Math.min(1, Math.max(0, elapsedMs / durationMs));

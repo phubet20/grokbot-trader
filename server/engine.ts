@@ -156,10 +156,14 @@ export class Engine extends EventEmitter {
       }
     }
     if (this.mode === 'live-auto' && hasBotWallet()) {
-      // Never carry a paper book into live-auto. Equity and exits must be on-chain only.
-      if (this.positions.length) {
-        this.log('Core', 'info', `dropping ${this.positions.length} paper position(s) — live-auto uses on-chain holdings only`);
+      // Never carry a paper book into live-auto. Equity, trades, and the chart must be on-chain only.
+      const paperTrades = this.store.trades(1).length;
+      if (this.positions.length || paperTrades || this.wallet.type === 'paper') {
+        if (this.positions.length || paperTrades) {
+          this.log('Core', 'info', `dropping ${this.positions.length} paper position(s) and paper history — live-auto uses on-chain holdings only`);
+        }
         this.positions = [];
+        this.store.clearPaperSession();
         this.persist();
       }
       await this.syncBotBalance();
@@ -215,17 +219,21 @@ export class Engine extends EventEmitter {
     if (auto && hasBotWallet()) {
       const pub = botPublicKey()!;
       const onchain = await getSolBalance(this.cfg.rpcUrl, pub);
+      const onchainUsd = ((onchain ?? 0) * this.solPrice) + (this.usdcBal?.ui || 0);
+      const fromPaper = this.wallet.type !== 'bot';
       this.wallet = {
         ...this.wallet,
         connected: true, type: 'bot', address: pub, realSol: onchain,
         solBalance: onchain ?? 0,
-        depositUsd: (onchain ?? 0) * this.solPrice || this.wallet.depositUsd,
-        startedAt: this.wallet.startedAt || Date.now(),
+        depositUsd: (!fromPaper && this.wallet.depositUsd > 0) ? this.wallet.depositUsd : onchainUsd,
+        startedAt: (!fromPaper && this.wallet.startedAt) ? this.wallet.startedAt : Date.now(),
         running: true,
       };
-      if (!this.wallet.dayKey) { this.wallet.dayKey = dayKey(); this.wallet.dayStartEquity = this.equity(); this.store.addEquity(Date.now(), this.equity()); }
+      this.wallet.dayKey = this.wallet.dayKey || dayKey();
+      this.wallet.dayStartEquity = this.wallet.dayStartEquity || this.equity();
+      this.store.addEquity(Date.now(), this.equity());
       this.saveWallet();
-      this.log('Core', 'info', `Bot wallet ready · LIVE AUTO · $${this.equity().toFixed(2)}`);
+      this.log('Core', 'info', `Bot wallet ready · LIVE AUTO · $${this.equity().toFixed(2)} (${(onchain ?? 0).toFixed(4)} SOL + ${(this.usdcBal?.ui || 0).toFixed(2)} USDC)`);
       this.emitState();
       return this.wallet;
     }
@@ -745,7 +753,7 @@ export class Engine extends EventEmitter {
     const eq = this.equity();
     const adapted = this.riskAdapted();
     const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
-    const low = lowBalanceReason(eq, this.freeCashUsd(), reserveUsd, this.cfg.minTradeUsd);
+    const low = lowBalanceReason(eq, this.freeCashUsd(), reserveUsd, this.cfg.minTradeUsd, this.usdcBal?.ui || 0);
     if (low) { this.agents.risk.label = low; return; }
     let size = openSizeUsd(this.cfg, eq, this.freeCashUsd(), reserveUsd);
     if (adding && existing) {
@@ -1280,12 +1288,19 @@ export class Engine extends EventEmitter {
       this.lastUsdcSwapAt = Date.now();
       await this.syncBotBalance();
       this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, bot);
-      this.log('Executor', 'info', `swapped ${r.usdcIn.toFixed(2)} USDC to ~${r.solOutEst.toFixed(4)} SOL`);
-      this.emit('toast', { kind: 'fill', title: `Swapped ${r.usdcIn.toFixed(2)} USDC to SOL`, text: `~${r.solOutEst.toFixed(4)} SOL · ${r.signature.slice(0, 8)}…` });
+      const how = r.gasless ? 'gasless Jupiter' : 'Jupiter';
+      this.log('Executor', 'info', `swapped ${r.usdcIn.toFixed(2)} USDC to ~${r.solOutEst.toFixed(4)} SOL via ${how} · ${r.signature}`);
+      this.emit('toast', { kind: 'fill', title: `Swapped ${r.usdcIn.toFixed(2)} USDC to SOL`, text: `~${r.solOutEst.toFixed(4)} SOL · ${how} · ${r.signature.slice(0, 8)}…` });
       this.emitState();
     } catch (e: any) {
       const msg = e?.message || String(e);
-      if (!/no USDC|dust|paper/.test(msg)) this.log('Core', 'info', `USDC swap skipped: ${msg}`);
+      if (!/no USDC|dust|paper/.test(msg)) {
+        this.log('Core', 'info', `USDC swap skipped: ${msg}`);
+        if (/Need ~0.01 SOL|need at least|gasless/i.test(msg) && Date.now() - this.lastUsdcNeedSolAt > 60_000) {
+          this.lastUsdcNeedSolAt = Date.now();
+          this.emit('toast', { kind: 'warn', title: 'Need ~0.01 SOL for fees', text: msg });
+        }
+      }
     } finally { this.usdcBusy = false; }
   }
 
@@ -1312,6 +1327,7 @@ export class Engine extends EventEmitter {
       coins: new Set([...trades.map((t) => t.mint), ...this.positions.map((p) => p.mint)]).size,
       best: best && { symbol: best.symbol, usd: best.pnlUsd }, worst: worst && { symbol: worst.symbol, usd: worst.pnlUsd },
       cashUsd: this.cashUsd(), solBalance: this.wallet.solBalance, solPrice: this.solPrice,
+      usdc: this.mode === 'paper' ? 0 : (this.usdcBal?.ui || 0),
       runtimeMin: this.wallet.startedAt ? (Date.now() - this.wallet.startedAt) / 60_000 : 0,
     };
   }
@@ -1321,7 +1337,7 @@ export class Engine extends EventEmitter {
       .map((c) => ({ symbol: c.symbol, mint: c.mint, image: c.image, change: c.change.h1 }));
     const reserve = reserveSol(this.cfg.priorityFeeSol);
     const reserveUsd = reserve * (this.solPrice || 0);
-    const low = this.wallet.connected ? lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) : null;
+    const low = this.wallet.connected ? lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd, this.usdcBal?.ui || 0) : null;
     const adapted = this.riskAdapted();
     const botPub = botPublicKey();
     return {
@@ -1346,6 +1362,7 @@ export class Engine extends EventEmitter {
         lockedBy: this.withdrawLockedBy(),
         lockMessage: this.lockedWithdrawTo() ? '' : LOCK_MESSAGE('YOUR_PHANTOM_ADDRESS'),
         usdc: this.usdcBal.ui,
+        onchainSol: this.wallet.realSol ?? this.wallet.solBalance,
         autoSwapUsdc: this.mode !== 'paper',
       } : null,
     };

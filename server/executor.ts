@@ -134,6 +134,83 @@ export async function signAndSendSwap(rpcUrl: string, swapTransactionBase64: str
   return sendSignedTx(rpcUrl, signedBase64);
 }
 
+const JUP_SWAP_V2 = ['https://lite-api.jup.ag/swap/v2', 'https://api.jup.ag/swap/v2'];
+
+export type SwapOrder = {
+  gasless?: boolean;
+  router?: string;
+  requestId?: string;
+  transaction?: string;
+  signatureFeePayer?: string;
+  rentFeeLamports?: number;
+  outAmount?: string;
+  inAmount?: string;
+  taker?: string;
+  errorCode?: number | string;
+  error?: string;
+};
+
+/** True when Jupiter (or a JupiterZ MM) pays the signature fee and no rent is charged to the taker. */
+export function isGaslessOrder(order: SwapOrder | null | undefined, taker: string): boolean {
+  if (!order?.transaction || !order.requestId) return false;
+  if (order.gasless !== true) return false;
+  if (!order.signatureFeePayer || order.signatureFeePayer === taker) return false;
+  if (Number(order.rentFeeLamports || 0) > 0) return false;
+  return true;
+}
+
+async function jupV2(path: string, init?: RequestInit): Promise<any> {
+  let last: any;
+  for (const base of JUP_SWAP_V2) {
+    try {
+      const r = await fetch(base + path, { ...init, headers: { accept: 'application/json', ...(init?.headers || {}) } });
+      const text = await r.text();
+      let d: any = null;
+      try { d = text ? JSON.parse(text) : null; } catch { d = { error: text.slice(0, 200) }; }
+      if (!r.ok) throw new Error((d && (d.error || d.message)) || ('Jupiter HTTP ' + r.status));
+      return d;
+    } catch (e) { last = e; }
+  }
+  throw last;
+}
+
+export async function fetchSwapOrder(args: { inputMint: string; outputMint: string; amountRaw: bigint; taker: string }): Promise<SwapOrder> {
+  const q = new URLSearchParams({
+    inputMint: args.inputMint,
+    outputMint: args.outputMint,
+    amount: args.amountRaw.toString(),
+    taker: args.taker,
+  });
+  return await jupV2('/order?' + q.toString());
+}
+
+export function partialSignVersionedTx(swapTransactionBase64: string, kp: Keypair): string {
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransactionBase64, 'base64'));
+  tx.sign([kp]);
+  return Buffer.from(tx.serialize()).toString('base64');
+}
+
+export async function executeSwapOrder(signedTransaction: string, requestId: string): Promise<string> {
+  const d = await jupV2('/execute', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ signedTransaction, requestId }),
+  });
+  const sig = d?.signature || d?.txid || d?.tx || (d?.status === 'Success' && d?.signature);
+  if (!sig || typeof sig !== 'string') {
+    const err = d?.error || d?.message || d?.status || 'execute failed';
+    throw new Error('Jupiter execute: ' + (typeof err === 'string' ? err : JSON.stringify(err)));
+  }
+  return sig;
+}
+
+/** Sign as the bot wallet (taker) and land via Jupiter /execute so a gasless MM can co-sign. */
+export async function signAndExecuteOrder(order: { transaction: string; requestId: string }): Promise<string> {
+  const kp = botKeypair();
+  const signed = partialSignVersionedTx(order.transaction, kp);
+  return executeSwapOrder(signed, order.requestId);
+}
+
 function closeAccountIx(account: PublicKey, dest: PublicKey, owner: PublicKey, program = TOKEN_PROGRAM) {
   return new TransactionInstruction({
     programId: program,

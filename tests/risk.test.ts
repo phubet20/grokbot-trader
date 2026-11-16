@@ -163,3 +163,9 @@ test('tiny $2 book sizes a meaningful share of spendable, not fee-dominated dust
   assert.ok(s <= 2 * 0.24 + 1e-9, 'capped at 24% equity, size=' + s);
   assert.ok(s <= 2 - reserve);
 });
+
+test('lowBalanceReason asks for fee SOL and mentions the banner copy', () => {
+  assert.equal(lowBalanceReason(1.73, 0, 0.18, 0.25, 1.73), 'Need ~0.01 SOL for fees');
+  assert.match(lowBalanceReason(0, 0, 0.18, 0.25, 0) || '', /Need ~0.01 SOL for fees/);
+  assert.equal(lowBalanceReason(10, 10, 0.3, 0.25, 0), null);
+});
