@@ -35,25 +35,25 @@ input { font: inherit; color: inherit; }
 .progress div { height: 100%; background: #0b0b0c; border-radius: 4px; transition: width .1s linear; }
 
 /* connect sheet */
-.sheet-wrap { position: fixed; inset: 0; background: rgba(0,0,0,.25); backdrop-filter: blur(6px); display: flex; align-items: flex-end; justify-content: center; z-index: 20; animation: fadein .3s; }
-.sheet { width: 100%; max-width: 480px; background: #fff; color: #0b0b0c; border-radius: 28px 28px 0 0; padding: 10px 20px calc(24px + env(safe-area-inset-bottom)); text-align: center; animation: up .4s cubic-bezier(.2,.9,.3,1); }
+.sheet-wrap { position: fixed; inset: 0; height: 100vh; height: 100dvh; background: rgba(0,0,0,.25); backdrop-filter: blur(6px); display: flex; flex-direction: column; justify-content: flex-end; align-items: center; z-index: 20; animation: fadein .3s; overflow: hidden; }
+.sheet { width: 100%; max-width: 480px; background: #fff; color: #0b0b0c; border-radius: 28px 28px 0 0; padding: 10px 20px 0; text-align: center; animation: up .4s cubic-bezier(.2,.9,.3,1); max-height: 100vh; max-height: 100dvh; overflow-x: hidden; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
 @keyframes up { from { transform: translateY(100%); } }
-.grabber { width: 40px; height: 5px; background: #d9d9de; border-radius: 3px; margin: 0 auto 16px; }
+.grabber { width: 40px; height: 5px; background: #d9d9de; border-radius: 3px; margin: 0 auto 12px; }
 .sheet-icons { display: flex; align-items: center; justify-content: center; gap: 18px; }
 .sheet-dot { width: 6px; height: 6px; border-radius: 50%; background: #ab9ff2; }
-.sheet h2 { margin: 12px 0 2px; font-size: 24px; }
+.sheet h2 { margin: 10px 0 2px; font-size: 22px; }
 .sheet p { margin: 0 0 12px; }
 .seg { display: flex; background: #f1f1f4; border-radius: 12px; padding: 3px; margin: 0 0 12px; }
 .seg button { flex: 1; padding: 8px; border-radius: 10px; font-size: 13px; color: #6b6b70; }
 .seg button.on { background: #fff; color: #0b0b0c; box-shadow: 0 1px 3px rgba(0,0,0,.1); font-weight: 600; }
 .seg button:disabled { opacity: .45; }
 .kv-box { border: 1px solid #ececf0; border-radius: 14px; padding: 4px 14px; text-align: left; font-size: 13px; }
-.kv-box div { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f3f3f5; }
+.kv-box div { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f3f3f5; }
 .kv-box div:last-child { border: 0; }
 .start-usd { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 13px; padding: 0 4px; }
 .usd-input { border: 1px solid #e3e3e8; border-radius: 10px; padding: 4px 8px; }
 .usd-input input { width: 70px; border: 0; outline: 0; background: none; text-align: right; }
-.checklist { list-style: none; padding: 0; margin: 14px 4px; text-align: left; font-size: 14px; color: #4b4b50; }
+.checklist { list-style: none; padding: 0; margin: 10px 4px; text-align: left; font-size: 14px; color: #4b4b50; }
 .checklist li { display: flex; gap: 8px; align-items: center; padding: 3px 0; }
 .checklist li svg { color: #16a34a; } .checklist li.x svg { color: #e5484d; }
 .pill-btn { display: block; width: 100%; padding: 15px; border-radius: 999px; background: #2f6bff; color: #fff !important; font-weight: 650; font-size: 16px; transition: background .3s, color .3s, transform .1s; }
@@ -63,6 +63,10 @@ input { font: inherit; color: inherit; }
 .sheet-btn.approving { background: #c4b5fd; color: #1a1228 !important; }
 .sheet-btn.ok { background: #16a34a; color: #fff !important; }
 .sheet-btn.go { background: #0b0b0c; color: #fff !important; }
+.sheet-btn.phantom-open { background: #ab9ff2; color: #1a1228 !important; display: flex; align-items: center; justify-content: center; gap: 8px; text-decoration: none; }
+.sheet-btn.phantom-open:active { transform: scale(.98); }
+.sheet-actions { position: sticky; bottom: 0; background: #fff; padding: 10px 0 calc(20px + env(safe-area-inset-bottom)); margin-top: 8px; }
+
 .pill-btn:disabled { opacity: .85; }
 .pill-btn.small-btn { padding: 10px 14px; font-size: 14px; }
 .pill-btn.ghost { background: var(--chip); color: var(--text) !important; }

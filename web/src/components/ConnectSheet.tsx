@@ -5,6 +5,11 @@ import { BotIcon, PhantomIcon, CheckI, XI } from './Icons';
 declare global { interface Window { phantom?: any; solana?: any } }
 export const getPhantom = () => (typeof window !== 'undefined' ? window.phantom?.solana || (window.solana?.isPhantom ? window.solana : null) : null);
 
+/** Phantom universal link that opens the current app URL in Phantom's in-app browser. */
+export function phantomBrowseUrl(href = typeof window !== 'undefined' ? window.location.href : '', origin = typeof window !== 'undefined' ? window.location.origin : '') {
+  return `https://phantom.app/ul/browse/${encodeURIComponent(href)}?ref=${encodeURIComponent(origin)}`;
+}
+
 function LinkDots({ state }: { state: 'idle' | 'busy' | 'done' }) {
   if (state === 'idle') return <span className="sheet-dot" />;
   if (state === 'done') return <span className="sheet-link done" aria-hidden>——</span>;
@@ -18,12 +23,16 @@ function LinkDots({ state }: { state: 'idle' | 'busy' | 'done' }) {
 export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void }) {
   const phantom = getPhantom();
   const isLive = snap?.mode === 'live';
+  const needPhantomApp = isLive && !phantom;
   const [address, setAddress] = useState<string>(snap?.wallet?.address || '');
   const startUsd = snap?.config?.startUsd || 81;
   const [pv, setPv] = useState<any>(null);
   const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
   const [ready, setReady] = useState(false);
   const [err, setErr] = useState('');
+  const [browse, setBrowse] = useState('');
+
+  useEffect(() => { setBrowse(phantomBrowseUrl()); }, []);
 
   useEffect(() => {
     const type = isLive ? 'phantom' : 'paper';
@@ -38,7 +47,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
     try {
       let addr = address;
       if (isLive) {
-        if (!phantom) throw new Error('Phantom not detected — open this app in the Phantom browser or install the Phantom extension');
+        if (!phantom) throw new Error('Phantom not detected — tap Open in Phantom, or install the Phantom extension');
         const r = await phantom.connect();
         addr = r.publicKey.toString(); setAddress(addr);
         await api('wallet/connect', { type: 'phantom', address: addr });
@@ -56,6 +65,9 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   const shownAddr = address || pv?.address || '';
   const btnLabel = ready ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? 'Approving…' : 'Connect';
   const btnTestId = ready ? 'start' : 'connect';
+  const bal = pv
+    ? (isLive ? (pv.address || address ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : 'open Phantom to read balance') : `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL`)
+    : '…';
 
   return (
     <div className="sheet-wrap" data-testid="connect-sheet">
@@ -67,23 +79,35 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
         <div className="kv-box mono">
           <div><span className="muted">network</span><span>Solana</span></div>
           <div><span className="muted">wallet</span><span>Phantom{shownAddr ? ' · ' + short(shownAddr) : ''}</span></div>
-          <div><span className="muted">balance</span><span>{pv ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : '…'}</span></div>
+          <div><span className="muted">balance</span><span>{bal}</span></div>
+          <div><span className="muted">mode</span><span className={isLive ? 'neg' : 'warn'}>{isLive ? 'LIVE · real funds' : 'TEST · simulated fills'}</span></div>
         </div>
-        {isLive && !phantom && <p className="note">Install the Phantom extension or open this link in the Phantom in-app browser to connect a real wallet.</p>}
+        {needPhantomApp && (
+          <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Connect. Never enter a seed phrase here.</p>
+        )}
         <ul className="checklist">
           <li><CheckI size={15} /> view balance and activity</li>
           <li><CheckI size={15} /> request approval for transactions</li>
           <li className="x"><XI size={15} /> can&apos;t move funds without your approval</li>
         </ul>
         {err && <p className="err">{err}</p>}
-        <button
-          className={`pill-btn sheet-btn ${state === 'busy' ? 'approving' : ''} ${state === 'done' && !ready ? 'ok' : ''} ${ready ? 'go' : ''}`}
-          onClick={ready ? onStart : connect}
-          disabled={state === 'busy' || (state === 'done' && !ready) || (isLive && !phantom && !ready)}
-          data-testid={btnTestId}
-        >
-          {btnLabel}
-        </button>
+        <div className="sheet-actions">
+          {needPhantomApp && !ready && (
+            <a className="pill-btn sheet-btn phantom-open" href={browse || '#'} data-testid="open-in-phantom">
+              <PhantomIcon size={22} /> Open in Phantom
+            </a>
+          )}
+          {(!needPhantomApp || ready) && (
+            <button
+              className={`pill-btn sheet-btn ${state === 'busy' ? 'approving' : ''} ${state === 'done' && !ready ? 'ok' : ''} ${ready ? 'go' : ''}`}
+              onClick={ready ? onStart : connect}
+              disabled={state === 'busy' || (state === 'done' && !ready)}
+              data-testid={btnTestId}
+            >
+              {btnLabel}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

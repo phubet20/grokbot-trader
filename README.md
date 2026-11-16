@@ -112,9 +112,12 @@ npm start      # เปิด http://127.0.0.1:8787
 
 ## การเปลี่ยนเป็นเงินจริง (ทำเมื่อคุณสั่งเท่านั้น)
 
-ปิดไว้และเปิดจากในแอปไม่ได้ ต้อง (1) แก้ `data/config.json` ใส่ `"mode": "live"` และ
-`"liveConfirm": "I UNDERSTAND REAL FUNDS ARE AT RISK"` แล้วรีสตาร์ท (2) เชื่อมกระเป๋า Phantom จริง
-(3) ทุกการซื้อขายต้องกดอนุมัติใน Phantom ระบบไม่เก็บและไม่ขอ private key / seed phrase เด็ดขาด
+ปิดไว้และเปิดจากในแอปไม่ได้ ต้องตั้ง `MODE=live` และ `LIVE_CONFIRM="I UNDERSTAND REAL FUNDS ARE AT RISK"`
+แล้วรีสตาร์ท (หรือแก้ `data/config.json` ด้วยค่าเดียวกัน)
+
+บนมือถือ: เปิดลิงก์ใน Safari/Chrome แล้วกด **Open in Phantom** (เปิดแอปภายในเบราว์เซอร์ของ Phantom)
+จากนั้นกด **Connect** → **เริ่มใช้งาน** เติม SOL ในกระเป๋า ทุกการซื้อขายต้องกดอนุมัติใน Phantom
+ระบบไม่เก็บและไม่ขอ private key / seed phrase เด็ดขาด
 
 ## ข้อจำกัด (ตรงไปตรงมา)
 
