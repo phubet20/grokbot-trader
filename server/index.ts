@@ -32,7 +32,6 @@ async function bootEngine() {
   else if (remoteStateConfigured()) console.log('[boot] remote state configured, no snapshot yet');
   return engine;
 }
-const booted = bootEngine();
 const DIST = join(ROOT, 'web/dist');
 const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 
@@ -54,7 +53,7 @@ function broadcast(type: string, data: unknown) {
   const msg = `event: ${type}\ndata: ${JSON.stringify(data, (_k, v) => (typeof v === 'bigint' ? String(v) : v))}\n\n`;
   for (const c of clients) c.write(msg);
 }
-for (const ev of ['state', 'agents', 'activity', 'decision', 'equity', 'positions', 'toast', 'approval']) engine.on(ev, (d) => broadcast(ev, d));
+const booted = bootEngine();
 
 async function body(req: import('node:http').IncomingMessage): Promise<any> {
   let s = '';
