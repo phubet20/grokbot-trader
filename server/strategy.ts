@@ -404,6 +404,13 @@ export function estimatedNetPnlPct(
   return fromEntry - slip * 100;
 }
 
+/** Realized-style net PnL % from a sell quote (SOL out after extra slip, minus fees). */
+export function netPnlFromSellQuote(costUsd: number, solReceived: number, feesSol: number, solPrice: number): number {
+  if (!(costUsd > 0) || !(solPrice > 0)) return 0;
+  const proceeds = (solReceived - feesSol) * solPrice;
+  return ((proceeds - costUsd) / costUsd) * 100;
+}
+
 /** Paper/live exits: 100% out on take-profit (paper), momentum break, or a wide catastrophic / rug stop. */
 export function liveExit(
   pos: PosMark & { entryLiq?: number; qty?: number; costUsd?: number },

@@ -10,7 +10,7 @@ import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -680,6 +680,7 @@ export class Engine extends EventEmitter {
           this.remember(fresh, now);
         }
       }
+      const tpMarks: Position[] = [];
       for (const p of [...this.positions]) {
         if (this.selling.has(p.id)) continue;
         const fresh = this.candidates.get(p.mint);
@@ -695,7 +696,18 @@ export class Engine extends EventEmitter {
           feeUsd: (BASE_FEE_SOL + this.cfg.priorityFeeSol) * this.solPrice,
         });
         p.peakPrice = Math.max(p.peakPrice, px);
+        if (d.exit && d.kind === 'take_profit') { tpMarks.push(p); continue; }
         if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);
+      }
+      // Confirm TP against a real sell quote so a stale mark cannot lock in a loss.
+      if (tpMarks.length) {
+        const target = this.cfg.takeProfitPct ?? 3;
+        await poolRun(tpMarks, 3, async (p) => {
+          if (this.selling.has(p.id)) return;
+          const net = await this.quotedNetPnlPct(p);
+          if (net == null || net < target) return;
+          await this.closePosition(p, 'take_profit', `take profit +${net.toFixed(1)}% net (target +${target}%)`, 1);
+        });
       }
       const trailing = this.positions.filter((p) => activeStop(this.cfg, p).kind === 'trailing');
       this.agents.risk.status = trailing.length ? `Trailing ${trailing.length}` : this.positions.length ? 'Guarding' : 'Idle';
@@ -1007,6 +1019,18 @@ export class Engine extends EventEmitter {
       position: pos ? { ...pos, valueUsd: pos.qty * pos.lastPrice, stop: activeStop(this.cfg, pos) } : null,
       trades, candles, markers, trailingStopPct: this.cfg.trailingStopPct, hardStopPct: this.cfg.hardStopPct,
     };
+  }
+
+  /** Paper TP check: net % from an actual sell quote after extra slip and fees. */
+  private async quotedNetPnlPct(p: Position): Promise<number | null> {
+    if (!this.solPrice || p.qty <= 0 || p.costUsd <= 0) return null;
+    const raw = BigInt(Math.floor(p.qty * 10 ** p.decimals));
+    if (raw <= 0n) return null;
+    const q = await withTimeout(this.m.quote(p.mint, SOL_MINT, raw, this.cfg.slippageBps), 1500, 'tp quote').catch(() => null);
+    if (!q || q.outAmount <= 0) return null;
+    const solReceived = (q.outAmount / 1e9) * (1 - (this.cfg.extraSlippageBps || 0) / 1e4);
+    const feesSol = BASE_FEE_SOL + this.cfg.priorityFeeSol;
+    return netPnlFromSellQuote(p.costUsd, solReceived, feesSol, this.solPrice);
   }
 
   private tuneAllows(why: string, score: number, minScore: number, hasSignal: boolean) {

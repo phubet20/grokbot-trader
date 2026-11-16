@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, estimatedNetPnlPct, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -138,4 +138,13 @@ test('dip-reclaim fires only after a bounce with buy flow, never while still fal
   ];
   const r = dipReclaim(rebound);
   assert.equal(r.ok, true, r.reason);
+});
+
+test('netPnlFromSellQuote only counts a fill as profit after fees', () => {
+  // $8 cost, sell 0.11 SOL at $80 (= $8.80) minus 0.0002 fees — clearly in profit
+  const win = netPnlFromSellQuote(8, 0.11, 0.0002, 80);
+  assert.ok(win > 3, 'win=' + win);
+  // same cost, sell 0.096 SOL at $80 (= $7.68) — a loss, must not look like TP
+  const loss = netPnlFromSellQuote(8, 0.096, 0.0002, 80);
+  assert.ok(loss < 0, 'loss=' + loss);
 });
