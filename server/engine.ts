@@ -883,16 +883,33 @@ export class Engine extends EventEmitter {
     const qty = p.qty * frac;
     const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
+    const hair = (SWAP_FEE_BPS + (this.cfg.extraSlippageBps || 0)) / 1e4;
+    const markPx = p.lastPrice * (1 - hair);
+    const markBack = this.solPrice > 0 ? (qty * markPx) / this.solPrice : 0;
     if (!f.ok) {
       const allowMark = this.mode === 'paper' && (kind === 'manual' || kind === 'take_profit');
       if (!allowMark && kind === 'manual') return { ok: false, error: f.error || 'sell failed' };
       this.sellFails[p.id] = (this.sellFails[p.id] || 0) + 1;
       if (!allowMark && this.sellFails[p.id] < 6) return { ok: false, error: f.error || 'sell failed' };
-      const hair = (SWAP_FEE_BPS + (this.cfg.extraSlippageBps || 0)) / 1e4;
-      fillPrice = p.lastPrice * (1 - hair);
-      solBack = this.solPrice > 0 ? (qty * fillPrice) / this.solPrice : 0;
+      fillPrice = markPx;
+      solBack = markBack;
       note = ' (mark estimate, no quote)';
-    } else { solBack = f.solReceived - f.feesSol; fillPrice = f.fillPrice; }
+    } else {
+      solBack = f.solReceived - f.feesSol;
+      fillPrice = f.fillPrice;
+      // Paper TP: if the live quote would lock in a loss (or miss the target)
+      // while the mark is in profit, close on the mark estimate instead.
+      if (this.mode === 'paper' && kind === 'take_profit' && this.solPrice > 0) {
+        const fillPnl = solBack * this.solPrice - (p.costUsd * frac);
+        const markPnl = markBack * this.solPrice - (p.costUsd * frac);
+        const targetUsd = p.costUsd * frac * ((this.cfg.takeProfitPct ?? 3) / 100);
+        if (fillPnl < targetUsd && markPnl >= targetUsd) {
+          fillPrice = markPx;
+          solBack = markBack;
+          note = ' (mark estimate, quote not in profit)';
+        }
+      }
+    }
     delete this.sellFails[p.id];
     if (frac < 0.999 && p.qty - qty > 0) {
       this.wallet.solBalance += solBack;
