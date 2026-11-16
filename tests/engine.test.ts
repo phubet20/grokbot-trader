@@ -95,3 +95,24 @@ test('scan cadence continues while a candidate check hangs', async () => {
   assert.ok(calls >= 3, 'expected several scans, got ' + calls);
   assert.ok(st.cadenceMs > 0 && st.cadenceMs < 1500, 'cadence stalled at ' + st.cadenceMs + 'ms');
 });
+
+test('re-connecting paper with a new test balance resets the book even if price fetch hangs', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-reconn-'));
+  const cfg = { ...DEFAULTS, startUsd: 81, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const m = new ReplayMarket(10);
+  const e = new Engine(cfg, m, new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 81 });
+  assert.ok(Math.abs(e.equity() - 81) < 0.05);
+  e.positions.push({ id: 'x', mint: 'M', pool: 'P', symbol: 'X', name: 'X', openedAt: Date.now(), entryPrice: 1, qty: 1, decimals: 6, costUsd: 10, costSol: 0.1, peakPrice: 1, lastPrice: 1, score: 50, rentSol: 0 } as any);
+  // Hang all subsequent price fetches — Connect must still return on the cached price.
+  m.prices = async () => new Promise(() => {});
+  const t0 = Date.now();
+  const w = await e.connect({ type: 'paper', startUsd: 12 });
+  const ms = Date.now() - t0;
+  assert.ok(ms < 1000, 'connect took ' + ms + 'ms');
+  assert.equal(e.positions.length, 0);
+  assert.ok(Math.abs(e.wallet.depositUsd - 12) < 0.05, 'deposit=' + e.wallet.depositUsd);
+  assert.ok(Math.abs(e.equity() - 12) < 0.05, 'equity=' + e.equity());
+  assert.equal(w.connected, true);
+  e.stop();
+});

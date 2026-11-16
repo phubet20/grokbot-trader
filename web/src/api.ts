@@ -1,11 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
 
 export type Snap = any;
-export async function api(path: string, body?: unknown) {
-  const r = await fetch('api/' + path, body === undefined ? undefined : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  const d = await r.json();
-  if (!r.ok) throw new Error(d.error || 'request failed');
-  return d;
+export async function api(path: string, body?: unknown, opts?: { timeoutMs?: number; retries?: number }) {
+  const timeoutMs = opts?.timeoutMs ?? 8000;
+  const retries = opts?.retries ?? 0;
+  let last: Error | null = null;
+  for (let i = 0; i <= retries; i++) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch('api/' + path, body === undefined
+        ? { signal: ctl.signal }
+        : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || 'request failed');
+      return d;
+    } catch (e: any) {
+      last = e?.name === 'AbortError' ? new Error('request timed out') : (e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  throw last || new Error('request failed');
 }
 
 export type Toast = { id: number; kind: string; title: string; text?: string; usd?: number; pct?: number; symbol?: string; image?: string };

@@ -38,4 +38,11 @@ export class Store {
       DELETE FROM decisions WHERE ts < (SELECT ts FROM decisions ORDER BY ts DESC LIMIT 1 OFFSET 2000);`);
   }
   reset() { this.db.exec('DELETE FROM kv; DELETE FROM trades; DELETE FROM activity; DELETE FROM decisions; DELETE FROM equity;'); }
+  /** Wipe paper trades/positions/history but keep kv secrets such as the withdraw lock. */
+  clearPaperSession() {
+    this.db.exec('DELETE FROM trades; DELETE FROM activity; DELETE FROM decisions; DELETE FROM equity;');
+    this.set('positions', []);
+    this.set('cooldown', {});
+    this.set('agents', null);
+  }
 }

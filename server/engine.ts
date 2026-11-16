@@ -91,6 +91,7 @@ export class Engine extends EventEmitter {
   private inFlightChecks = new Set<string>();
   private buying = new Set<string>();
   private selling = new Set<string>();
+  private bookGen = 0;
   private lastPairAt = 0;
   private lossPauseUntil = 0;
   private mintHist = new Map<string, TapeSnap[]>();
@@ -169,7 +170,8 @@ export class Engine extends EventEmitter {
 
   // ---------------------------------------------------------------- wallet
   async connect(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number }) {
-    await this.refreshSol();
+    await this.refreshSol(this.solPrice ? 0 : 400);
+    if (!this.solPrice && this.mode === 'paper') this.solPrice = (this.m as any).lastSolPrice || 70;
     if (!this.solPrice) throw new Error('SOL price unavailable - check internet / use DATA_SOURCE=replay');
     const startUsd = Math.max(2, Number(opts.startUsd) || this.cfg.startUsd);
     let realSol: number | null = null;
@@ -197,16 +199,21 @@ export class Engine extends EventEmitter {
       return this.wallet;
     }
     const solBalance = livePhantom ? (realSol ?? 0) : startUsd / this.solPrice;
-    const fresh = !this.wallet.connected || this.wallet.depositUsd === 0;
+    // Paper: an explicit Connect with a test balance always resets the sim book
+    // (close open paper positions) so a new amount is not stuck behind AUTO_START.
+    const resetPaper = opts.type === 'paper' && this.mode === 'paper' && (this.wallet.connected || this.positions.length > 0 || this.wallet.depositUsd > 0);
+    if (resetPaper) this.resetPaperBook();
     this.wallet = {
       ...this.wallet,
       connected: true, type: opts.type, address: opts.address || this.wallet.address || this.previewAddr || fakeAddr(), realSol,
-      solBalance: fresh ? solBalance : this.wallet.solBalance,
-      depositUsd: fresh ? solBalance * this.solPrice : this.wallet.depositUsd,
-      startedAt: fresh ? Date.now() : this.wallet.startedAt,
+      solBalance,
+      depositUsd: livePhantom ? solBalance * this.solPrice : startUsd,
+      startedAt: Date.now(),
       running: true,
     };
-    if (fresh) { this.wallet.dayKey = dayKey(); this.wallet.dayStartEquity = this.wallet.depositUsd; this.store.addEquity(Date.now(), this.wallet.depositUsd); }
+    this.wallet.dayKey = dayKey();
+    this.wallet.dayStartEquity = this.wallet.depositUsd;
+    this.store.addEquity(Date.now(), this.wallet.depositUsd);
     this.saveWallet();
     this.log('Core', 'info', `${opts.type === 'phantom' ? 'Phantom' : 'Paper'} wallet connected · ${this.mode.toUpperCase()} mode · $${this.equity().toFixed(2)}`);
     this.emitState();
@@ -214,7 +221,7 @@ export class Engine extends EventEmitter {
   }
   /** Read-only preview used by the Connect sheet before connecting. */
   async preview(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number }) {
-    await this.refreshSol();
+    await this.refreshSol(this.solPrice ? 0 : 300);
     const startUsd = Math.max(2, Number(opts.startUsd) || this.cfg.startUsd);
     let realSol: number | null = null;
     if (opts.type === 'phantom' && opts.address) realSol = await getSolBalance(this.cfg.rpcUrl, opts.address);
@@ -235,9 +242,20 @@ export class Engine extends EventEmitter {
   }
   reset() {
     if (this.mode === 'live') throw new Error('reset is disabled in live mode');
-    this.store.reset(); this.positions = []; for (const a of Object.values(this.agents)) for (const k of Object.keys(a)) if (typeof (a as any)[k] === 'number') (a as any)[k] = 0; this.cooldown = {}; this.pending.clear();
+    this.store.reset(); this.resetPaperBook();
     this.wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
     this.emitState();
+  }
+  /** Drop simulated positions and session history so a new test balance starts clean. */
+  private resetPaperBook() {
+    this.bookGen++;
+    this.positions = [];
+    this.pending.clear();
+    this.buying.clear();
+    this.selling.clear();
+    this.inFlightChecks.clear();
+    this.cooldown = {};
+    this.store.clearPaperSession();
   }
 
   equity() {
@@ -246,9 +264,16 @@ export class Engine extends EventEmitter {
   }
   cashUsd() { return this.wallet.solBalance * this.solPrice; }
 
-  private async refreshSol() {
-    const p = await this.m.prices([SOL_MINT]);
-    if (p[SOL_MINT]) this.solPrice = p[SOL_MINT];
+  /** Prefer a cached SOL price so Connect/preview never wait on the Jupiter quote queue. */
+  private async refreshSol(maxWaitMs = 2500) {
+    const cached = this.solPrice || (this.m as any).lastSolPrice || 0;
+    if (cached) this.solPrice = cached;
+    const work = this.m.prices([SOL_MINT]).then((p) => {
+      if (p[SOL_MINT]) this.solPrice = p[SOL_MINT];
+    }).catch(() => {});
+    if (cached && maxWaitMs <= 0) { void work; return; }
+    const wait = cached ? Math.min(maxWaitMs, 400) : maxWaitMs;
+    await Promise.race([work, new Promise((r) => setTimeout(r, Math.max(0, wait)))]);
   }
   private async syncBotBalance() {
     const pub = botPublicKey();
@@ -341,6 +366,7 @@ export class Engine extends EventEmitter {
     if (this.ingestingPump) return;
     this.ingestingPump = true;
     try {
+      await new Promise((r) => setImmediate(r));
       const now = Date.now();
       const list = getPumpFeed().toCandidates(this.solPrice || 70, now);
       if (!list.length) return;
@@ -385,6 +411,7 @@ export class Engine extends EventEmitter {
     this.scanning = true;
     try {
       const { list, scanned } = await withTimeout(this.m.candidates(), SCAN_FETCH_TIMEOUT_MS, 'scan fetch timeout');
+      await new Promise((r) => setImmediate(r));
       const now = Date.now();
       for (const c of list) { this.candidates.set(c.mint, { ...this.candidates.get(c.mint), ...c, seenAt: now }); this.remember(c, now); }
       for (const [k, v] of this.candidates) if (now - v.seenAt > 3 * 3600_000 && !this.positions.some((p) => p.mint === k)) this.candidates.delete(k);
@@ -529,6 +556,7 @@ export class Engine extends EventEmitter {
 
   // ---------------------------------------------------------------- RISK sizing + EXECUTOR buy
   async openPosition(c: Candidate, score: number, why: string) {
+    const gen = this.bookGen;
     if (this.alreadyHeld(c.mint)) return;
     if (this.occupied() >= this.cfg.maxPositions && !this.buying.has(c.mint)) return;
     this.buying.add(c.mint);
@@ -550,6 +578,7 @@ export class Engine extends EventEmitter {
 
     const f = await this.exec.buy(c.mint, solAmt, this.solPrice);
     if (!f.ok) { this.agents.executor.failures++; this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `executor: ${f.error}` }); return; }
+    if (gen !== this.bookGen) return; // paper book was reset while this fill was in flight
     const costSol = f.solSpent + f.feesSol;
     this.wallet.solBalance -= costSol + f.rentSol;
     const pos: Position = {

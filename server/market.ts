@@ -62,6 +62,7 @@ export class LiveMarket implements MarketSource {
   private ohlcvCache = new Map<string, { at: number; data: Candle[] }>();
   private scanTick = 0;
   lastSolPrice = 0;
+  lastSolAt = 0;
   private pump = getPumpFeed();
   private pumpStarted = false;
 
@@ -263,7 +264,7 @@ export class LiveMarket implements MarketSource {
           if (v?.usdPrice) out[m] = num(v.usdPrice);
           if (v?.decimals !== undefined) this.decCache.set(m, num(v.decimals));
         }
-        if (out[SOL_MINT]) this.lastSolPrice = out[SOL_MINT];
+        if (out[SOL_MINT]) { this.lastSolPrice = out[SOL_MINT]; this.lastSolAt = Date.now(); }
       } catch {}
     }
     return out;

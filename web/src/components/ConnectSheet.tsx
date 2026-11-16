@@ -32,39 +32,39 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
 
   useEffect(() => {
     const type = isLive ? 'phantom' : 'paper';
-    const t = setTimeout(() => api('wallet/preview', { type, address: address || undefined, startUsd }).then(setPv).catch((e) => setErr(e.message)), 200);
+    const t = setTimeout(() => api('wallet/preview', { type, address: address || undefined, startUsd }, { timeoutMs: 2500, retries: 1 }).then(setPv).catch(() => {}), 150);
     return () => clearTimeout(t);
   }, [isLive, address, startUsd]);
 
   async function connect() {
     if (state !== 'idle') return;
     setErr(''); setState('busy');
-    const started = Date.now();
     try {
       let addr = address;
       if (isAuto) {
-        await api('wallet/connect', { type: 'bot' });
+        await api('wallet/connect', { type: 'bot' }, { timeoutMs: 4000, retries: 1 });
       } else if (isLive) {
         if (!phantom) throw new Error('Phantom not detected — tap Open in Phantom, or install the Phantom extension');
         const r = await phantom.connect();
         addr = r.publicKey.toString(); setAddress(addr);
-        await api('wallet/connect', { type: 'phantom', address: addr });
+        await api('wallet/connect', { type: 'phantom', address: addr }, { timeoutMs: 8000, retries: 1 });
       } else {
-        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd: Math.max(2, startUsd) });
+        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd: Math.max(2, startUsd) }, { timeoutMs: 4000, retries: 1 });
       }
-      const wait = 900 - (Date.now() - started);
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       setState('done');
-      setTimeout(() => setReady(true), 700);
+      setTimeout(() => setReady(true), 150);
     } catch (e: any) { setErr(e.message || String(e)); setState('idle'); }
   }
 
   const shownAddr = address || pv?.address || '';
   const btnLabel = ready ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? (isAuto ? 'Starting…' : 'Approving…') : (isAuto ? 'Start bot' : 'Connect');
   const btnTestId = ready ? 'start' : 'connect';
-  const bal = pv
-    ? (isLive ? (pv.address || address ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : 'open Phantom to read balance') : `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL`)
-    : '…';
+  const solPx = pv?.solPrice || snap?.solPrice || snap?.stats?.solPrice || 0;
+  const paperUsd = Math.max(2, startUsd);
+  const paperSol = solPx ? paperUsd / solPx : 0;
+  const bal = isLive
+    ? (pv && (pv.address || address) ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : (pv ? 'open Phantom to read balance' : '…'))
+    : (solPx ? `${usd(paperUsd)} · ${paperSol.toFixed(2)} SOL` : `${usd(paperUsd)}`);
 
   return (
     <div className="sheet-wrap" data-testid="connect-sheet">
@@ -77,7 +77,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
         <div className="kv-box mono">
           <div><span className="muted">network</span><span>Solana</span></div>
           <div><span className="muted">wallet</span><span>Phantom{shownAddr ? ' · ' + short(shownAddr) : ''}</span></div>
-          <div><span className="muted">balance</span><span>{bal}</span></div>
+          <div><span className="muted">balance</span><span data-testid="connect-balance">{bal}</span></div>
           <div><span className="muted">mode</span><span className={isLive ? 'neg' : 'warn'}>{isLive ? 'LIVE · real funds' : 'TEST · simulated fills'}</span></div>
         </div>
         {!isLive && (
@@ -94,7 +94,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
           <li className="x"><XI size={15} /> can&apos;t move funds without your approval</li>
         </ul>
         </>}
-        {err && <p className="err">{err}</p>}
+        {err && <p className="err" data-testid="connect-error">{err}</p>}
         <div className="sheet-actions">
           {needPhantomApp && !ready && (
             <a className="pill-btn sheet-btn phantom-open" href={browse || '#'} data-testid="open-in-phantom">
