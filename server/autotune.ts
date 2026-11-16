@@ -43,6 +43,7 @@ export type PatternStats = {
 export type TuneSnapshot = {
   enabled: boolean;
   patterns: PatternStats[];
+  exits: Record<string, number>;
   exitSensitivity: number;
   equityScore: number;
   slope: number;
@@ -53,7 +54,7 @@ export type TuneSnapshot = {
   note: string;
 };
 
-type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number };
+type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string };
 
 function classify(reason: string): PatternKey {
   const r = (reason || '').toLowerCase();
@@ -143,11 +144,11 @@ export class AutoTune {
     };
   }
 
-  record(opts: { reason: string; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts?: number }) {
+  record(opts: { reason: string; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts?: number; exitKind?: string; exitReason?: string }) {
     if (!this.enabled) return;
     const pattern = classify(opts.reason);
     const cost = Math.max(1e-6, opts.costUsd);
-    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now() };
+    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now(), exitKind: opts.exitKind, exitReason: opts.exitReason };
     this.trades.push(rec);
     if (this.trades.length > 400) this.trades = this.trades.slice(-400);
     this.rebuild();
@@ -241,9 +242,15 @@ export class AutoTune {
 
   snapshot(): TuneSnapshot {
     const list = [...this.patterns.values()].sort((a, b) => b.n - a.n);
+    const exits: Record<string, number> = {};
+    for (const tr of this.trades) {
+      const k = tr.exitKind || 'other';
+      exits[k] = (exits[k] || 0) + 1;
+    }
     return {
       enabled: this.enabled,
       patterns: list,
+      exits,
       exitSensitivity: this.exitSensitivity,
       equityScore: this.equityScore,
       slope: this.slope,

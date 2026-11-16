@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, estimatedNetPnlPct, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -68,18 +68,38 @@ test('partial take-profit then breakeven on the runner', () => {
   assert.equal(hard.kind, 'hard_stop');
 });
 
-test('liveExit does not use a tight stop or take-profit, only momentum break or a wide catastrophic stop', () => {
+test('liveExit without a TP setting only uses momentum break or a wide catastrophic stop', () => {
   const pos = { entryPrice: 100, peakPrice: 110, openedAt: 0 };
   const hold = liveExit(pos, 97, undefined, [], { catStopPct: 35 }); // -3%, a normal pullback
   assert.equal(hold.exit, false, hold.reason);
-  const tp = liveExit(pos, 115, undefined, [], { catStopPct: 35 });
-  assert.equal(tp.exit, false, 'no fixed take-profit');
+  const noTp = liveExit(pos, 115, undefined, [], { catStopPct: 35, takeProfitPct: 0 });
+  assert.equal(noTp.exit, false, 'TP disabled');
   const cat = liveExit(pos, 64, undefined, [], { catStopPct: 35 });
   assert.equal(cat.exit, true);
   assert.match(cat.reason, /catastrophic/);
   const rug = liveExit({ ...pos, entryLiq: 10_000 }, 100, { liquidityUsd: 3000 } as any, [], { catStopPct: 35 });
   assert.equal(rug.exit, true);
   assert.match(rug.reason, /liquidity pulled/);
+});
+
+test('liveExit takes profit at +3% net after estimated fees and slippage, 100% close', () => {
+  const pos = { entryPrice: 100, qty: 1, costUsd: 100.15, peakPrice: 100, openedAt: 0 };
+  const opts = { catStopPct: 35, takeProfitPct: 3, extraSlippageBps: 50, feeUsd: 0.02 };
+  const under = liveExit(pos, 103.0, undefined, [], opts);
+  assert.equal(under.exit, false, `net ${estimatedNetPnlPct(pos, 103, opts)} should be under 3%. ${under.reason}`);
+  const hit = liveExit(pos, 104.0, undefined, [], opts);
+  assert.equal(hit.exit, true, `net ${estimatedNetPnlPct(pos, 104, opts)}`);
+  assert.equal(hit.kind, 'take_profit');
+  assert.equal(hit.partial, false);
+  assert.match(hit.reason, /take profit/i);
+  // A +2% mark with the haircut must not fire.
+  const barely = liveExit(pos, 102.0, undefined, [], opts);
+  assert.equal(barely.exit, false, barely.reason);
+  // Momentum still used when below TP.
+  const dump = { t: 1, px: 101, liq: 20_000, mc: 80_000, m5: -4, m15: 2, h1: 10, vol5: 1000, vol1h: 5000, b5: 4, s5: 16, b1: 20, s1: 40, tr: 40, age: 1 };
+  const mom = liveExit(pos, 101, undefined, [dump], opts);
+  assert.equal(mom.exit, true);
+  assert.equal(mom.kind, 'momentum_fade');
 });
 
 test('momentum breakdown exits on net sell flow or a lower low after the peak', () => {

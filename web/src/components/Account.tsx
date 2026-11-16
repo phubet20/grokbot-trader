@@ -6,6 +6,7 @@ import { NotifyPanel } from './NotifyPanel';
 const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of portfolio)', 1, 50, 1],
   ['maxPositions', 'Max open positions', 1, 20, 1],
+  ['takeProfitPct', 'Take profit (% net after fees/slip)', 0.5, 50, 0.5],
   ['hardStopPct', 'Catastrophic stop (% below entry)', 10, 80, 1],
   ['trailingStopPct', 'Trailing stop (% from top)', 2, 60, 0.5],
   ['dailyLossLimitPct', 'Daily loss limit (%)', 1, 100, 1],
@@ -44,7 +45,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
       <div className="section card">
         <div className="sec-hd"><b>Risk & strategy</b><span className="pos small">{msg}</span></div>
         {FIELDS.map(([k, label, min, max, step]) => (
-          <label key={k} className="field small"><span>{label}</span><input type="number" min={min} max={max} step={step} value={cfg[k]} onChange={(e) => setCfg({ ...cfg, [k]: Number(e.target.value) })} /></label>
+          <label key={k} className="field small" data-testid={k === "takeProfitPct" ? "take-profit-field" : undefined}><span>{label}</span><input type="number" min={min} max={max} step={step} value={cfg[k]} onChange={(e) => setCfg({ ...cfg, [k]: Number(e.target.value) })} data-testid={k === "takeProfitPct" ? "take-profit-input" : undefined} /></label>
         ))}
         <label className="field small"><span>App name</span><input type="text" value={cfg.appName} onChange={(e) => setCfg({ ...cfg, appName: e.target.value })} /></label>
         <button className="pill-btn" onClick={save}>Save settings</button>

@@ -387,13 +387,30 @@ export function momentumBreakdown(c: Candidate | undefined, s: TapeSnap, hist: T
   return { exit: false, reason: '' };
 }
 
-/** Live/paper exits: 100% out on momentum break, plus a wide catastrophic / rug stop. No tight SL/TP. */
+/** Estimated net PnL % after a paper sell: mark proceeds minus extra slippage and sell fees, vs cost. Rent is refunded and ignored. */
+export function estimatedNetPnlPct(
+  pos: { entryPrice: number; qty?: number; costUsd?: number },
+  price: number,
+  opts: { extraSlippageBps?: number; feeUsd?: number } = {},
+): number {
+  if (!(price > 0) || !(pos.entryPrice > 0)) return 0;
+  const slip = Math.max(0, opts.extraSlippageBps || 0) / 1e4;
+  const fee = Math.max(0, opts.feeUsd || 0);
+  if ((pos.qty || 0) > 0 && (pos.costUsd || 0) > 0) {
+    const net = pos.qty! * price * (1 - slip) - fee;
+    return ((net - pos.costUsd!) / pos.costUsd!) * 100;
+  }
+  const fromEntry = (price / pos.entryPrice - 1) * 100;
+  return fromEntry - slip * 100;
+}
+
+/** Paper/live exits: 100% out on take-profit (paper), momentum break, or a wide catastrophic / rug stop. */
 export function liveExit(
-  pos: PosMark & { entryLiq?: number },
+  pos: PosMark & { entryLiq?: number; qty?: number; costUsd?: number },
   price: number,
   c: Candidate | undefined,
   hist: TapeSnap[],
-  opts: { catStopPct?: number; sensitivity?: number } = {},
+  opts: { catStopPct?: number; sensitivity?: number; takeProfitPct?: number; extraSlippageBps?: number; feeUsd?: number } = {},
 ): { exit: boolean; kind: ExitKind | null; reason: string; partial: boolean; peak: number } {
   const cat = opts.catStopPct ?? 35;
   const peak = Math.max(pos.peakPrice, price);
@@ -403,6 +420,12 @@ export function liveExit(
     return { exit: true, kind: 'hard_stop', reason: `rug · liquidity pulled (${fromEntry.toFixed(1)}%)`, partial: false, peak };
   if (fromEntry <= -cat)
     return { exit: true, kind: 'hard_stop', reason: `catastrophic stop -${cat}% (${fromEntry.toFixed(1)}%)`, partial: false, peak };
+  const tp = opts.takeProfitPct ?? 0;
+  if (tp > 0) {
+    const net = estimatedNetPnlPct(pos, price, { extraSlippageBps: opts.extraSlippageBps, feeUsd: opts.feeUsd });
+    if (net >= tp)
+      return { exit: true, kind: 'take_profit', reason: `take profit +${net.toFixed(1)}% net (target +${tp}%)`, partial: false, peak };
+  }
   const s = hist[hist.length - 1] || (c ? toSnap(Date.now(), c) : undefined);
   if (s) {
     const br = momentumBreakdown(c, s, hist, { sensitivity: opts.sensitivity });

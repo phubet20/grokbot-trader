@@ -60,4 +60,8 @@ test('config sanitize: min $2 start, live-auto kept, bogus mode -> paper', () =>
   assert.equal(sanitize({ startUsd: 1 }).startUsd, 2);
   assert.equal(sanitize({ mode: 'live-auto' as any }).mode, 'live-auto');
   assert.equal(sanitize({ mode: 'yolo' as any }).mode, 'paper');
+  assert.equal(DEFAULTS.takeProfitPct, 3);
+  assert.equal(sanitize({ takeProfitPct: 5 }).takeProfitPct, 5);
+  assert.equal(sanitize({ takeProfitPct: -1 }).takeProfitPct, 0);
+  assert.equal(sanitize({ takeProfitPct: 99 }).takeProfitPct, 50);
 });

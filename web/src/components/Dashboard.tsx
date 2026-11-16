@@ -232,6 +232,9 @@ export function AutoTunePanel({ snap }: { snap: any }) {
         <span>smooth <b>{Math.round((t.smoothness || 0) * 100)}%</b></span>
         <span>exit sens <b>{(t.exitSensitivity || 1).toFixed(2)}</b></span>
         <span>closes <b>{t.trades || 0}</b></span>
+        {t.exits && Object.keys(t.exits).length > 0 && (
+          <span>exits <b>{['take_profit', 'momentum_fade', 'hard_stop'].filter((k) => t.exits[k]).map((k) => `${t.exits[k]} ${k === 'take_profit' ? 'TP' : k === 'momentum_fade' ? 'momentum' : 'stop'}`).concat(Object.entries(t.exits).filter(([k]) => !['take_profit', 'momentum_fade', 'hard_stop'].includes(k)).map(([k, n]) => `${n} ${k}`)).join(' · ')}</b></span>
+        )}
       </div>
       {rows.length === 0 ? (
         <div className="mono tiny muted">No closed paper trades yet — patterns will appear here after the first exits.</div>

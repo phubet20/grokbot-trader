@@ -76,6 +76,18 @@ test('dump/load restores weights', () => {
   assert.equal(t2.exitSensitivity, t.exitSensitivity);
 });
 
+test('take-profit is recorded as an exit reason', () => {
+  const t = new AutoTune();
+  t.record({ reason: 'whale inflow', pnlUsd: 0.4, costUsd: 8, pnlPct: 5, equity: 82, exitKind: 'take_profit', exitReason: 'take profit +3.2% net (target +3%)' });
+  t.record({ reason: 'whale inflow', pnlUsd: -0.2, costUsd: 8, pnlPct: -2.5, equity: 81.8, exitKind: 'momentum_fade', exitReason: 'momentum break · net sell flow' });
+  const s = t.snapshot();
+  assert.equal(s.exits.take_profit, 1);
+  assert.equal(s.exits.momentum_fade, 1);
+  const pat = s.patterns.find((p) => p.key === 'whale-inflow')!;
+  assert.equal(pat.n, 2);
+  assert.equal(pat.wins, 1);
+});
+
 test('betaSample stays in (0,1)', () => {
   for (let i = 0; i < 30; i++) {
     const x = betaSample(3, 5, () => (i + 1) / 31);

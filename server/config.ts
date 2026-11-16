@@ -19,6 +19,7 @@ export type Config = {
   positionPct: number;         // % of current portfolio per trade
   minTradeUsd: number;         // never open a trade smaller than this
   maxPositions: number;        // max concurrent open positions
+  takeProfitPct: number;       // paper: close 100% when net PnL after fees/slip reaches this %
   hardStopPct: number;         // exit if price drops this % below entry
   trailingStopPct: number;     // exit if price drops this % from the peak
   maxHoldMin: number;          // exit stale positions after N minutes
@@ -51,6 +52,7 @@ export const DEFAULTS: Config = {
   positionPct: 8,
   minTradeUsd: 0.25,
   maxPositions: 10,
+  takeProfitPct: 3,
   hardStopPct: 35,
   trailingStopPct: 60,
   maxHoldMin: 0,
@@ -85,6 +87,7 @@ function fromEnv(): Partial<Config> {
   if (e.PORT) out.port = Number(e.PORT);
   if (e.START_USD) out.startUsd = Number(e.START_USD);
   if (e.POSITION_PCT) out.positionPct = Number(e.POSITION_PCT);
+  if (e.TAKE_PROFIT_PCT) out.takeProfitPct = Number(e.TAKE_PROFIT_PCT);
   if (e.RPC_URL) out.rpcUrl = e.RPC_URL;
   if (e.LIVE_CONFIRM) out.liveConfirm = e.LIVE_CONFIRM;
   return out;
@@ -102,6 +105,7 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   if (out.startUsd !== undefined) out.startUsd = Math.max(2, out.startUsd);
   if (out.positionPct !== undefined) out.positionPct = Math.min(100, Math.max(1, out.positionPct));
   if (out.maxPositions !== undefined) out.maxPositions = Math.min(20, Math.max(1, Math.round(out.maxPositions)));
+  if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0, out.takeProfitPct));
   if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(80, Math.max(1, out.hardStopPct));
   if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(80, Math.max(2, out.trailingStopPct));
   if (out.mode !== undefined && out.mode !== 'live' && out.mode !== 'live-auto') out.mode = 'paper';

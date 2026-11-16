@@ -687,7 +687,13 @@ export class Engine extends EventEmitter {
         if (!px) continue;
         p.lastPrice = px;
         const hist = this.mintHist.get(p.mint) || [];
-        const d = liveExit({ ...p, peakPrice: Math.max(p.peakPrice, px) }, px, fresh, hist, { catStopPct: this.cfg.hardStopPct, sensitivity: this.mode === 'paper' ? this.tuner.exitSensitivity : 1 });
+        const d = liveExit({ ...p, peakPrice: Math.max(p.peakPrice, px) }, px, fresh, hist, {
+          catStopPct: this.cfg.hardStopPct,
+          sensitivity: this.mode === 'paper' ? this.tuner.exitSensitivity : 1,
+          takeProfitPct: this.mode === 'paper' ? (this.cfg.takeProfitPct ?? 0) : 0,
+          extraSlippageBps: this.cfg.extraSlippageBps,
+          feeUsd: (BASE_FEE_SOL + this.cfg.priorityFeeSol) * this.solPrice,
+        });
         p.peakPrice = Math.max(p.peakPrice, px);
         if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);
       }
@@ -761,7 +767,7 @@ export class Engine extends EventEmitter {
     const t: ClosedTrade = { ...p, closedAt: Date.now(), exitPrice, proceedsUsd, pnlUsd, pnlPct: (pnlUsd / p.costUsd) * 100, reason, kind, heldSec: (Date.now() - p.openedAt) / 1000 } as ClosedTrade;
     this.store.addTrade(t);
     if (this.mode === 'paper') {
-      this.tuner.record({ reason: p.entryPattern || reason, pnlUsd, costUsd: p.costUsd, pnlPct: t.pnlPct, equity: this.equity() });
+      this.tuner.record({ reason: p.entryPattern || reason, exitKind: kind, exitReason: reason, pnlUsd, costUsd: p.costUsd, pnlPct: t.pnlPct, equity: this.equity() });
       this.store.set('autotune', this.tuner.dump());
     }
     const rug = /rug|catastrophic|dev\/top-holder/i.test(reason);
@@ -772,7 +778,7 @@ export class Engine extends EventEmitter {
     this.decision({ ts: Date.now(), side: 'SELL', symbol: p.symbol, image: p.image, text: `${reason} · ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd).toFixed(2)} via Jupiter`, usd: pnlUsd });
     void notifyTrade({ side: 'SELL', symbol: p.symbol, sizeUsd: proceedsUsd, price: exitPrice, pnlPct: t.pnlPct });
     this.log('Risk', stopped ? 'stop' : 'sell', `${stopped ? 'Stopped' : 'Sold'} ${p.symbol}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: pnlUsd, pct: t.pnlPct, text2: reason } as any);
-    if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
+    if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: kind === 'take_profit' ? `Take profit ${p.symbol}` : `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
     const adapted = this.riskAdapted();
     if (pnlUsd < 0 && adapted.pauseMs) {
       this.lossPauseUntil = Date.now() + adapted.pauseMs;
