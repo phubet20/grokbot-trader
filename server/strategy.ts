@@ -456,8 +456,10 @@ export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STR
     if (dipPct >= 2 && dipPct <= 18 && r5 >= 0.55 && snap.px >= h[h.length - 2].px)
       return { ok: true, reason: `dip-buy after whale · dip ${dipPct.toFixed(1)}%` };
   }
+  // 1s candles on a 2-tick pump tape are noise, not a real first pullback.
   const candle = buyCandlePattern(h);
-  if (candle.ok && /higher lows/.test(candle.reason)) return candle;
+  if (candle.ok && /higher lows/.test(candle.reason) && !candle.reason.includes('1s') && h.length >= 4)
+    return candle;
   return { ok: false, reason: 'no signal' };
 }
 
