@@ -9,7 +9,8 @@ import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts'
 import { Store } from './store.ts';
 import { preCheck, securityCheck } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
-import { positionSizeUsd, entryBlocked, evaluateExit, activeStop, reserveSol, fmtPct, momentumEntryOk, momentumFade, adaptFilters, lowBalanceReason } from './risk.ts';
+import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason } from './risk.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, momentumFadeStrict, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 
@@ -59,6 +60,17 @@ export class Engine extends EventEmitter {
   private scanHistory: { t: number; n: number }[] = [];
   private lastPairAt = 0;
   private lossPauseUntil = 0;
+  private mintHist = new Map<string, TapeSnap[]>();
+  private strat() { return { ...STRAT_DEFAULTS, hardStopPct: this.cfg.hardStopPct, trailingStopPct: this.cfg.trailingStopPct, maxHoldMin: this.cfg.maxHoldMin, minLiq: this.cfg.minLiquidityUsd, maxLiq: this.cfg.maxLiquidityUsd, minMcap: this.cfg.minMcapUsd, maxMcap: this.cfg.maxMcapUsd, minAgeMin: this.cfg.minAgeMin, maxAgeHours: this.cfg.maxAgeHours }; }
+  private remember(c: Candidate, now: number) {
+    const s = toSnap(now, c);
+    const arr = this.mintHist.get(c.mint) || [];
+    if (!arr.length || arr[arr.length - 1].t !== s.t) arr.push(s);
+    if (arr.length > 24) arr.splice(0, arr.length - 24);
+    this.mintHist.set(c.mint, arr);
+    return arr;
+  }
+
   lastEquity = 0;
 
   constructor(cfg: Config, m: MarketSource, store: Store) {
@@ -195,7 +207,7 @@ export class Engine extends EventEmitter {
       this.scanHistory = this.scanHistory.filter((x) => now - x.t < 3600_000);
       const span = Math.max(60_000, now - this.scanHistory[0].t);
       sc.perHour = Math.round((this.scanHistory.reduce((a, x) => a + x.n, 0) / span) * 3600_000);
-      for (const c of list) this.candidates.set(c.mint, { ...this.candidates.get(c.mint), ...c, seenAt: now });
+      for (const c of list) { this.candidates.set(c.mint, { ...this.candidates.get(c.mint), ...c, seenAt: now }); this.remember(c, now); }
       for (const [k, v] of this.candidates) if (now - v.seenAt > 3 * 3600_000 && !this.positions.some((p) => p.mint === k)) this.candidates.delete(k);
 
       // SAFETY pre-check + ANALYST scoring
@@ -222,16 +234,21 @@ export class Engine extends EventEmitter {
 
       if (!this.wallet.connected || !this.wallet.running) return;
       this.rollDay();
-      if (this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length >= this.cfg.maxPositions) {
-        this.agents.risk.label = 'holding — one at a time';
+      const reservedOpen = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
+      const adapted = this.riskAdapted();
+      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
+      const slots = usableSlots(this.cfg, this.equity(), this.cashUsd(), reserveUsd, reservedOpen);
+      if (!slots || reservedOpen >= this.cfg.maxPositions) {
+        this.agents.risk.label = reservedOpen ? `holding ${reservedOpen}/${this.cfg.maxPositions}` : (lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) || 'no free slot');
         return;
       }
-      const adapted = this.riskAdapted();
       let checks = 0;
       for (const { c, s } of scored) {
+        if (this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length >= this.cfg.maxPositions) break;
         if (s.score < adapted.minScore) continue;
-        if (!momentumEntryOk(c)) continue;
-        if (checks >= 3) break;
+        const ent = liveEntryOk(c, this.mintHist.get(c.mint) || [], this.strat(), now);
+        if (!ent.ok) continue;
+        if (checks >= 10) break;
         const blocked = entryBlocked(this.cfg, {
           openPositions: this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length,
           dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
@@ -255,8 +272,8 @@ export class Engine extends EventEmitter {
           this.cooldown[c.mint] = Date.now() + 20 * 60_000;
           continue;
         }
-        const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
-        const trialSize = positionSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, adapted.sizeMult);
+        const openNow = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
+        const trialSize = slotSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, openNow);
         if (!trialSize) { this.agents.risk.label = lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) || 'not enough free cash'; break; }
         const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
         if (!okSell) {
@@ -266,8 +283,8 @@ export class Engine extends EventEmitter {
         }
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
-        await this.openPosition(c, s.score, `score ${s.score} · bull ${s.bull}/bear ${s.bear}`);
-        break; // one position at a time
+        await this.openPosition(c, s.score, `${ent.reason} · score ${s.score}`);
+        // keep filling free slots in this scan
       }
       this.store.set('cooldown', this.cooldown);
     } finally {
@@ -286,7 +303,8 @@ export class Engine extends EventEmitter {
     const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
     const low = lowBalanceReason(eq, this.cashUsd(), reserveUsd, this.cfg.minTradeUsd);
     if (low) { this.agents.risk.label = low; return; }
-    const size = positionSizeUsd(this.cfg, eq, this.cashUsd(), reserveUsd, adapted.sizeMult);
+    const openNow = this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length;
+    const size = slotSizeUsd(this.cfg, eq, this.cashUsd(), reserveUsd, openNow);
     if (!size) { this.agents.risk.label = 'not enough free cash'; return; }
     const solAmt = size / this.solPrice;
     if (this.mode === 'live-auto') return this.execLiveAuto('buy', c, { solAmt, score, why });
@@ -300,7 +318,8 @@ export class Engine extends EventEmitter {
       id: randomUUID(), mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(),
       entryPrice: f.fillPrice, qty: f.tokens, decimals: f.decimals, costUsd: costSol * this.solPrice, costSol,
       peakPrice: f.fillPrice, lastPrice: f.fillPrice, score, rentSol: f.rentSol,
-    };
+    } as Position;
+    (pos as any).origCost = pos.costUsd; (pos as any).partialTaken = false; (pos as any).breakeven = false;
     this.positions.push(pos);
     this.agents.executor.fills++; this.agents.executor.last = `BUY ${c.symbol}`;
     this.persist();
@@ -320,15 +339,18 @@ export class Engine extends EventEmitter {
       if (prices[SOL_MINT]) this.solPrice = prices[SOL_MINT];
       const now = Date.now();
       const adapted = this.riskAdapted();
-      const riskP = { ...this.cfg, hardStopPct: adapted.hardStopPct, trailingStopPct: adapted.trailingStopPct };
+      const strat = { ...this.strat(), hardStopPct: adapted.hardStopPct, trailingStopPct: adapted.trailingStopPct };
       if (this.positions.length && now - this.lastPairAt > 3000) {
         this.lastPairAt = now;
         for (const p of this.positions) {
           const fresh = await this.m.pair(p.mint).catch(() => null);
           if (fresh) {
             this.candidates.set(p.mint, { ...this.candidates.get(p.mint), ...fresh, seenAt: now } as any);
-            const fade = momentumFade(fresh, p.peakPrice, p.lastPrice || fresh.priceUsd);
-            if (fade.exit) { await this.closePosition(p, 'momentum_fade', fade.reason); continue; }
+            this.remember(fresh, now);
+            const fade = momentumFadeStrict(toSnap(now, fresh));
+            const d = exitReason(p as any, fresh.priceUsd || p.lastPrice, strat, now, fade.exit, fade.reason);
+            p.peakPrice = d.peak;
+            if (d.exit) { await this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1); continue; }
           }
         }
       }
@@ -336,9 +358,9 @@ export class Engine extends EventEmitter {
         const px = prices[p.mint];
         if (!px) continue;
         p.lastPrice = px;
-        const d = evaluateExit(riskP, p, px, now);
+        const d = exitReason(p as any, px, strat, now);
         p.peakPrice = d.peak;
-        if (d.exit) await this.closePosition(p, d.kind!, d.reason);
+        if (d.exit) await this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1);
       }
       const trailing = this.positions.filter((p) => activeStop(this.cfg, p).kind === 'trailing');
       this.agents.risk.status = trailing.length ? `Trailing ${trailing.length}` : this.positions.length ? 'Guarding' : 'Idle';
@@ -361,20 +383,39 @@ export class Engine extends EventEmitter {
     } finally { this.monitoring = false; }
   }
 
-  async closePosition(p: Position, kind: string, reason: string) {
-    if (this.mode === 'live-auto') return this.execLiveAuto('sell', p as any, { position: p, kind, reason });
-    if (this.mode === 'live') return this.requestLive('sell', p as any, { position: p, kind, reason });
-    const f = await this.exec.sell(p.mint, p.qty, p.decimals, this.solPrice);
+  async closePosition(p: Position, kind: string, reason: string, fraction = 1) {
+    const frac = Math.min(1, Math.max(0.05, fraction));
+    if (this.mode === 'live-auto') return this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac });
+    if (this.mode === 'live') return this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac });
+    const qty = p.qty * frac;
+    const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
     if (!f.ok) {
       this.sellFails[p.id] = (this.sellFails[p.id] || 0) + 1;
-      if (this.sellFails[p.id] < 6) return; // retry next tick
-      // paper only: assume a bad exit (-15% vs last price) when no route exists
-      fillPrice = p.lastPrice * 0.85; solBack = (p.qty * fillPrice) / this.solPrice; note = ' (no route, est.)';
+      if (this.sellFails[p.id] < 6) return;
+      fillPrice = p.lastPrice * 0.85; solBack = (qty * fillPrice) / this.solPrice; note = ' (no route, est.)';
     } else { solBack = f.solReceived - f.feesSol; fillPrice = f.fillPrice; }
     delete this.sellFails[p.id];
+    if (frac < 0.999 && p.qty - qty > 0) {
+      this.wallet.solBalance += solBack;
+      const costCut = p.costUsd * frac;
+      (p as any).origCost = (p as any).origCost ?? p.costUsd;
+      (p as any).realizedUsd = ((p as any).realizedUsd || 0) + solBack * this.solPrice;
+      p.qty -= qty;
+      p.costUsd -= costCut;
+      p.costSol *= (1 - frac);
+      (p as any).partialTaken = true;
+      (p as any).breakeven = true;
+      this.log('Risk', 'sell', `Partial ${p.symbol} ${reason}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: solBack * this.solPrice, pct: (fillPrice / p.entryPrice - 1) * 100, text2: reason } as any);
+      this.persist();
+      this.emitState();
+      return;
+    }
     this.wallet.solBalance += solBack + p.rentSol;
-    this.finishClose(p, fillPrice, solBack * this.solPrice, kind, reason + note);
+    const proceeds = solBack * this.solPrice + ((p as any).realizedUsd || 0);
+    const cost = (p as any).origCost ?? p.costUsd;
+    p.costUsd = cost;
+    this.finishClose(p, fillPrice, proceeds, kind, reason + note);
   }
 
   private finishClose(p: Position, exitPrice: number, proceedsUsd: number, kind: string, reason: string) {

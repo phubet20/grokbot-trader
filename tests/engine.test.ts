@@ -27,8 +27,8 @@ test('paper engine trades a $10 wallet and keeps accounting consistent', async (
   }
   const s = e.stats();
   assert.ok(s.trades > 0, 'made some trades');
-  assert.ok(e.positions.length <= 1, 'one position at a time');
-  for (const p of e.positions) assert.ok(p.costUsd <= 10 * 0.08 * 1.7 + 0.05, 'size ~8% of a $10 book (not boosted to full cash)');
+  assert.ok(e.positions.length <= cfg.maxPositions, 'respects max slots');
+  for (const p of e.positions) assert.ok(p.costUsd <= 10 + 0.05, 'slot size cannot exceed the book');
   // accounting: equity == cash + positions + locked rent
   const manual = e.wallet.solBalance * e.solPrice + e.positions.reduce((a, p) => a + p.qty * p.lastPrice + p.rentSol * e.solPrice, 0);
   assert.ok(Math.abs(manual - e.equity()) < 1e-9);
@@ -36,7 +36,7 @@ test('paper engine trades a $10 wallet and keeps accounting consistent', async (
   e.stop();
 });
 
-test('paper engine can trade a $2 wallet (upsized when 8% is too small)', async () => {
+test('paper engine can trade a $2 wallet (fewer slots so each trade stays viable)', async () => {
   const dir2 = mkdtempSync(join(tmpdir(), 'gb2-'));
   const cfg = { ...DEFAULTS, startUsd: 2, minScore: 35, minHolders: 50, minAgeMin: 1, minMcapUsd: 1000, minLiquidityUsd: 5000, cooldownMin: 1, scanIntervalSec: 9999, monitorIntervalSec: 9999, minTradeUsd: 0.25 };
   const m = new ReplayMarket(800);
@@ -48,7 +48,7 @@ test('paper engine can trade a $2 wallet (upsized when 8% is too small)', async 
     await new Promise((r) => setTimeout(r, 80));
     await e.monitor();
     assert.ok(e.wallet.solBalance >= -1e-9, 'cash never negative');
-    assert.ok(e.positions.length <= 1);
+    assert.ok(e.positions.length <= cfg.maxPositions);
   }
   const s = e.stats();
   assert.ok(s.trades >= 0); // may or may not fill depending on momentum; accounting must hold

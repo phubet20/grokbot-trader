@@ -167,6 +167,26 @@ export class LiveMarket implements MarketSource {
     } catch { return null; }
   }
 
+  async pairs(mints: string[]): Promise<Candidate[]> {
+    const out: Candidate[] = [];
+    const uniq = [...new Set(mints.filter(Boolean))].slice(0, 30);
+    if (!uniq.length) return out;
+    try {
+      const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${uniq.join(',')}`, 'dexscreener'));
+      const best = new Map<string, any>();
+      for (const p of Array.isArray(pairs) ? pairs : []) {
+        const m = p.baseToken?.address;
+        if (!m) continue;
+        if (!best.has(m) || num(p.liquidity?.usd) > num(best.get(m).liquidity?.usd)) best.set(m, p);
+      }
+      for (const p of best.values()) {
+        const c = mapDs(p);
+        if (c) out.push(c);
+      }
+    } catch {}
+    return out;
+  }
+
   async security(mint: string): Promise<TokenSecurity | null> {
     const hit = this.secCache.get(mint);
     if (hit && Date.now() - hit.fetchedAt < 15 * 60_000) return hit;

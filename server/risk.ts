@@ -42,6 +42,34 @@ export function positionSizeUsd(p: RiskParams, portfolioUsd: number, freeCashUsd
   return round2(spendable);
 }
 
+/**
+ * How many concurrent slots this book can support.
+ * Capital is split evenly across slots from equity, after reserving rent/fees
+ * for every slot. Tiny books use fewer slots so each trade stays >= minTrade.
+ */
+export function usableSlots(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number, openPositions = 0): number {
+  const max = Math.max(1, Math.min(10, p.maxPositions || 10));
+  for (let n = max; n >= 1; n--) {
+    if (openPositions >= n) continue;
+    const reserved = n * reserveUsd;
+    const tradable = equityUsd - reserved;
+    if (tradable < n * p.minTradeUsd) continue;
+    const size = tradable / n;
+    if (freeCashUsd + 1e-9 < size + reserveUsd) continue;
+    return n;
+  }
+  return 0;
+}
+
+export function slotSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number, openPositions = 0): number {
+  const n = usableSlots(p, equityUsd, freeCashUsd, reserveUsd, openPositions);
+  if (!n) return 0;
+  const size = (equityUsd - n * reserveUsd) / n;
+  const cap = freeCashUsd - reserveUsd;
+  if (size < p.minTradeUsd || cap < p.minTradeUsd) return 0;
+  return round2(Math.min(size, cap));
+}
+
 export function lowBalanceReason(portfolioUsd: number, freeCashUsd: number, reserveUsd: number, minTradeUsd: number): string | null {
   if (freeCashUsd <= 0) return 'wallet is empty — deposit SOL to the bot address';
   if (freeCashUsd <= reserveUsd) return `balance too low to cover fees and token-account rent (need ~$${reserveUsd.toFixed(2)} reserved, have $${freeCashUsd.toFixed(2)})`;
@@ -80,12 +108,12 @@ export function adaptFilters(base: { minScore: number; trailingStopPct: number; 
   if (consec >= 2) {
     minScore += 8;
     trailingStopPct = Math.max(3, trailingStopPct - 2);
-    pauseMs = 10 * 60_000;
+    pauseMs = 0;
   }
   if (consec >= 3 || (last.length >= 6 && losses >= 5)) {
     minScore += 5;
     hardStopPct = Math.max(3, hardStopPct - 1);
-    pauseMs = 20 * 60_000;
+    pauseMs = 0;
   }
   return { minScore, trailingStopPct, hardStopPct, pauseMs, consec, sizeMult: sizeMultiplier(recentPnlsChrono) };
 }

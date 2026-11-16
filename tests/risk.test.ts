@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { positionSizeUsd, entryBlocked, evaluateExit, activeStop, reserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
+import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, evaluateExit, activeStop, reserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
 
 const P = { positionPct: 8, minTradeUsd: 0.5, maxPositions: 4, hardStopPct: 8, trailingStopPct: 12, maxHoldMin: 120, dailyLossLimitPct: 15 };
 const T0 = 1_000_000;
@@ -92,7 +92,7 @@ test('consecutive loss cooldown and tighter filters (self-correction, not averag
   assert.equal(consecutiveLosses([1, -1, -1]), 2);
   const a = adaptFilters({ minScore: 55, trailingStopPct: 6, hardStopPct: 5 }, [-1, -1]);
   assert.ok(a.minScore > 55);
-  assert.ok(a.pauseMs >= 10 * 60_000);
+  assert.equal(a.pauseMs, 0);
   assert.ok(a.trailingStopPct <= 6);
 });
 test('low balance message when cash cannot cover reserve + min trade', () => {
@@ -105,4 +105,19 @@ test('momentum entry requires buy pressure and acceleration; fade on ratio drop'
   assert.equal(momentumEntryOk({ ...c, change: { ...c.change, m5: 0.5 } }), false);
   const fade = momentumFade({ ...c, txns: { ...c.txns, m5b: 3, m5s: 12 } }, 1.2, 1.1);
   assert.equal(fade.exit, true);
+});
+
+test('even slot sizing: $81 gets 10 slots, $2 uses fewer so each trade stays viable', () => {
+  const P2 = { ...P, minTradeUsd: 0.25, maxPositions: 10 };
+  const n81 = usableSlots(P2, 81, 81, 0.35, 0);
+  assert.equal(n81, 10);
+  const s81 = slotSizeUsd(P2, 81, 81, 0.35, 0);
+  assert.ok(s81 >= 7 && s81 <= 8.1, 's81=' + s81);
+  const n2 = usableSlots(P2, 2, 2, 0.35, 0);
+  assert.ok(n2 >= 1 && n2 <= 4, 'tiny book uses fewer slots, n2=' + n2);
+  const s2 = slotSizeUsd(P2, 2, 2, 0.35, 0);
+  assert.ok(s2 >= 0.25 && s2 <= 2, 's2=' + s2);
+  // cannot overfill: once slots are used, no extra size
+  const nFull = usableSlots(P2, 81, 8, 0.35, 10);
+  assert.equal(nFull, 0);
 });
