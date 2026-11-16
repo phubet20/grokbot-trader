@@ -1286,7 +1286,18 @@ export class Engine extends EventEmitter {
       }
       const r = await swapUsdcToSol(this.cfg, this.m);
       this.lastUsdcSwapAt = Date.now();
-      await this.syncBotBalance();
+      // RPC can lag behind a just-landed gasless swap; don't zero out equity.
+      let synced = 0;
+      for (let i = 0; i < 5; i++) {
+        await this.syncBotBalance();
+        synced = this.wallet.realSol ?? this.wallet.solBalance ?? 0;
+        if (synced > 0) break;
+        await new Promise((res) => setTimeout(res, 800));
+      }
+      if (synced <= 0 && r.solOutEst > 0) {
+        this.wallet.solBalance = r.solOutEst;
+        this.wallet.realSol = r.solOutEst;
+      }
       this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, bot);
       const how = r.gasless ? 'gasless Jupiter' : 'Jupiter';
       this.log('Executor', 'info', `swapped ${r.usdcIn.toFixed(2)} USDC to ~${r.solOutEst.toFixed(4)} SOL via ${how} · ${r.signature}`);
