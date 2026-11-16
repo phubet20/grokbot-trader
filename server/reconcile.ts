@@ -81,8 +81,8 @@ export async function rebuildPositions(opts: {
   metaOf?: (mint: string) => { symbol?: string; name?: string; image?: string; pool?: string } | undefined;
 }): Promise<{ positions: Position[]; added: number; skipped: number }> {
   const holdings = await fetchTokenHoldings(opts.rpcUrl, opts.owner);
+  const incoming: Reconciled[] = [];
   const have = new Set(opts.current.map((p) => p.mint));
-  const positions = [...opts.current];
   let added = 0, skipped = 0;
   for (const h of holdings) {
     if (have.has(h.mint)) continue;
@@ -102,14 +102,34 @@ export async function rebuildPositions(opts: {
       peakPrice: Math.max(entry, px), lastPrice: px, score: 0, rentSol: 0.002,
       reconciled: true, entryEstimated: !hist || estimated,
     };
-    positions.push(pos);
+    incoming.push(pos);
     have.add(h.mint);
     added++;
   }
-  // Drop local positions that no longer have tokens (unless qty was already 0)
-  const live = new Set(holdings.map((h) => h.mint));
-  const kept = positions.filter((p) => !p.id.startsWith('recon-') || live.has(p.mint));
-  return { positions: kept, added, skipped };
+  return { positions: applyOnchainHoldings(opts.current, holdings, incoming), added, skipped };
+}
+
+/** Keep only mints actually held on-chain; drop paper leftovers and vanished tokens. Update qty from chain. */
+export function applyOnchainHoldings<T extends { mint: string; qty: number; decimals: number }>(
+  current: T[],
+  holdings: { mint: string; qty: number; decimals: number }[],
+  incoming: T[] = [],
+): T[] {
+  const live = new Map(holdings.map((h) => [h.mint, h]));
+  const kept: T[] = [];
+  const seen = new Set<string>();
+  for (const p of current) {
+    const h = live.get(p.mint);
+    if (!h) continue;
+    kept.push({ ...p, qty: h.qty, decimals: h.decimals });
+    seen.add(p.mint);
+  }
+  for (const n of incoming) {
+    if (seen.has(n.mint) || !live.has(n.mint)) continue;
+    kept.push(n);
+    seen.add(n.mint);
+  }
+  return kept;
 }
 
 export async function fetchMintAuthorities(rpcUrl: string, mint: string): Promise<{ mintAuthority: string | null; freezeAuthority: string | null; decimals: number } | null> {

@@ -156,7 +156,17 @@ export class Engine extends EventEmitter {
       }
     }
     if (this.mode === 'live-auto' && hasBotWallet()) {
+      // Never carry a paper book into live-auto. Equity and exits must be on-chain only.
+      if (this.positions.length) {
+        this.log('Core', 'info', `dropping ${this.positions.length} paper position(s) — live-auto uses on-chain holdings only`);
+        this.positions = [];
+        this.persist();
+      }
       await this.syncBotBalance();
+      try {
+        const pub = botPublicKey();
+        if (pub) this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, pub);
+      } catch {}
       if (this.wallet.running || autoStartEnabled()) {
         await this.connect({ type: 'paper' });
         await this.reconcileOnchain();
@@ -333,7 +343,8 @@ export class Engine extends EventEmitter {
 
   equity() {
     const pos = this.positions.reduce((a, p) => a + p.qty * (p.lastPrice || p.entryPrice) + p.rentSol * this.solPrice, 0);
-    return this.wallet.solBalance * this.solPrice + pos;
+    const usdcUsd = this.mode === 'paper' ? 0 : (this.usdcBal?.ui || 0);
+    return this.wallet.solBalance * this.solPrice + pos + usdcUsd;
   }
   cashUsd() { return this.wallet.solBalance * this.solPrice; }
   private freeCashUsd() { return Math.max(0, (this.wallet.solBalance - this.reservedSol) * this.solPrice); }
@@ -1239,6 +1250,7 @@ export class Engine extends EventEmitter {
 
   private usdcBal: { ui: number; raw: bigint; ata: string | null } = { ui: 0, raw: 0n, ata: null };
   private lastUsdcSwapAt = 0;
+  private lastUsdcNeedSolAt = 0;
   private usdcBusy = false;
 
   async convertUsdc(force = false) {
@@ -1253,7 +1265,17 @@ export class Engine extends EventEmitter {
       this.usdcBal = bal;
       const sol = (this.wallet.realSol ?? this.wallet.solBalance ?? 0);
       const gate = canAutoSwapUsdc(this.mode, bal.ui, sol);
-      if (!gate.ok) return;
+      if (!gate.ok) {
+        if (gate.reason === 'need SOL for fees' && bal.ui > 0) {
+          const now = Date.now();
+          if (now - this.lastUsdcNeedSolAt > 60_000) {
+            this.lastUsdcNeedSolAt = now;
+            this.log('Core', 'info', `USDC ${bal.ui.toFixed(2)} waiting: need ~0.005 SOL in the bot wallet to pay swap fees (have ${sol.toFixed(4)} SOL)`);
+            this.emit('toast', { kind: 'warn', title: 'USDC received — send a little SOL', text: `${bal.ui.toFixed(2)} USDC is in the bot wallet but auto-swap needs ~0.005 SOL for fees (currently ${sol.toFixed(4)} SOL). Trading cannot start until then.` });
+          }
+        }
+        return;
+      }
       const r = await swapUsdcToSol(this.cfg, this.m);
       this.lastUsdcSwapAt = Date.now();
       await this.syncBotBalance();
