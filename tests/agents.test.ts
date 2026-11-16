@@ -40,6 +40,14 @@ test('safety security check: authorities, holders, missing data fail closed', ()
   assert.ok(!securityCheck({ ...s, topHolderPct: 40 }, DEFAULTS).ok);
   assert.ok(!securityCheck(null, DEFAULTS).ok);
 });
+test('pump.fun bonding-curve security: missing RugCheck is ok, authorities and dev cap still reject', () => {
+  const s = { mintAuthority: null, freezeAuthority: null, holders: 2, topHolderPct: 5, top10Pct: 25, dangerRisks: [], rugged: false, fetchedAt: now, available: true };
+  assert.ok(securityCheck(null, DEFAULTS, { pumpCurve: true, devHoldPct: 4 }).ok, 'no report yet is not a reject on the curve');
+  assert.ok(securityCheck(s, DEFAULTS, { pumpCurve: true, devHoldPct: 4 }).ok);
+  assert.ok(!securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS, { pumpCurve: true }).ok);
+  assert.ok(!securityCheck({ ...s, freezeAuthority: 'X' }, DEFAULTS, { pumpCurve: true }).ok);
+  assert.ok(!securityCheck(null, DEFAULTS, { pumpCurve: true, devHoldPct: 40 }).ok);
+});
 test('live mode needs mode=live AND the exact confirmation phrase', () => {
   assert.equal(liveGate(DEFAULTS).live, false);
   assert.equal(liveGate({ ...DEFAULTS, mode: 'live' }).live, false);

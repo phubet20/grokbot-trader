@@ -232,7 +232,7 @@ export class PumpFeed {
           netBuySol: t.initialSol, largeBuys: t.initialSol >= 0.5 ? 1 : 0, largeSells: 0,
           uniqueBuyers: b5, uniqueSellers: 0,
           whaleBuyUsd: t.initialSol * solPrice,
-          bundled: t.initialSol >= 2.5 && ageMin < 3,
+          bundled: false,
           devPubkey: t.dev, devHoldPct, devSold: false,
           progress, progressVel: ageMin > 0 ? progress / Math.max(ageMin, 0.05) : progress / 0.05,
         },

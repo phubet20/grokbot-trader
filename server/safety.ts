@@ -39,9 +39,26 @@ export function preCheck(c: Candidate, cfg: Config, now = Date.now()): SafetyRes
   return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'pre-check ✓' };
 }
 
-/** Checks that need on-chain/RugCheck data. Missing data = reject (fail closed). */
-export function securityCheck(s: TokenSecurity | null, cfg: Config): SafetyResult {
+export type SecurityOpts = { pumpCurve?: boolean; devHoldPct?: number };
+
+/** Checks that need on-chain/RugCheck data.
+ *  AMM tokens fail closed when the report is missing.
+ *  pump.fun bonding-curve tokens: mint/freeze are revoked at create, so a missing
+ *  RugCheck report is not a reject. We still reject if a report shows authorities
+ *  or a rugged flag, and we apply the dev-holding cap. */
+export function securityCheck(s: TokenSecurity | null, cfg: Config, opts: SecurityOpts = {}): SafetyResult {
   const r: string[] = [];
+  if (opts.pumpCurve) {
+    if (s?.available) {
+      if (s.rugged) r.push('flagged rugged');
+      if (s.mintAuthority) r.push('mint authority active');
+      if (s.freezeAuthority) r.push('freeze authority active');
+      if (s.topHolderPct !== null && s.topHolderPct > cfg.maxTopHolderPct) r.push(`top holder ${s.topHolderPct.toFixed(0)}%`);
+    }
+    // No report yet: mint/freeze are always revoked on pump.fun creates.
+    if ((opts.devHoldPct || 0) > cfg.maxTopHolderPct) r.push(`dev holds ${opts.devHoldPct!.toFixed(0)}%`);
+    return { ok: r.length === 0, reasons: r, label: r.length ? r[0] : 'pump curve · mint/freeze revoked · dev cap ✓' };
+  }
   if (!s || !s.available) return { ok: false, reasons: ['security data unavailable'], label: 'no security data' };
   if (s.rugged) r.push('flagged rugged');
   if (s.mintAuthority) r.push('mint authority active');

@@ -276,10 +276,14 @@ export class LiveMarket implements MarketSource {
   }
 
   async quote(inputMint: string, outputMint: string, amountRaw: bigint, slippageBps: number): Promise<Quote | null> {
+    const mint = outputMint === SOL_MINT ? inputMint : outputMint;
+    const curveTok = this.pump.get(mint);
+    // Bonding-curve tokens have no Jupiter route yet — don't wait on a 404/timeout.
+    if (curveTok && !curveTok.graduated) return curveQuote(curveTok, inputMint, outputMint, amountRaw, this.lastSolPrice || 0);
     try {
       const d = await this.jup.run(() => this.get(`https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${slippageBps}&restrictIntermediateTokens=true`, 'jupiter'));
       if (!d?.outAmount) {
-        const t = this.pump.get(outputMint === SOL_MINT ? inputMint : outputMint);
+        const t = this.pump.get(mint);
         if (t && !t.graduated) return curveQuote(t, inputMint, outputMint, amountRaw, this.lastSolPrice || 0);
         return null;
       }

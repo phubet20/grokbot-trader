@@ -35,7 +35,8 @@ export function useLive() {
       on('approval', (d) => setApprovals((a) => [...a, d]));
     };
     connect();
-    const iv = setInterval(() => api('state').then(setSnap).catch(() => {}), 15000);
+    api('state').then(setSnap).catch(() => {});
+    const iv = setInterval(() => api('state').then(setSnap).catch(() => {}), 4000);
     return () => { stop = true; es?.close(); clearInterval(iv); };
   }, []);
   return { snap, setSnap, toasts, setToasts, approvals, setApprovals, online };

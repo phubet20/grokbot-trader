@@ -7,7 +7,7 @@ import type { MarketSource } from './market.ts';
 import { SOL_MINT } from './market.ts';
 import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts';
 import { Store } from './store.ts';
-import { preCheck, securityCheck } from './safety.ts';
+import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason } from './risk.ts';
 import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, type TapeSnap } from './strategy.ts';
@@ -17,7 +17,7 @@ import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
 import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './render-env.ts';
 import { rebuildPositions } from './reconcile.ts';
-import { getPumpFeed } from './pump.ts';
+import { getPumpFeed, mergePumpOnto } from './pump.ts';
 
 export type Wallet = {
   connected: boolean;
@@ -74,7 +74,7 @@ export class Engine extends EventEmitter {
   pending = new Map<string, Pending>();
   agents = {
     scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0 },
-    safety: { checked: 0, rejected: 0, passed: 0, last: '', lastSymbol: '', lastOk: true, calls: 0 },
+    safety: { checked: 0, rejected: 0, passed: 0, last: '', lastSymbol: '', lastOk: true, calls: 0, reasons: {} as Record<string, number> },
     analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
     risk: { status: 'Guarding', label: '', exits: 0 },
     executor: { fills: 0, last: '', failures: 0 },
@@ -82,8 +82,10 @@ export class Engine extends EventEmitter {
   private sellFails: Record<string, number> = {};
   private timers: NodeJS.Timeout[] = [];
   private scanning = false;
+  private ingestingPump = false;
   private monitoring = false;
   private evaluating = false;
+  private lastRejectLogAt = 0;
   private scanHistory: { t: number; n: number }[] = [];
   private scanTimes: number[] = [];
   private inFlightChecks = new Set<string>();
@@ -129,6 +131,10 @@ export class Engine extends EventEmitter {
       this.wallet.running = true;
       this.saveWallet();
     }
+    // Paper: start entries as soon as a paper book exists (or create one on AUTO_START).
+    if (this.mode === 'paper' && autoStartEnabled() && !this.wallet.connected) {
+      await this.connect({ type: 'paper', startUsd: this.cfg.startUsd });
+    }
     if (this.mode === 'live-auto' && hasBotWallet()) {
       await this.syncBotBalance();
       if (this.wallet.running || autoStartEnabled()) {
@@ -148,8 +154,9 @@ export class Engine extends EventEmitter {
       };
       tick();
     };
+    loop(() => this.ingestPump(), () => 1, 'pump');
     loop(() => this.scan(), () => this.cfg.scanIntervalSec, 'scan');
-    loop(() => this.evaluateEntries(), () => Math.max(1, Math.min(2, this.cfg.scanIntervalSec)), 'eval');
+    loop(() => this.evaluateEntries(), () => 1, 'eval');
     loop(() => this.monitor(), () => this.cfg.monitorIntervalSec, 'monitor');
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
     if (this.wallet.connected && this.wallet.running) {
@@ -268,6 +275,19 @@ export class Engine extends EventEmitter {
   private alreadyOn(mint: string) {
     return this.alreadyHeld(mint) || this.buying.has(mint);
   }
+  private noteReject(reason: string) {
+    const key = (reason || 'unknown').slice(0, 80);
+    const s = this.agents.safety as typeof this.agents.safety & { reasons: Record<string, number> };
+    if (!s.reasons) s.reasons = {};
+    s.reasons[key] = (s.reasons[key] || 0) + 1;
+    const now = Date.now();
+    if (now - this.lastRejectLogAt > 20_000) {
+      this.lastRejectLogAt = now;
+      const top = Object.entries(s.reasons).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k}×${n}`).join(' · ');
+      this.log('Safety', 'info', `rejects ${s.rejected} · passed ${s.passed} · ${top || 'none yet'}`);
+    }
+  }
+
   private bumpScanStats(now: number, scanned: number, pools: number) {
     const sc = this.agents.scanner;
     sc.pools = pools; sc.total += scanned; sc.lastScanAt = now; sc.calls++;
@@ -316,6 +336,50 @@ export class Engine extends EventEmitter {
   }
 
   // ---------------------------------------------------------------- SCANNER
+  /** 1s path: merge PumpPortal creates immediately, score, and try entries the same tick. */
+  async ingestPump() {
+    if (this.ingestingPump) return;
+    this.ingestingPump = true;
+    try {
+      const now = Date.now();
+      const list = getPumpFeed().toCandidates(this.solPrice || 70, now);
+      if (!list.length) return;
+      let newN = 0, scoredNew = 0, rejectedNew = 0;
+      for (const c of list) {
+        const prev = this.candidates.get(c.mint);
+        const first = !prev;
+        const merged = prev ? mergePumpOnto(prev, c) : c;
+        this.candidates.set(c.mint, { ...merged, seenAt: now, score: prev?.score, safety: prev?.safety });
+        this.remember(this.candidates.get(c.mint)!, now);
+        const pc = preCheck(this.candidates.get(c.mint)!, this.cfg, now);
+        const cc = this.candidates.get(c.mint)!;
+        if (!pc.ok) {
+          cc.safety = pc.label;
+          if (first) { rejectedNew++; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); }
+          continue;
+        }
+        const s = scoreCandidate(cc);
+        cc.score = s.score;
+        if (first) scoredNew++;
+        if (s.score >= (this.agents.analyst.lastScore || 0)) {
+          Object.assign(this.agents.analyst, { lastScore: s.score, lastSymbol: cc.symbol, lastImage: cc.image, bull: s.bull, bear: s.bear, note: s.note });
+          this.agents.scanner.top = cc.symbol; this.agents.scanner.topImage = cc.image;
+        }
+        if (first) newN++;
+      }
+      this.agents.safety.checked += newN + rejectedNew;
+      this.agents.safety.rejected += rejectedNew;
+      this.agents.analyst.scored += scoredNew;
+      if (scoredNew) this.agents.analyst.calls++;
+      this.agents.scanner.lastScanAt = now;
+      if (newN + rejectedNew) this.bumpScanStats(now, newN + rejectedNew, this.candidates.size);
+      this.emit('agents', this.agents);
+      void this.evaluateEntries();
+    } finally {
+      this.ingestingPump = false;
+    }
+  }
+
   async scan() {
     if (this.scanning) return;
     this.scanning = true;
@@ -330,7 +394,7 @@ export class Engine extends EventEmitter {
       for (const c of list) {
         const pc = preCheck(c, this.cfg, now);
         const cc = this.candidates.get(c.mint)!;
-        if (!pc.ok) { cc.safety = pc.label; continue; }
+        if (!pc.ok) { cc.safety = pc.label; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); continue; }
         const s = scoreCandidate(c);
         cc.score = s.score;
         scored.push({ c, s });
@@ -365,30 +429,27 @@ export class Engine extends EventEmitter {
       this.rollDay();
       const now = Date.now();
       const adapted = this.riskAdapted();
+      const minScore = adapted.minScore;
+      // Score ≥ threshold → try to buy on this tick. No pattern/age/confirmation wait.
       const scored = [...this.candidates.values()]
-        .filter((c) => now - c.seenAt < 120_000)
-        .map((c) => ({ c, s: { score: c.score || 0, bull: 0, bear: 0, note: '', parts: {} } }))
-        .filter(({ c, s }) => (s.score || 0) >= adapted.minScore)
-        .sort((a, b) => (b.s.score || 0) - (a.s.score || 0))
+        .filter((c) => now - c.seenAt < 180_000)
+        .map((c) => {
+          if (!c.score) {
+            const s = scoreCandidate(c);
+            c.score = s.score;
+          }
+          return c;
+        })
+        .filter((c) => (c.score || 0) >= minScore)
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
         .slice(0, 16);
       if (!scored.length) return;
-      // Re-score those missing a score from the last ingest
-      for (const row of scored) {
-        if (!row.c.score) {
-          const s = scoreCandidate(row.c);
-          row.c.score = s.score; row.s = s as any;
-        }
-      }
-      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
       if (this.occupied() >= this.cfg.maxPositions) {
         this.agents.risk.label = `holding ${this.occupied()}/${this.cfg.maxPositions}`;
         return;
       }
-      const todo = scored.filter(({ c }) => {
+      const todo = scored.filter((c) => {
         if (this.inFlightChecks.has(c.mint) || this.alreadyOn(c.mint)) return false;
-        const ent = liveEntryOk(c, this.mintHist.get(c.mint) || [], this.strat(), now);
-        if (!ent.ok) return false;
-        (c as any)._ent = ent.reason;
         const blocked = entryBlocked(this.cfg, {
           openPositions: this.occupied(),
           dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
@@ -396,11 +457,11 @@ export class Engine extends EventEmitter {
           inCooldown: (this.cooldown[c.mint] || 0) > now,
           pausedUntil: this.lossPauseUntil, now,
         });
-        if (blocked) return false;
+        if (blocked) { this.noteReject('risk:' + blocked); return false; }
         return true;
       }).slice(0, 10);
-      await poolRun(todo, 4, async ({ c, s }) => {
-        await this.checkCandidate(c, s.score, (c as any)._ent || `score ${s.score}`).catch(() => {});
+      await poolRun(todo, 4, async (c) => {
+        await this.checkCandidate(c, c.score || 0, `score ${c.score} ≥ ${minScore}`).catch(() => {});
       });
       this.store.set('cooldown', this.cooldown);
     } finally {
@@ -419,26 +480,32 @@ export class Engine extends EventEmitter {
     let aborted = false;
     try {
       const work = (async () => {
-        const sec = await this.m.security(c.mint);
+        const pump = isPumpCurve(c);
+        // Pump curve: don't wait on RugCheck (it isn't indexed yet). AMM still fail-closed.
+        const sec = pump
+          ? await withTimeout(this.m.security(c.mint), 1200, 'sec timeout').catch(() => null)
+          : await this.m.security(c.mint);
         if (aborted) return;
         this.agents.safety.calls++;
-        const sr = securityCheck(sec, this.cfg);
+        const sr = securityCheck(sec, this.cfg, { pumpCurve: pump, devHoldPct: c.flow?.devHoldPct });
         Object.assign(this.agents.safety, { last: sr.label, lastSymbol: c.symbol, lastOk: sr.ok });
         const cc = this.candidates.get(c.mint);
         if (cc) cc.safety = sr.label;
         if (!sr.ok) {
           this.agents.safety.rejected++;
+          this.noteReject('sec:' + (sr.reasons[0] || sr.label));
           this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `safety: ${sr.reasons.slice(0, 2).join(', ')}` });
           this.cooldown[c.mint] = Date.now() + 20 * 60_000;
           return;
         }
         const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
         const trialSize = slotSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, this.occupied());
-        if (!trialSize) return;
+        if (!trialSize) { this.noteReject('risk:no size'); return; }
         const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
         if (aborted) return;
         if (!okSell) {
-          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'safety: Jupiter reverse quote failed (not sellable)' });
+          this.noteReject(pump ? 'not sellable on curve' : 'not sellable on Jupiter');
+          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: pump ? 'safety: curve sell quote failed' : 'safety: Jupiter reverse quote failed (not sellable)' });
           this.cooldown[c.mint] = Date.now() + 15 * 60_000;
           return;
         }
@@ -452,6 +519,7 @@ export class Engine extends EventEmitter {
       await withTimeout(work, CHECK_TIMEOUT_MS, `check ${c.symbol} timeout`);
     } catch {
       aborted = true;
+      this.noteReject('check timed out');
       this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'check timed out — skipped, scan continues' });
     } finally {
       this.inFlightChecks.delete(c.mint);
