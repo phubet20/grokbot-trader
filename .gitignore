@@ -1,0 +1,12 @@
+*.db
+*.db-*
+.env
+.npm/
+ACCESS_TOKEN.txt
+PUBLIC_URL.txt
+data-*/
+data/
+logs/
+node_modules/
+web/dist/
+web/node_modules/

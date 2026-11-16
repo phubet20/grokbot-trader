@@ -1,0 +1,17 @@
+# Render Blueprint - paper/test mode only. Set ACCESS_TOKEN in the dashboard (sync: false).
+services:
+  - type: web
+    name: grokbot-trader
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install --no-audit --no-fund && npm run build
+    startCommand: node --disable-warning=ExperimentalWarning server/index.ts
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: MODE
+        value: paper
+      - key: ACCESS_TOKEN
+        sync: false

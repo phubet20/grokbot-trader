@@ -1,0 +1,65 @@
+import { useEffect, useRef, useState } from 'react';
+
+export type Snap = any;
+export async function api(path: string, body?: unknown) {
+  const r = await fetch('api/' + path, body === undefined ? undefined : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || 'request failed');
+  return d;
+}
+
+export type Toast = { id: number; kind: string; title: string; text?: string; usd?: number; pct?: number; symbol?: string; image?: string };
+
+/** Live state over Server-Sent Events, with periodic full refresh. */
+export function useLive() {
+  const [snap, setSnap] = useState<Snap | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [approvals, setApprovals] = useState<any[]>([]);
+  const [online, setOnline] = useState(true);
+  const tid = useRef(1);
+  useEffect(() => {
+    let es: EventSource | null = null;
+    let stop = false;
+    const connect = () => {
+      es = new EventSource('api/events');
+      es.onopen = () => setOnline(true);
+      es.onerror = () => { setOnline(false); es?.close(); if (!stop) setTimeout(connect, 3000); };
+      const on = (t: string, f: (d: any) => void) => es!.addEventListener(t, (e: MessageEvent) => f(JSON.parse(e.data)));
+      on('state', (d) => setSnap(d));
+      on('agents', (d) => setSnap((s: Snap) => (s ? { ...s, agents: d } : s)));
+      on('positions', (d) => setSnap((s: Snap) => (s ? { ...s, positions: d } : s)));
+      on('activity', (d) => setSnap((s: Snap) => (s ? { ...s, activity: [d, ...s.activity].slice(0, 100) } : s)));
+      on('decision', (d) => setSnap((s: Snap) => (s ? { ...s, decisions: [d, ...s.decisions].slice(0, 60) } : s)));
+      on('equity', (d) => setSnap((s: Snap) => (s ? { ...s, stats: { ...s.stats, equity: d.usd, pnlUsd: d.usd - s.stats.deposit, multiplier: s.stats.deposit ? d.usd / s.stats.deposit : 1, pnlPct: s.stats.deposit ? (d.usd / s.stats.deposit - 1) * 100 : 0 }, lastEquity: d } : s)));
+      on('toast', (d) => { const id = tid.current++; setToasts((t) => [...t, { ...d, id }]); setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), d.kind === 'profit' ? 5000 : 3200); });
+      on('approval', (d) => setApprovals((a) => [...a, d]));
+    };
+    connect();
+    const iv = setInterval(() => api('state').then(setSnap).catch(() => {}), 15000);
+    return () => { stop = true; es?.close(); clearInterval(iv); };
+  }, []);
+  return { snap, setSnap, toasts, setToasts, approvals, setApprovals, online };
+}
+
+export const usd = (x: number | undefined | null, d = 2) => x === undefined || x === null || !Number.isFinite(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+export const sUsd = (x: number) => (x >= 0 ? '+' : '-') + '$' + Math.abs(x).toFixed(2);
+export const pct = (x: number | undefined | null, d = 1) => x === undefined || x === null || !Number.isFinite(x) ? '—' : (x >= 0 ? '+' : '') + x.toFixed(d) + '%';
+export const compact = (x: number | undefined | null) => {
+  if (x === undefined || x === null || !Number.isFinite(x)) return '—';
+  const a = Math.abs(x);
+  return a >= 1e9 ? (x / 1e9).toFixed(2) + 'B' : a >= 1e6 ? (x / 1e6).toFixed(2) + 'M' : a >= 1e3 ? (x / 1e3).toFixed(1) + 'K' : x.toFixed(0);
+};
+export const price = (p: number | undefined) => {
+  if (!p || !Number.isFinite(p)) return '—';
+  if (p >= 1) return '$' + p.toFixed(4);
+  const dec = Math.min(12, Math.max(4, -Math.floor(Math.log10(p)) + 3));
+  return '$' + p.toFixed(dec);
+};
+export const hm = (ts: number) => new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+export const hhmm = (ts: number) => new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+export const short = (a: string) => (a ? a.slice(0, 4) + '…' + a.slice(-4) : '');
+export const age = (ts?: number) => {
+  if (!ts) return '—';
+  const m = (Date.now() - ts) / 60000;
+  return m < 60 ? Math.round(m) + 'm old' : m < 1440 ? Math.round(m / 60) + 'h old' : Math.round(m / 1440) + 'd old';
+};

@@ -1,0 +1,65 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { positionSizeUsd, entryBlocked, evaluateExit, activeStop } from '../server/risk.ts';
+
+const P = { positionPct: 8, minTradeUsd: 0.5, maxPositions: 4, hardStopPct: 8, trailingStopPct: 12, maxHoldMin: 120, dailyLossLimitPct: 15 };
+const T0 = 1_000_000;
+
+test('position size is % of portfolio', () => {
+  assert.equal(positionSizeUsd(P, 81, 81, 0.5), 6.48);
+  assert.equal(positionSizeUsd(P, 1000, 1000, 0.5), 80);
+});
+test('works with a $10 portfolio', () => {
+  assert.equal(positionSizeUsd(P, 10, 10, 0.57), 0.8);
+});
+test('size capped by free cash minus reserve, 0 when below min trade', () => {
+  assert.equal(positionSizeUsd(P, 100, 3, 0.5), 2.5);
+  assert.equal(positionSizeUsd(P, 100, 0.8, 0.5), 0);
+  assert.equal(positionSizeUsd(P, 0, 0, 0), 0);
+});
+test('entry gates', () => {
+  const g = { openPositions: 0, dayStartEquityUsd: 100, equityUsd: 100, alreadyHolding: false, inCooldown: false };
+  assert.equal(entryBlocked(P, g), null);
+  assert.match(entryBlocked(P, { ...g, openPositions: 4 })!, /max 4/);
+  assert.match(entryBlocked(P, { ...g, equityUsd: 85 })!, /daily loss/);
+  assert.equal(entryBlocked(P, { ...g, equityUsd: 85.1 }), null);
+  assert.match(entryBlocked(P, { ...g, alreadyHolding: true })!, /already/);
+  assert.match(entryBlocked(P, { ...g, inCooldown: true })!, /cooldown/);
+});
+test('hard stop at -8% from entry', () => {
+  const pos = { entryPrice: 1, peakPrice: 1, openedAt: T0 };
+  assert.equal(evaluateExit(P, pos, 0.93, T0 + 1000).exit, false);
+  const d = evaluateExit(P, pos, 0.92, T0 + 1000);
+  assert.equal(d.exit, true); assert.equal(d.kind, 'hard_stop');
+});
+test('trailing stop 12% from peak once it is above the hard stop', () => {
+  let pos = { entryPrice: 1, peakPrice: 1, openedAt: T0 };
+  let d = evaluateExit(P, pos, 1.5, T0 + 1000);
+  assert.equal(d.exit, false); assert.equal(d.peak, 1.5);
+  pos = { ...pos, peakPrice: d.peak };
+  assert.equal(evaluateExit(P, pos, 1.33, T0 + 2000).exit, false);  // -11.3% from top
+  d = evaluateExit(P, pos, 1.32, T0 + 2000);                      // -12% from top
+  assert.equal(d.exit, true); assert.equal(d.kind, 'trailing_stop');
+  assert.match(d.reason, /\+32\.0%/);
+});
+test('small peak: hard stop stays the active level', () => {
+  const pos = { entryPrice: 1, peakPrice: 1.03 };
+  assert.equal(activeStop(P, pos).kind, 'hard');
+  assert.equal(activeStop(P, { entryPrice: 1, peakPrice: 1.2 }).kind, 'trailing');
+  assert.ok(Math.abs(activeStop(P, { entryPrice: 1, peakPrice: 1.2 }).level - 1.056) < 1e-9);
+});
+test('peak never decreases and new high resets trailing', () => {
+  const pos = { entryPrice: 1, peakPrice: 2, openedAt: T0 };
+  assert.equal(evaluateExit(P, pos, 1.9, T0).peak, 2);
+  assert.equal(evaluateExit(P, pos, 2.5, T0).peak, 2.5);
+});
+test('time stop', () => {
+  const pos = { entryPrice: 1, peakPrice: 1, openedAt: T0 };
+  assert.equal(evaluateExit(P, pos, 1.01, T0 + 119 * 60_000).exit, false);
+  assert.equal(evaluateExit(P, pos, 1.01, T0 + 120 * 60_000).kind, 'time_stop');
+});
+test('bad prices never trigger exits', () => {
+  const pos = { entryPrice: 1, peakPrice: 1, openedAt: T0 };
+  assert.equal(evaluateExit(P, pos, 0, T0).exit, false);
+  assert.equal(evaluateExit(P, pos, NaN, T0).exit, false);
+});

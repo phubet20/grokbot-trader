@@ -1,0 +1,43 @@
+
+  Grok Bot · PAPER/TEST mode · data: live
+  MODE=paper (default). Simulated fills only.
+  open http://127.0.0.1:8811
+
+[20:28:38] Core     Paper wallet connected · PAPER mode · $81.00
+[20:29:46] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:29:48] Executor Bought WASTED6 $6.49
+[20:29:49] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:29:50] Executor Bought WIGGLES $6.49
+[20:32:35] Risk     Stopped WIGGLES $-1.16 · -8% stop (-13.9%)
+[20:33:20] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:33:23] Executor Bought Stumpy $6.39
+[20:33:56] Risk     Stopped Stumpy $-0.75 · -8% stop (-13.0%)
+[20:36:20] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:36:22] Executor Bought bill $6.35
+[20:44:23] Risk     Stopped bill $-0.48 · -8% stop (-8.2%)
+[20:46:31] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:46:33] Executor Bought Anthropig $6.33
+
+  Grok Bot · PAPER/TEST mode · data: live
+  MODE=paper (default). Simulated fills only.
+  open http://127.0.0.1:8811
+
+
+  Grok Bot · PAPER/TEST mode · data: live
+  MODE=paper (default). Simulated fills only.
+  open http://127.0.0.1:8811
+
+[20:53:42] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:53:44] Executor Bought 1.0 $6.39
+[20:55:29] Safety   honeypot ✓ · LP ✓ · auth ✓
+[20:55:31] Executor Bought hello $6.37
+[21:00:45] Risk     Sold hello $1.05 · trailing stop +19.4% (−14.6% from top)
+[21:03:06] Safety   honeypot ✓ · LP ✓ · auth ✓
+[21:03:11] Executor Bought GTA $6.48
+[21:04:07] Risk     Stopped GTA $-0.60 · -8% stop (-8.3%)
+
+  Grok Bot · PAPER/TEST mode · data: live
+  MODE=paper (default). Simulated fills only.
+  open http://127.0.0.1:8811
+
+[21:09:50] Risk     Stopped 1.0 $-0.11 · trailing stop -0.5% (−15.3% from top)

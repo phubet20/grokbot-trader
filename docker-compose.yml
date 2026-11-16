@@ -1,0 +1,10 @@
+services:
+  grokbot:
+    build: .
+    ports: ["8787:8787"]
+    volumes: ["./data:/app/data"]
+    environment:
+      - APP_NAME=Grok Bot
+      - START_USD=81
+      - DATA_SOURCE=live
+    restart: unless-stopped

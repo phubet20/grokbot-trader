@@ -1,0 +1,23 @@
+{
+  "name": "grokbot-trader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Grok Bot - Solana meme-coin trading bot (paper/test mode by default)",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "postinstall": "cd web && npm install --no-audit --no-fund",
+    "build": "cd web && npx vite build",
+    "start": "node scripts/ensure-build.mjs && node --env-file-if-exists=.env --disable-warning=ExperimentalWarning server/index.ts",
+    "dev": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning --watch server/index.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
+    "replay": "DATA_SOURCE=replay npm start",
+    "screenshots": "node scripts/screenshots.mjs",
+    "check:live-build": "node --disable-warning=ExperimentalWarning scripts/check-live-build.ts"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
+}
