@@ -35,6 +35,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
         {snap.lowBalance && <p className="note neg" data-testid="low-balance">{snap.lowBalance}</p>}
         <div className="btn-row">
           <button className="pill-btn small-btn" data-testid="bot-toggle" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Stop bot' : 'Start bot'}</button>
+          <button className="pill-btn small-btn ghost" data-testid="restart-bot-account" title="Restart loops and rescan now. Does not wipe positions or the withdraw lock." onClick={() => api('bot/restart', {})}>Restart bot / rescan</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
         </div>
         <p className="tiny muted" data-testid="background-note">{snap.mode === 'paper'

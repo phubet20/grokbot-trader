@@ -66,43 +66,121 @@ function rpcConnection(rpcUrl: string) {
   return new Connection(rpcUrl || 'https://api.mainnet-beta.solana.com', { commitment: 'confirmed', disableRetryOnRateLimit: false });
 }
 
+/** Unsigned tx from PumpPortal trade-local — used when the coin is still on the pump.fun curve (no Jupiter route). */
+export async function buildPumpPortalTx(args: {
+  userPublicKey: string;
+  action: 'buy' | 'sell';
+  mint: string;
+  amount: number | string;
+  denominatedInSol: boolean;
+  slippagePct: number;
+  priorityFeeSol: number;
+  pool?: 'auto' | 'pump' | 'pump-amm' | 'raydium';
+}): Promise<{ swapTransaction: string; rawBytes: number }> {
+  const body = {
+    publicKey: args.userPublicKey,
+    action: args.action,
+    mint: args.mint,
+    amount: args.amount,
+    denominatedInSol: args.denominatedInSol ? 'true' : 'false',
+    slippage: Math.max(1, Math.min(49, args.slippagePct)),
+    priorityFee: args.priorityFeeSol,
+    pool: args.pool || 'auto',
+  };
+  const r = await fetch('https://pumpportal.fun/api/trade-local', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/octet-stream' },
+    body: JSON.stringify(body),
+  });
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!r.ok || !buf.length) {
+    const text = buf.toString('utf8').slice(0, 240);
+    throw new Error(`pump trade-local HTTP ${r.status}${text ? ': ' + text : ''}`);
+  }
+  if (buf[0] === 0x7b /* { */) {
+    let msg = buf.toString('utf8').slice(0, 240);
+    try {
+      const j = JSON.parse(buf.toString('utf8'));
+      msg = String(j.error || j.message || msg);
+    } catch {}
+    throw new Error('pump trade-local: ' + msg);
+  }
+  return { swapTransaction: buf.toString('base64'), rawBytes: buf.length };
+}
+
 export async function buildLiveSwapTx(cfg: Config, m: MarketSource, args: { inputMint: string; outputMint: string; amountRaw: bigint; userPublicKey: string; closeOutputAta?: boolean }) {
   const gate = liveGate(cfg);
   if (!gate.live) throw new Error('LIVE trading is disabled: ' + gate.reason);
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(args.userPublicKey)) throw new Error('invalid wallet address');
   const q = await m.quote(args.inputMint, args.outputMint, args.amountRaw, cfg.slippageBps);
-  if (!q?.raw) throw new Error('no Jupiter route');
-  const slip = dynamicSlippageBps(cfg.slippageBps, q.priceImpactPct);
-  const body: any = {
-    quoteResponse: q.raw,
-    userPublicKey: args.userPublicKey,
-    wrapAndUnwrapSol: true,
-    dynamicComputeUnitLimit: true,
-    dynamicSlippage: { maxBps: slip },
-    prioritizationFeeLamports: {
-      priorityLevelWithMaxLamports: {
-        maxLamports: Math.max(200_000, Math.round(cfg.priorityFeeSol * 1e9 * 8)),
-        priorityLevel: 'veryHigh',
+  if (q?.raw) {
+    const slip = dynamicSlippageBps(cfg.slippageBps, q.priceImpactPct);
+    const body: any = {
+      quoteResponse: q.raw,
+      userPublicKey: args.userPublicKey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      dynamicSlippage: { maxBps: slip },
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          maxLamports: Math.max(200_000, Math.round(cfg.priorityFeeSol * 1e9 * 8)),
+          priorityLevel: 'veryHigh',
+        },
       },
-    },
-  };
-  const r = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error('Jupiter swap build failed HTTP ' + r.status);
-  const d: any = await r.json();
-  if (!d.swapTransaction) throw new Error('Jupiter swap build returned no transaction');
-  return { swapTransaction: d.swapTransaction as string, lastValidBlockHeight: d.lastValidBlockHeight as number, quote: q, slippageBps: slip };
+    };
+    const r = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error('Jupiter swap build failed HTTP ' + r.status);
+    const d: any = await r.json();
+    if (!d.swapTransaction) throw new Error('Jupiter swap build returned no transaction');
+    return { swapTransaction: d.swapTransaction as string, lastValidBlockHeight: d.lastValidBlockHeight as number, quote: q, slippageBps: slip };
+  }
+  // Bonding-curve (and some pump-amm) coins have a local curve quote but no Jupiter route.
+  const buy = args.inputMint === SOL_MINT;
+  const mint = buy ? args.outputMint : args.inputMint;
+  const decimals = await m.decimals(mint);
+  const amount = buy ? Number(args.amountRaw) / 1e9 : Number(args.amountRaw) / 10 ** decimals;
+  if (!(amount > 0)) throw new Error('size 0');
+  const curve = q?.route === 'pump-curve';
+  const slipPct = Math.max(cfg.slippageBps / 100, curve ? 15 : 10);
+  try {
+    const built = await buildPumpPortalTx({
+      userPublicKey: args.userPublicKey,
+      action: buy ? 'buy' : 'sell',
+      mint,
+      amount,
+      denominatedInSol: buy,
+      slippagePct: slipPct,
+      priorityFeeSol: cfg.priorityFeeSol,
+      pool: curve ? 'pump' : 'auto',
+    });
+    const quote = q || { inAmount: Number(args.amountRaw), outAmount: 0, priceImpactPct: 0, route: 'pump-portal' };
+    return { swapTransaction: built.swapTransaction, lastValidBlockHeight: 0, quote: { ...quote, route: quote.route || 'pump-portal' }, slippageBps: Math.round(slipPct * 100) };
+  } catch (e: any) {
+    const why = e?.message || String(e);
+    if (curve) throw new Error(`pump.fun buy failed (${why})`);
+    throw new Error(`no Jupiter route${why ? ' / ' + why : ''}`);
+  }
 }
 
-/** Sign a Jupiter (or any) versioned transaction. Does not send. For tests and live-auto. */
+/** Sign a Jupiter or PumpPortal transaction (versioned or legacy). Does not send. */
 export function signVersionedTx(swapTransactionBase64: string, kp: Keypair): { signedBase64: string; signature: string } {
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransactionBase64, 'base64'));
-  tx.sign([kp]);
-  const sig = Buffer.from(tx.signatures[0]).toString('base64');
-  return { signedBase64: Buffer.from(tx.serialize()).toString('base64'), signature: sig };
+  const buf = Buffer.from(swapTransactionBase64, 'base64');
+  try {
+    const tx = VersionedTransaction.deserialize(buf);
+    tx.sign([kp]);
+    const sig = Buffer.from(tx.signatures[0]).toString('base64');
+    return { signedBase64: Buffer.from(tx.serialize()).toString('base64'), signature: sig };
+  } catch {
+    const tx = Transaction.from(buf);
+    tx.partialSign(kp);
+    const raw = tx.serialize();
+    const sig = tx.signature ? Buffer.from(tx.signature).toString('base64') : '';
+    return { signedBase64: Buffer.from(raw).toString('base64'), signature: sig };
+  }
 }
 
 export async function sendSignedTx(rpcUrl: string, signedBase64: string, retries = 3): Promise<string> {
@@ -247,6 +325,12 @@ async function closeEmptyTokenAccounts(conn: Connection, kp: Keypair): Promise<n
     }
   }
   return closed;
+}
+
+/** Close empty ATAs (including after a full sell) so rent returns to the bot wallet. */
+export async function reclaimEmptyAtas(rpcUrl: string): Promise<number> {
+  const kp = botKeypair();
+  return closeEmptyTokenAccounts(rpcConnection(rpcUrl), kp);
 }
 
 /**

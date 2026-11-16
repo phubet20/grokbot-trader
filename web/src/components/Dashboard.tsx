@@ -20,6 +20,7 @@ export function Header({ snap, theme, setTheme, onRecap }: any) {
       <button className="icon-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="theme">{theme === 'dark' ? <SunI size={19} /> : <MoonI size={19} />}</button>
       <button className="icon-btn" onClick={onRecap} aria-label="recap"><BellI size={19} /></button>
       <span className={`live-pill ${snap.wallet.running ? '' : 'off'} ${snap.mode === 'paper' ? 'test' : 'real'}`} title={snap.modeReason}><i />{!snap.wallet.running ? 'Paused' : snap.mode === 'live-auto' ? 'Live auto' : snap.mode === 'live' ? 'Live $' : 'Live · test'}</span>
+      <button className="pill-btn small-btn ghost" data-testid="restart-bot" title="Restart loops and rescan now. Does not wipe positions or the withdraw lock." onClick={() => api('bot/restart', {})}>Restart / rescan</button>
     </div>
   );
 }
@@ -98,7 +99,7 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
           <SourceCounts sources={a.scanner.sources || snap.scan?.sources} />
           {a.scanner.top && <div className="tiny mono row"><TokenAvatar symbol={a.scanner.top} src={a.scanner.topImage} size={14} /> top: ${a.scanner.top}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ef4444' }}>🛡</span><div><b>Safety</b><div className="muted tiny">Penalties</div></div></div>
-          <div className="big-num">{a.safety.penalties || a.safety.rejected || 0}</div><div className="muted tiny">penalties · {a.safety.passed} bought</div>
+          <div className="big-num">{a.safety.penalties || a.safety.rejected || 0}</div><div className="muted tiny">penalties · {a.executor?.buys || 0} bought</div>
           {a.safety.lastSymbol && <div className={`tiny mono ${(a.safety.lastAdj || 0) < 0 ? 'neg' : 'pos'}`}>${a.safety.lastSymbol} {a.safety.last || '—'}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#8b5cf6' }}>🧠</span><div><b>Analyst</b><div className="muted tiny">Scoring</div></div></div>
           <div className="row"><Ring v={a.analyst.lastScore || 0} /><div className="tiny"><div className="mono"><TokenAvatar symbol={a.analyst.lastSymbol} src={a.analyst.lastImage} size={14} /> ${a.analyst.lastSymbol || '—'}</div><div className="muted">bull {a.analyst.bull} / bear {a.analyst.bear}</div></div></div>

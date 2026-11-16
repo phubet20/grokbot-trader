@@ -101,10 +101,23 @@ test('betaSample stays in (0,1)', () => {
 
 void EPS;
 
+test('governor stays relaxed on cash-only SOL drift until there are closed trades', () => {
+  const t = new AutoTune();
+  const start = 100;
+  const t0 = Date.now() - 8 * 60_000;
+  for (let i = 0; i < 10; i++) t.observeEquity(start - i * 0.8, t0 + i * 50_000);
+  assert.equal(t.governor(3).mode, 'relaxed');
+});
+
 test('governor tightens when the rolling equity slope stalls, then relaxes on recovery', () => {
   const t = new AutoTune();
   const start = 100;
   const t0 = Date.now() - 8 * 60_000;
+  let eq = start;
+  for (let i = 0; i < 4; i++) {
+    eq -= 2;
+    t.record({ reason: 'score 55', pnlUsd: -2, costUsd: 8, pnlPct: -25, equity: eq, ts: t0 + i * 50_000 });
+  }
   for (let i = 0; i < 10; i++) t.observeEquity(start - i * 0.8, t0 + i * 50_000);
   const tight = t.governor(3);
   assert.equal(tight.mode, 'tight');
@@ -117,6 +130,11 @@ test('governor tightens when the rolling equity slope stalls, then relaxes on re
   assert.ok(t.takeProfitPct(3) <= 1.8);
 
   const t1 = Date.now() - 7 * 60_000;
+  let up = 90;
+  for (let i = 0; i < 5; i++) {
+    up += 2;
+    t.record({ reason: 'first pullback bounce', pnlUsd: 2, costUsd: 8, pnlPct: 25, equity: up, ts: t1 + i * 40_000 });
+  }
   for (let i = 0; i < 10; i++) t.observeEquity(90 + i * 1.2, t1 + i * 45_000);
   const relaxed = t.governor(3);
   assert.equal(relaxed.mode, 'relaxed');
@@ -149,6 +167,11 @@ test('governor shrinks size after losses and grows it after wins', () => {
 test('governor state survives dump/load', () => {
   const t = new AutoTune();
   const t0 = Date.now() - 8 * 60_000;
+  let eq = 100;
+  for (let i = 0; i < 4; i++) {
+    eq -= 2;
+    t.record({ reason: 'score 55', pnlUsd: -2, costUsd: 8, pnlPct: -25, equity: eq, ts: t0 + i * 50_000 });
+  }
   for (let i = 0; i < 10; i++) t.observeEquity(100 - i, t0 + i * 50_000);
   assert.equal(t.governor().mode, 'tight');
   const t2 = new AutoTune();

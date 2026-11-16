@@ -97,6 +97,7 @@ const server = createServer(async (req, res) => {
       if (p === '/api/wallet/connect') return json(200, await engine.connect(b));
       if (p === '/api/wallet/disconnect') { engine.disconnect(); return json(200, { ok: true }); }
       if (p === '/api/bot/run') { engine.setRunning(!!b.running); return json(200, { ok: true }); }
+      if (p === '/api/bot/restart') { return json(200, engine.restartTrading()); }
       if (p === '/api/config') { updateConfig(b); engine.emitState(); return json(200, { ...config, liveConfirm: undefined }); }
       if (p === '/api/reset') { engine.reset(); return json(200, { ok: true }); }
       if (p === '/api/paper/reset') { engine.reset(); return json(200, { ok: true }); }

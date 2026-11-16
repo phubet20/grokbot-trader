@@ -3,16 +3,17 @@ import { EventEmitter } from 'node:events';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { Config } from './config.ts';
 import { liveGate } from './config.ts';
+import { loadPaperPriors, pumpPathBoost, staleExitSec, isStalePosition, type PaperPriors } from './priors.ts';
 import type { MarketSource } from './market.ts';
 import { SOL_MINT } from './market.ts';
 import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts';
 import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve, clampScore } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
-import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
+import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, exitReserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
 import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, SWAP_FEE_BPS, type TapeSnap } from './strategy.ts';
-import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
+import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked, reclaimEmptyAtas } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
@@ -82,7 +83,7 @@ export class Engine extends EventEmitter {
     safety: { checked: 0, rejected: 0, passed: 0, penalties: 0, last: '', lastSymbol: '', lastOk: true, lastAdj: 0, calls: 0, reasons: {} as Record<string, number> },
     analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
     risk: { status: 'Guarding', label: '', exits: 0 },
-    executor: { fills: 0, last: '', failures: 0 },
+    executor: { fills: 0, buys: 0, last: '', failures: 0 },
   };
   private sellFails: Record<string, number> = {};
   private timers: NodeJS.Timeout[] = [];
@@ -97,6 +98,7 @@ export class Engine extends EventEmitter {
   private buying = new Set<string>();
   private selling = new Set<string>();
   private bookGen = 0;
+  private lastBuyFail = new Map<string, number>();
   private reservedSol = 0;
   private tuner = new AutoTune();
   private narrative: Narrative | null = null;
@@ -106,6 +108,7 @@ export class Engine extends EventEmitter {
   private lastPairAt = 0;
   private lossPauseUntil = 0;
   private mintHist = new Map<string, TapeSnap[]>();
+  private priors: PaperPriors | null = null;
   private strat() { return { ...STRAT_DEFAULTS, hardStopPct: this.cfg.hardStopPct, trailingStopPct: this.cfg.trailingStopPct, maxHoldMin: this.cfg.maxHoldMin, minLiq: this.cfg.minLiquidityUsd, maxLiq: this.cfg.maxLiquidityUsd, minMcap: this.cfg.minMcapUsd, maxMcap: this.cfg.maxMcapUsd, minAgeMin: this.cfg.minAgeMin, maxAgeHours: this.cfg.maxAgeHours }; }
   private remember(c: Candidate, now: number) {
     const s = toSnap(now, c);
@@ -129,6 +132,14 @@ export class Engine extends EventEmitter {
     const saved = store.get<any>('agents', null);
     if (saved) for (const k of Object.keys(this.agents) as (keyof typeof this.agents)[]) Object.assign(this.agents[k], saved[k] || {});
     this.tuner.load(store.get('autotune', null));
+    this.priors = loadPaperPriors();
+    if (this.priors?.events?.length) {
+      this.tuner.seedFromPriors(this.priors.events.map((ev) => ({
+        pattern: ev.pattern, pnlUsd: ev.pnlUsd, costUsd: ev.costUsd, pnlPct: ev.pnlPct,
+        weight: ev.weight, exitKind: ev.exitKind, exitReason: ev.exitReason,
+      })));
+    }
+
   }
 
   get mode(): 'paper' | 'live' | 'live-auto' {
@@ -299,6 +310,36 @@ export class Engine extends EventEmitter {
     }
   }
 
+  /** Restart loops / clear stuck in-flight flags and rescan now. Does not wipe positions, trades, or the withdraw lock. */
+  restartTrading() {
+    const locked = this.lockedWithdrawTo();
+    this.kickingOff = false;
+    this.scanning = false;
+    this.evaluating = false;
+    this.monitoring = false;
+    this.inFlightChecks.clear();
+    this.buying.clear();
+    this.selling.clear();
+    this.reservedSol = 0;
+    this.lastBuyFail.clear();
+    this.agents.scanner.inFlightChecks = 0;
+    this.agents.scanner.inFlightBuys = 0;
+    this.agents.scanner.inFlightSells = 0;
+    this.agents.risk.label = '';
+    const wasRunning = this.wallet.running;
+    if (!this.wallet.running) {
+      this.wallet.running = true;
+      this.saveWallet();
+      void persistRenderEnv({ AUTO_START: '1' });
+    }
+    this.log('Core', 'info', wasRunning
+      ? 'Restart / rescan — in-flight flags cleared, scanning now (positions and withdraw lock kept)'
+      : 'Restart / rescan — bot resumed, scanning now (positions and withdraw lock kept)');
+    this.emitState();
+    if (this.wallet.connected) void this.kickoffTrading('restart');
+    return { ok: true, running: this.wallet.running, positions: this.positions.length, withdrawLocked: !!locked };
+  }
+
   /** Immediate scan + entries on Connect/Start — do not wait for the interval loops. */
   private kickingOff = false;
   private async kickoffTrading(reason = 'start') {
@@ -356,6 +397,12 @@ export class Engine extends EventEmitter {
   }
   cashUsd() { return this.wallet.solBalance * this.solPrice; }
   private freeCashUsd() { return Math.max(0, (this.wallet.solBalance - this.reservedSol) * this.solPrice); }
+  private exitReserveSolAmt(openingNew = true) {
+    return exitReserveSol(this.cfg.priorityFeeSol, this.positions.length, openingNew);
+  }
+  private exitReserveUsd(openingNew = true) {
+    return this.exitReserveSolAmt(openingNew) * (this.solPrice || 0);
+  }
 
   /** Prefer a cached SOL price so Connect/preview never wait on the Jupiter quote queue. */
   private async refreshSol(maxWaitMs = 2500) {
@@ -610,6 +657,11 @@ export class Engine extends EventEmitter {
         (c as any)._adjNotes = adj.notes;
         if (adj.why && adj.why !== 'score') (c as any)._sig = (c as any)._sig || adj.why;
         c.score = clampScore(c.score + this.tuner.patternAdj((c as any)._sig || 'score'));
+        const path = pumpPathBoost(c, hist, this.priors);
+        if (path.boost) {
+          c.score = clampScore(c.score + path.boost);
+          (c as any)._pathBoost = path.boost;
+        }
       }
       const scored = recent
         .filter((c) => {
@@ -630,7 +682,7 @@ export class Engine extends EventEmitter {
         })
         .slice(0, 20);
       if (!scored.length) return;
-      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
+      const reserveUsd = this.exitReserveUsd(true);
       if (!openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd)) {
         this.agents.risk.label = 'holding until cash frees up';
       }
@@ -709,7 +761,7 @@ export class Engine extends EventEmitter {
           this.noteReject(`score ${adjScore} < ${minScore} after safety ${sr.adj}`, c.mint);
           return;
         }
-        const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
+        const reserveUsd = this.exitReserveUsd(true);
         const trialSize = openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd);
         if (!trialSize) { this.noteReject('risk:no size'); return; }
         // Only mechanical skip: no route or quote, retry later (no long cooldown).
@@ -737,6 +789,16 @@ export class Engine extends EventEmitter {
     }
   }
 
+  private logBuyFail(c: { symbol?: string; mint?: string; image?: string }, reason: string) {
+    this.agents.executor.failures++;
+    const key = `${c.mint || c.symbol || ''}::${reason}`;
+    const now = Date.now();
+    if ((this.lastBuyFail.get(key) || 0) + 15_000 > now) return;
+    this.lastBuyFail.set(key, now);
+    this.log('Executor', 'reject', `Buy ${c.symbol || 'token'} failed: ${reason}`, { symbol: c.symbol, mint: c.mint, image: c.image });
+    this.decision({ ts: now, side: 'SKIP', symbol: c.symbol, image: c.image, text: `buy failed: ${reason}` });
+  }
+
   // ---------------------------------------------------------------- RISK sizing + EXECUTOR buy
   async openPosition(c: Candidate, score: number, why: string) {
     const gen = this.bookGen;
@@ -752,16 +814,16 @@ export class Engine extends EventEmitter {
     if (!this.solPrice) return;
     const eq = this.equity();
     const adapted = this.riskAdapted();
-    const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
+    const reserveUsd = this.exitReserveUsd(true);
     const low = lowBalanceReason(eq, this.freeCashUsd(), reserveUsd, this.cfg.minTradeUsd, this.usdcBal?.ui || 0);
-    if (low) { this.agents.risk.label = low; return; }
+    if (low) { this.agents.risk.label = low; this.logBuyFail(c, low); return; }
     let size = openSizeUsd(this.cfg, eq, this.freeCashUsd(), reserveUsd);
     if (adding && existing) {
       const room = Math.max(0, this.maxCoinUsd() - existing.costUsd);
       size = Math.min(size, room);
     }
     if (this.mode === 'paper') size *= this.tuner.entrySizeMult(why);
-    if (!size) { this.agents.risk.label = 'not enough free cash'; return; }
+    if (!size) { this.agents.risk.label = 'not enough free cash'; this.logBuyFail(c, 'not enough free cash'); return; }
     const solAmt = size / this.solPrice;
     if (this.mode === 'live-auto') { await this.execLiveAuto('buy', c, { solAmt, score, why }); return; }
     if (this.mode === 'live') { await this.requestLive('buy', c, { solAmt, score, why }); return; }
@@ -775,7 +837,7 @@ export class Engine extends EventEmitter {
     } finally {
       this.reservedSol = Math.max(0, this.reservedSol - needSol);
     }
-    if (!f || !f.ok) { this.agents.executor.failures++; this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `executor: ${f && !f.ok ? f.error : 'buy failed'}` }); return; }
+    if (!f || !f.ok) { this.logBuyFail(c, f && !f.ok ? f.error : 'buy failed'); return; }
     if (gen !== this.bookGen) return; // paper book was reset while this fill was in flight
     const held = this.positions.find((p) => p.mint === c.mint) || existing;
     const costSol = f.solSpent + f.feesSol;
@@ -794,7 +856,7 @@ export class Engine extends EventEmitter {
       existing.peakPrice = Math.max(existing.peakPrice, f.fillPrice);
       existing.adds = (existing.adds || 0) + 1;
       (existing as any).origCost = ((existing as any).origCost ?? (existing.costUsd - addUsd)) + addUsd;
-      this.agents.executor.fills++; this.agents.executor.last = `ADD ${c.symbol}`;
+      this.agents.executor.fills++; this.agents.executor.buys++; this.agents.executor.last = `ADD ${c.symbol}`;
       this.persist();
       this.decision({ ts: Date.now(), side: 'BUY', symbol: c.symbol, image: c.image, text: `add #${existing.adds} on ${why} · $${addUsd.toFixed(2)}`, usd: addUsd });
       this.log('Executor', 'buy', `Added ${c.symbol}`, { symbol: c.symbol, mint: c.mint, image: c.image, usd: addUsd });
@@ -813,7 +875,7 @@ export class Engine extends EventEmitter {
     (pos as any).origCost = pos.costUsd; (pos as any).partialTaken = false; (pos as any).breakeven = false;
     this.positions.push(pos);
     if (c.universe === 'trending') this.uni.enteredTrending++; else this.uni.enteredNew++;
-    this.agents.executor.fills++; this.agents.executor.last = `BUY ${c.symbol}`;
+    this.agents.executor.fills++; this.agents.executor.buys++; this.agents.executor.last = `BUY ${c.symbol}`;
     this.persist();
     const stake = (pos.costUsd / eq) * 100;
     this.decision({ ts: Date.now(), side: 'BUY', symbol: c.symbol, image: c.image, text: `${why} · $${pos.costUsd.toFixed(2)} via Jupiter (${f.route}, impact ${f.impactPct.toFixed(2)}%)`, usd: pos.costUsd });
@@ -897,6 +959,18 @@ export class Engine extends EventEmitter {
           if (!conf.ok && fromEntry < 1) {
             void this.closePosition(p, 'momentum_fade', `no thrust within ${gov.earlyCutSec}s of entry`, 1);
           }
+        }
+      }
+      const staleSec = staleExitSec(this.priors, gov.mode === 'tight');
+      for (const p of [...this.positions]) {
+        if (this.selling.has(p.id)) continue;
+        const fresh = this.candidates.get(p.mint);
+        const hist = this.mintHist.get(p.mint) || [];
+        if (isStalePosition({
+          openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now, staleSec, hist,
+          volumeM5: fresh?.volume?.m5, txM5: fresh ? (fresh.txns.m5b + fresh.txns.m5s) : undefined,
+        })) {
+          void this.closePosition(p, 'stale_flat', `stale ${staleSec}s · no price/volume, rotating capital`, 1);
         }
       }
       if (this.positions.length && now - this.lastPairAt > 3000) {
@@ -1088,14 +1162,14 @@ export class Engine extends EventEmitter {
       const decimals = await this.m.decimals(c.mint);
       this.pending.set(id, { id, side, mint: c.mint, createdAt: Date.now(), tx: built.swapTransaction, meta: { ...meta, candidate: side === 'buy' ? c : undefined, outAmount: built.quote.outAmount, decimals } });
       this.emit('approval', { id, side, symbol: c.symbol, tx: built.swapTransaction, text: side === 'buy' ? `Buy ${c.symbol} for ${meta.solAmt.toFixed(4)} SOL` : `Sell ${c.symbol} (${meta.reason})` });
-    } catch (e: any) { this.log('Executor', 'info', `live ${side} not sent: ${e.message}`); }
+    } catch (e: any) { if (side === 'buy') this.logBuyFail(c, e?.message || 'not sent'); else this.log('Executor', 'reject', `Sell ${c.symbol} failed: ${e.message}`, { symbol: c.symbol, mint: c.mint, image: c.image }); }
   }
   async liveSigned(id: string, signature: string) {
     const p = this.pending.get(id); if (!p) throw new Error('unknown request');
     p.signature = signature;
     for (let i = 0; i < 30; i++) {
       const s = await getSignatureStatus(this.cfg.rpcUrl, signature);
-      if (s === 'failed') { this.pending.delete(id); this.log('Executor', 'info', 'transaction failed on-chain'); return; }
+      if (s === 'failed') { this.pending.delete(id); this.agents.executor.failures++; this.log('Executor', 'reject', `Buy/sell failed on-chain${p.meta?.candidate?.symbol ? ' · ' + p.meta.candidate.symbol : ''}`); return; }
       if (s === 'confirmed' || s === 'finalized') break;
       await new Promise((r) => setTimeout(r, 2000));
     }
@@ -1104,12 +1178,22 @@ export class Engine extends EventEmitter {
     if (p.side === 'buy') {
       const c = p.meta.candidate; const tokens = p.meta.outAmount / 10 ** p.meta.decimals;
       const costSol = p.meta.solAmt; const price = (costSol * this.solPrice) / tokens;
-      this.positions.push({ id, mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(), entryPrice: price, qty: tokens, decimals: p.meta.decimals, costUsd: costSol * this.solPrice, costSol, peakPrice: price, lastPrice: price, score: p.meta.score, rentSol: 0 });
+      this.positions.push({ id, mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(), entryPrice: price, qty: tokens, decimals: p.meta.decimals, costUsd: costSol * this.solPrice, costSol, peakPrice: price, lastPrice: price, score: p.meta.score, rentSol: ATA_RENT_SOL });
+      this.agents.executor.fills++; this.agents.executor.buys++; this.agents.executor.last = `BUY ${c.symbol}`;
       this.log('Executor', 'buy', `Bought ${c.symbol}`, { symbol: c.symbol, mint: c.mint, image: c.image, usd: costSol * this.solPrice });
       void notifyTrade({ side: 'BUY', symbol: c.symbol, sizeUsd: costSol * this.solPrice, price });
     } else {
       const pos: Position = p.meta.position; const sol = p.meta.outAmount / 1e9;
       this.finishClose(pos, (sol * this.solPrice) / pos.qty, sol * this.solPrice, p.meta.kind, p.meta.reason);
+      if (this.mode === 'live-auto') {
+        try {
+          const n = await reclaimEmptyAtas(this.cfg.rpcUrl);
+          if (n) this.log('Executor', 'info', `reclaimed rent from ${n} empty token account(s)`);
+          await this.syncBotBalance();
+        } catch (e: any) {
+          this.log('Core', 'info', `ATA rent reclaim skipped: ${e?.message || e}`);
+        }
+      }
     }
     this.persist(); this.emitState();
   }
@@ -1142,7 +1226,7 @@ export class Engine extends EventEmitter {
       this.pending.set(id, { id, side, mint: c.mint, createdAt: Date.now(), tx: built.swapTransaction, meta: { ...meta, candidate: side === 'buy' ? c : undefined, outAmount: built.quote.outAmount, decimals }, signature });
       await this.liveSigned(id, signature);
       this.log('Executor', 'info', `live-auto ${side} ${c.symbol} confirmed`);
-    } catch (e: any) { this.log('Executor', 'info', `live-auto ${side} not sent: ${e.message}`); }
+    } catch (e: any) { if (side === 'buy') this.logBuyFail(c, e?.message || 'not sent'); else this.log('Executor', 'reject', `Sell ${c.symbol} failed: ${e.message}`, { symbol: c.symbol, mint: c.mint, image: c.image }); }
   }
 
   async reconcileOnchain() {
@@ -1346,8 +1430,8 @@ export class Engine extends EventEmitter {
     const gate = liveGate(this.cfg);
     const ticker = [...this.candidates.values()].filter((c) => c.liquidityUsd > 5000).sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 12)
       .map((c) => ({ symbol: c.symbol, mint: c.mint, image: c.image, change: c.change.h1 }));
-    const reserve = reserveSol(this.cfg.priorityFeeSol);
-    const reserveUsd = reserve * (this.solPrice || 0);
+    const reserve = this.exitReserveSolAmt(true);
+    const reserveUsd = this.exitReserveUsd(true);
     const low = this.wallet.connected ? lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd, this.usdcBal?.ui || 0) : null;
     const adapted = this.riskAdapted();
     const botPub = botPublicKey();

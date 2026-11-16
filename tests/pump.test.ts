@@ -93,3 +93,46 @@ test('persistRenderEnv refuses unknown keys and no-ops without an API key', asyn
   assert.equal(autoStartEnabled(), true);
   delete process.env.AUTO_START;
 });
+
+test('buildLiveSwapTx falls back to PumpPortal when the quote has no Jupiter raw route', async () => {
+  const { DEFAULTS, LIVE_CONFIRM_PHRASE } = await import('../server/config.ts');
+  const { buildLiveSwapTx } = await import('../server/executor.ts');
+  const cfg = { ...DEFAULTS, mode: 'live-auto' as const, liveConfirm: LIVE_CONFIRM_PHRASE };
+  const mint = '2P6yDTNLgHyub5CgpM2hn3wWG4dVakhfpkHAFBQJpump';
+  const user = '2VscQ33yZudTXXNjCpfB5X4jsJVL4ZoZxGDzS5xCtLYo';
+  const m = {
+    async quote() { return { inAmount: 1_000_000, outAmount: 50_000_000, priceImpactPct: 2, route: 'pump-curve' }; },
+    async decimals() { return 6; },
+  } as any;
+  const original = globalThis.fetch;
+  let seen: { url: string; body: any } | null = null;
+  globalThis.fetch = (async (url: any, init?: any) => {
+    seen = { url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null };
+    return new Response(Buffer.from([1, 2, 3, 4, 5, 16]), { status: 200, headers: { 'content-type': 'application/octet-stream' } });
+  }) as any;
+  try {
+    const built = await buildLiveSwapTx(cfg, m, { inputMint: SOL_MINT, outputMint: mint, amountRaw: 2_000_000n, userPublicKey: user });
+    assert.ok(seen && seen.url.includes('pumpportal.fun/api/trade-local'), 'called trade-local, url=' + seen?.url);
+    assert.equal(seen!.body.action, 'buy');
+    assert.equal(seen!.body.pool, 'pump');
+    assert.equal(seen!.body.denominatedInSol, 'true');
+    assert.ok(built.swapTransaction);
+    assert.equal(built.quote.route, 'pump-curve');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('buildPumpPortalTx surfaces HTTP/JSON errors', async () => {
+  const { buildPumpPortalTx } = await import('../server/executor.ts');
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'insufficient sol' }), { status: 400 })) as any;
+  try {
+    await assert.rejects(() => buildPumpPortalTx({
+      userPublicKey: '2VscQ33yZudTXXNjCpfB5X4jsJVL4ZoZxGDzS5xCtLYo',
+      action: 'buy', mint: 'M', amount: 0.02, denominatedInSol: true, slippagePct: 15, priorityFeeSol: 0.0002, pool: 'pump',
+    }), /insufficient sol|trade-local HTTP 400/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

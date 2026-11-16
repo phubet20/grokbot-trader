@@ -193,3 +193,25 @@ test('paper withdraw is refused', async () => {
   await assert.rejects(() => e.withdraw({ max: true }), /disabled in paper/);
   e.stop();
 });
+
+test('restartTrading clears in-flight flags and does not wipe positions or the withdraw lock', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-restart-'));
+  const cfg = { ...DEFAULTS, startUsd: 10, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const e = new Engine(cfg, new ReplayMarket(10), new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 10 });
+  const locked = 'CgrPNY2dMhyB8QmfM8hGyBqLwbvrWdE2X58LZZyGSVye';
+  e.store.set('withdrawTo', locked);
+  const beforeEq = e.equity();
+  const beforePos = e.positions.length;
+  const beforeTrades = e.store.trades().length;
+  e.setRunning(true);
+  const r = e.restartTrading();
+  assert.equal(r.ok, true);
+  assert.equal(r.running, true);
+  assert.equal(e.lockedWithdrawTo(), locked);
+  assert.equal(e.positions.length, beforePos);
+  assert.equal(e.store.trades().length, beforeTrades);
+  assert.ok(Math.abs(e.equity() - beforeEq) < 1e-6);
+  assert.equal(e.wallet.solBalance > 0, true);
+  e.stop();
+});

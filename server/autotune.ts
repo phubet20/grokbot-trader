@@ -94,23 +94,26 @@ export type TuneSnapshot = {
   governor: GovernorState;
 };
 
-type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string; immediateRed?: boolean };
+type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string; immediateRed?: boolean; weight?: number; prior?: boolean };
+
+const PATTERN_KEYS: PatternKey[] = ['fresh-launch','curve-breakout','near-graduation','post-graduation','first-pullback','dip-reclaim','buy-candle','whale-inflow','big-money','bounce','momentum-burst','ob-pullback','fvg-pullback','score','other'];
 
 function classify(reason: string): PatternKey {
-  const r = (reason || '').toLowerCase();
+  const r = (reason || '').toLowerCase().replace(/_/g, '-');
+  if (PATTERN_KEYS.includes(r as PatternKey)) return r as PatternKey;
   if (r.includes('fresh-launch') || r.includes('fresh launch')) return 'fresh-launch';
-  if (r.includes('curve breakout')) return 'curve-breakout';
+  if (r.includes('curve-breakout') || r.includes('curve breakout')) return 'curve-breakout';
   if (r.includes('near-graduation') || r.includes('near graduation')) return 'near-graduation';
   if (r.includes('post-graduation') || r.includes('post graduation')) return 'post-graduation';
-  if (r.includes('first pullback')) return 'first-pullback';
+  if (r.includes('first-pullback') || r.includes('first pullback')) return 'first-pullback';
   if (r.includes('dip-reclaim') || r.includes('dip-buy') || r.includes('dip reclaim')) return 'dip-reclaim';
-  if (r.includes('buy candle')) return 'buy-candle';
+  if (r.includes('buy-candle') || r.includes('buy candle')) return 'buy-candle';
   if (r.includes('whale') || r.includes('big-money inflow') || r.includes('big money')) return 'whale-inflow';
   if (r.includes('net buy volume')) return 'big-money';
   if (r.includes('bounce')) return 'bounce';
-  if (r.includes('momentum thrust') || r.includes('momentum burst') || r.includes('buy pressure') || (r.includes('breakout') && !r.includes('curve'))) return 'momentum-burst';
-  if (r.includes('ob pullback') || r.includes('order block')) return 'ob-pullback';
-  if (r.includes('fvg pullback') || r.includes('fair value')) return 'fvg-pullback';
+  if (r.includes('momentum-thrust') || r.includes('momentum thrust') || r.includes('momentum-burst') || r.includes('momentum burst') || r.includes('buy pressure') || (r.includes('breakout') && !r.includes('curve'))) return 'momentum-burst';
+  if (r.includes('ob-pullback') || r.includes('ob pullback') || r.includes('order block')) return 'ob-pullback';
+  if (r.includes('fvg-pullback') || r.includes('fvg pullback') || r.includes('fair value')) return 'fvg-pullback';
   if (r.startsWith('score') || r.includes('score ')) return 'score';
   return 'other';
 }
@@ -162,6 +165,7 @@ export class AutoTune {
   private eqTicks: { t: number; eq: number }[] = [];
   private tight = false;
   private gov: GovernorState = defaultGovernor();
+  private priorsSeeded = false;
 
   load(raw: any) {
     if (!raw || typeof raw !== 'object') return;
@@ -171,6 +175,7 @@ export class AutoTune {
     this.smoothness = Number(raw.smoothness) || 1;
     this.updatedAt = Number(raw.updatedAt) || 0;
     this.tight = !!raw.tight;
+    this.priorsSeeded = !!raw.priorsSeeded;
     if (Array.isArray(raw.trades)) this.trades = raw.trades.slice(-400);
     if (Array.isArray(raw.eqTicks)) this.eqTicks = raw.eqTicks.slice(-300);
     if (Array.isArray(raw.patterns)) {
@@ -191,6 +196,7 @@ export class AutoTune {
       trades: this.trades.slice(-400),
       patterns: [...this.patterns.values()],
       tight: this.tight,
+      priorsSeeded: this.priorsSeeded,
       eqTicks: this.eqTicks.slice(-300),
     };
   }
@@ -199,7 +205,7 @@ export class AutoTune {
     if (!this.enabled) return;
     const pattern = classify(opts.reason);
     const cost = Math.max(1e-6, opts.costUsd);
-    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now(), exitKind: opts.exitKind, exitReason: opts.exitReason, immediateRed: !!opts.immediateRed };
+    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now(), exitKind: opts.exitKind, exitReason: opts.exitReason, immediateRed: !!opts.immediateRed, weight: (opts as any).weight, prior: (opts as any).prior };
     this.trades.push(rec);
     if (this.trades.length > 400) this.trades = this.trades.slice(-400);
     this.rebuild();
@@ -214,20 +220,21 @@ export class AutoTune {
     this.equityScore = score;
 
     for (const t of this.trades) {
+      const w = Math.max(0, t.weight ?? 1);
       const s = map.get(t.pattern) || empty(t.pattern);
-      s.n++;
-      if (t.immediateRed) s.immediateRed++;
-      if (t.pnlUsd > 0) s.wins++; else s.losses++;
-      s.sumPnl += t.pnlUsd;
-      if (t.pnlUsd < 0) s.ddContrib += t.pnlUsd;
-      s.expectancy += t.pnlUsd / t.costUsd;
+      s.n += w;
+      if (t.immediateRed) s.immediateRed += w;
+      if (t.pnlUsd > 0) s.wins += w; else s.losses += w;
+      s.sumPnl += t.pnlUsd * w;
+      if (t.pnlUsd < 0) s.ddContrib += t.pnlUsd * w;
+      s.expectancy += (t.pnlUsd / t.costUsd) * w;
       map.set(t.pattern, s);
     }
     for (const s of map.values()) {
       s.wr = s.n ? s.wins / s.n : 0;
       s.immediateRate = s.n ? s.immediateRed / s.n : 0;
-      s.expectancy = s.n ? s.expectancy : 0; // already summed as pnl/cost, divide
-      s.expectancy = s.n ? s.sumPnl / Math.max(1e-6, this.trades.filter((t) => t.pattern === s.key).reduce((a, t) => a + t.costUsd, 0)) : 0;
+      const costSum = this.trades.filter((t) => t.pattern === s.key).reduce((a, t) => a + t.costUsd * Math.max(0, t.weight ?? 1), 0);
+      s.expectancy = s.n ? s.sumPnl / Math.max(1e-6, costSum) : 0;
       if (s.n >= this.minSamples) {
         if (s.expectancy < -0.04 || (s.wr < 0.35 && s.expectancy < 0)) {
           s.disabled = true;
@@ -297,9 +304,10 @@ export class AutoTune {
       tradeSlopePct = ((recent[recent.length - 1].equity - recent[0].equity) / recent[0].equity) * 100;
     const haveTicks = ticks.length >= 3;
     const haveTrades = recent.length >= 4;
-    const stalled = (haveTicks && slopePctPerMin <= 0.02) || (haveTrades && tradeSlopePct <= 0);
-    const recovered = (!haveTicks || slopePctPerMin > 0.05) && (!haveTrades || tradeSlopePct > 0);
-    if (!haveTicks && !haveTrades) this.tight = false;
+    // Ignore cash-only SOL/USD drift: tight mode needs real closed trades.
+    const stalled = haveTrades && ((haveTicks && slopePctPerMin <= 0.02) || tradeSlopePct <= 0);
+    const recovered = haveTrades && (!haveTicks || slopePctPerMin > 0.05) && tradeSlopePct > 0;
+    if (!haveTrades) this.tight = false;
     else if (stalled) this.tight = true;
     else if (recovered) this.tight = false;
 
@@ -383,6 +391,33 @@ export class AutoTune {
     const s = this.patterns.get(key);
     if (!s || s.n < this.minSamples) return 1;
     return clamp(s.weight, 0.5, 1.5);
+  }
+
+  seedFromPriors(events: { pattern: PatternKey | string; pnlUsd: number; costUsd: number; pnlPct: number; weight?: number; exitKind?: string; exitReason?: string; ts?: number }[]) {
+    if (this.priorsSeeded) return;
+    if (!events?.length) return;
+    for (const ev of events) {
+      const cost = Math.max(1e-6, ev.costUsd || 1);
+      this.trades.push({
+        pattern: (ev.pattern as PatternKey) || 'other',
+        pnlUsd: ev.pnlUsd,
+        costUsd: cost,
+        pnlPct: ev.pnlPct,
+        equity: 0,
+        ts: ev.ts || 1,
+        exitKind: ev.exitKind,
+        exitReason: ev.exitReason,
+        weight: ev.weight ?? 1,
+        prior: true,
+      });
+    }
+    if (this.trades.length > 400) {
+      const priors = this.trades.filter((t) => t.prior);
+      const live = this.trades.filter((t) => !t.prior).slice(-(400 - Math.min(200, priors.length)));
+      this.trades = [...priors.slice(-200), ...live];
+    }
+    this.priorsSeeded = true;
+    this.rebuild();
   }
 
   snapshot(): TuneSnapshot {

@@ -17,7 +17,7 @@ export type Config = {
   port: number;
   startUsd: number;            // paper wallet starting balance (USD), min 2
   positionPct: number;         // % of current portfolio per trade
-  minTradeUsd: number;         // never open a trade smaller than this
+  minTradeUsd: number;         // unused as a gate (0); kept for config compat
   maxPositions: number;        // 0 = unlimited (cash is the only cap)
   takeProfitPct: number;       // paper: close 100% when net PnL after fees/slip reaches this %
   hardStopPct: number;         // exit if price drops this % below entry
@@ -51,7 +51,7 @@ export const DEFAULTS: Config = {
   port: 8787,
   startUsd: 81,
   positionPct: 8,
-  minTradeUsd: 0.25,
+  minTradeUsd: 0,
   maxPositions: 0,
   takeProfitPct: 3,
   hardStopPct: 35,

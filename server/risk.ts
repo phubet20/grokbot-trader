@@ -14,46 +14,68 @@ export type RiskParams = {
 export const BASE_FEE_SOL = 0.000005;
 export const ATA_RENT_SOL = 0.00203928; // refundable when the token account is closed after sell
 
-/** SOL to keep back: ATA rent (while a position is open) + buy and sell network+priority fees. */
+export function sellFeeSol(priorityFeeSol: number): number {
+  return BASE_FEE_SOL + Math.max(0, Number(priorityFeeSol) || 0);
+}
+
+/**
+ * SOL that must stay in the wallet so every open position (and a newly opened one)
+ * can still be sold, including a parallel close-all. ATA rent for a not-yet-opened
+ * position is reserved in the wallet until the buy locks it; rent for already-open
+ * positions already sits in those ATAs and is reclaimed on close.
+ */
+export function exitReserveSol(priorityFeeSol: number, openPositions = 0, openingNew = false): number {
+  const fee = sellFeeSol(priorityFeeSol);
+  // sell fees for every current position (parallel close-all) plus, when opening,
+  // the new position's sell fee, its ATA rent, and this buy's network fee.
+  const sellFees = (Math.max(0, openPositions) + (openingNew ? 1 : 0)) * fee;
+  const openCost = openingNew ? ATA_RENT_SOL + fee : 0;
+  return sellFees + openCost;
+}
+
+/** Exit reserve for opening one position (sell fee + ATA rent). */
 export function reserveSol(priorityFeeSol: number): number {
-  return ATA_RENT_SOL + 2 * (BASE_FEE_SOL + Math.max(0, Number(priorityFeeSol) || 0));
+  return exitReserveSol(priorityFeeSol, 0, true);
 }
 
 /** @deprecated use reserveSol(priorityFeeSol); kept as a conservative fallback number */
 export const FEE_RESERVE_SOL = 0.0005;
 
+function roundUsd(x: number) { return Math.floor(x * 1e6) / 1e6; }
 function round2(x: number) { return Math.floor(x * 100) / 100; }
+
+const TINY_BOOK_USD = 15;
 
 /**
  * USD size of the next trade.
- * Default is positionPct of the portfolio, scaled by an anti-martingale multiplier.
- * If that would be below minTradeUsd, use more of the free cash (up to all of it
- * minus the fee/rent reserve) so $2–$5 wallets can still place a viable trade.
+ * Large books: positionPct of spendable, scaled by an anti-martingale multiplier.
+ * Tiny books: all spendable (cash minus the exit reserve) so a trade is larger
+ * than ATA rent and can actually execute. No minimum USD floor.
  */
 export function positionSizeUsd(p: RiskParams, portfolioUsd: number, freeCashUsd: number, reserveUsd: number, sizeMult = 1): number {
   if (!(portfolioUsd > 0)) return 0;
   const spendable = Math.max(0, freeCashUsd - reserveUsd);
-  if (spendable < p.minTradeUsd) return 0;
+  if (!(spendable > 0)) return 0;
+  if (portfolioUsd <= TINY_BOOK_USD) return roundUsd(spendable);
   const target = (portfolioUsd * p.positionPct / 100) * Math.max(0.4, sizeMult);
-  if (target >= p.minTradeUsd) {
-    const size = Math.min(target, spendable);
-    return size >= p.minTradeUsd ? round2(size) : 0;
-  }
-  return round2(spendable);
+  return roundUsd(Math.min(Math.max(target, 0), spendable));
 }
 
 /**
  * How many concurrent slots this book can support.
- * Capital is split evenly across slots from equity, after reserving rent/fees
- * for every slot. Tiny books use fewer slots so each trade stays >= minTrade.
+ * Capital is split evenly across slots from equity, after reserving exit fees
+ * for every slot. Tiny books use one slot and go all-in on spendable.
  */
 export function usableSlots(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number, openPositions = 0): number {
+  if (equityUsd > 0 && equityUsd <= TINY_BOOK_USD) {
+    return (freeCashUsd - reserveUsd) > 0 ? 1 : 0;
+  }
   const max = Math.max(1, Math.min(10, p.maxPositions || 10));
   for (let n = max; n >= 1; n--) {
     if (openPositions >= n) continue;
     const reserved = n * reserveUsd;
     const tradable = equityUsd - reserved;
-    if (tradable < n * p.minTradeUsd) continue;
+    if (tradable <= 0) continue;
     const size = tradable / n;
     if (freeCashUsd + 1e-9 < size + reserveUsd) continue;
     return n;
@@ -64,40 +86,35 @@ export function usableSlots(p: RiskParams, equityUsd: number, freeCashUsd: numbe
 export function slotSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number, openPositions = 0): number {
   const n = usableSlots(p, equityUsd, freeCashUsd, reserveUsd, openPositions);
   if (!n) return 0;
+  const cap = Math.max(0, freeCashUsd - reserveUsd);
+  if (!(cap > 0)) return 0;
+  if (equityUsd <= TINY_BOOK_USD) return roundUsd(cap);
   const size = (equityUsd - n * reserveUsd) / n;
-  const cap = freeCashUsd - reserveUsd;
-  if (size < p.minTradeUsd || cap < p.minTradeUsd) return 0;
-  return round2(Math.min(size, cap));
+  return roundUsd(Math.min(Math.max(size, 0), cap));
 }
 
 /**
- * Size the next entry as a % of spendable cash (free cash minus rent/fee reserve),
- * never below minTrade and never more than spendable, so cash cannot go negative.
- * No concurrent-position cap — keep opening until spendable is below the minimum.
+ * Size the next entry from spendable cash (free cash minus exit reserve).
+ * No minimum USD floor. Tiny books use all spendable so the buy exceeds ATA
+ * rent; larger books use positionPct and a 24% equity cap. Stops only when
+ * spendable is 0 (a trade is mechanically impossible).
  */
 export function openSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number): number {
   const spendable = Math.max(0, freeCashUsd - reserveUsd);
-  if (spendable < p.minTradeUsd) return 0;
+  if (!(spendable > 0)) return 0;
+  if (equityUsd > 0 && equityUsd <= TINY_BOOK_USD) return roundUsd(spendable);
   const pct = Math.max(1, Math.min(100, p.positionPct || 8)) / 100;
   let size = spendable * pct;
-  if (size < p.minTradeUsd) size = p.minTradeUsd;
-  // Tiny books: size at least 20% of spendable (still capped at 24% of equity)
-  // so a $2 account does not open fee-dominated dust trades.
-  if (equityUsd > 0 && equityUsd <= 10) {
-    const floor = Math.min(spendable, equityUsd * 0.24, Math.max(p.minTradeUsd, spendable * 0.2));
-    if (floor >= p.minTradeUsd) size = Math.max(size, floor);
-  }
-  if (size > spendable) return 0;
-  if (equityUsd > 0) size = Math.min(size, equityUsd * 0.24);
-  if (size < p.minTradeUsd) return 0;
-  return round2(size);
+  if (size > spendable) size = spendable;
+  if (equityUsd > TINY_BOOK_USD) size = Math.min(size, equityUsd * 0.24);
+  return size > 0 ? roundUsd(size) : 0;
 }
 
 export function lowBalanceReason(portfolioUsd: number, freeCashUsd: number, reserveUsd: number, minTradeUsd: number, usdcUi = 0): string | null {
   const needSol = 'Need ~0.01 SOL for fees';
   if (freeCashUsd <= 0) return usdcUi > 0 ? needSol : needSol + ' — deposit SOL to the bot address';
-  if (freeCashUsd <= reserveUsd) return usdcUi > 0 ? needSol : `balance too low to cover fees and token-account rent (need ~$${reserveUsd.toFixed(2)} reserved, have $${freeCashUsd.toFixed(2)})`;
-  if (freeCashUsd - reserveUsd < minTradeUsd) return `balance too low for a viable trade (spendable $${Math.max(0, freeCashUsd - reserveUsd).toFixed(2)}, minimum $${minTradeUsd.toFixed(2)})`;
+  if (freeCashUsd <= reserveUsd) return usdcUi > 0 ? needSol : `balance reserved for sell fees and token-account rent (need ~$${reserveUsd.toFixed(4)} reserved, have $${freeCashUsd.toFixed(4)})`;
+  // minTradeUsd is ignored: keep trading until spendable is gone.
   return null;
 }
 

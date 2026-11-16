@@ -34,9 +34,14 @@ class Limiter {
   private last = 0;
   baseGap: number;
   gapMs: number;
+  coolUntil = 0;
   constructor(gapMs: number) { this.baseGap = gapMs; this.gapMs = gapMs; }
-  on429() { this.gapMs = Math.min(this.gapMs * 2, 15_000); }
-  onOk() { this.gapMs = Math.max(this.baseGap, this.gapMs * 0.92); }
+  on429() {
+    this.gapMs = Math.min(this.gapMs * 2, 180_000);
+    this.coolUntil = Date.now() + this.gapMs;
+  }
+  onOk() { this.gapMs = Math.max(this.baseGap, this.gapMs * 0.92); if (Date.now() >= this.coolUntil) this.coolUntil = 0; }
+  cooling() { return Date.now() < this.coolUntil; }
   run<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.q.then(async () => {
       const wait = this.last + this.gapMs - Date.now();
@@ -55,13 +60,14 @@ export class LiveMarket implements MarketSource {
   calls: Record<string, number> = { geckoterminal: 0, dexscreener: 0, rugcheck: 0, jupiter: 0, pumpfun: 0, gmgn: 0 };
   errors = 0;
   lastError = '';
-  private gt = new Limiter(2100);      // GeckoTerminal free tier ~30 req/min
+  private gt = new Limiter(3000);      // GeckoTerminal free tier ~30 req/min; stay under and back off on 429
   private ds = new Limiter(800);       // DexScreener; back off hard on 429 (shared IPs)
   private rc = new Limiter(1500);
   private jup = new Limiter(1100);    // Jupiter lite API is ~60 req/min
   private secCache = new Map<string, TokenSecurity>();
   private decCache = new Map<string, number>([[SOL_MINT, 9], [USDC_MINT, 6]]);
   private ohlcvCache = new Map<string, { at: number; data: Candle[] }>();
+  private gtCache = new Map<string, { at: number; data: any }>();
   private scanTick = 0;
   lastSolPrice = 0;
   lastSolAt = 0;
@@ -114,6 +120,20 @@ export class LiveMarket implements MarketSource {
       this.lastError = `${new Date().toISOString()} ${src}: ${e?.message || e}`;
       throw e;
     } finally { clearTimeout(t); }
+  }
+
+  private async getGt(url: string, timeoutMs = 5000): Promise<any> {
+    const hit = this.gtCache.get(url);
+    if (this.gt.cooling() && hit) return hit.data;
+    if (hit && Date.now() - hit.at < 5 * 60_000 && this.gt.cooling()) return hit.data;
+    try {
+      const d = await this.gt.run(() => this.get(url, 'geckoterminal', timeoutMs));
+      this.gtCache.set(url, { at: Date.now(), data: d });
+      return d;
+    } catch (e) {
+      if (hit) return hit.data;
+      throw e;
+    }
   }
 
   private ingestGt(d: any, out: Map<string, Candidate>): number {
@@ -200,7 +220,7 @@ export class LiveMarket implements MarketSource {
     // or 429'd API does not hold up the others.
     const gtJobs = gtPages.map((job) => {
       const sep = job.path.includes('?') ? '&' : '?';
-      return this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${job.path}${sep}include=base_token,quote_token,dex`, 'geckoterminal', 5000))
+      return this.getGt(`https://api.geckoterminal.com/api/v2/networks/solana/${job.path}${sep}include=base_token,quote_token,dex`)
         .then((d) => addGt(d, job.universe, job.src)).catch((e: any) => this.markSrc(job.src, false, 0, e?.message));
     });
     const dsJob = (async () => {
@@ -411,12 +431,13 @@ export class LiveMarket implements MarketSource {
     const [unit, agg] = map[tf] || map['1m'];
     const key = `${pool}:${tf}`;
     const hit = this.ohlcvCache.get(key);
-    if (hit && Date.now() - hit.at < 45_000) return hit.data;
+    if (hit && Date.now() - hit.at < 180_000) return hit.data;
+    if (this.gt.cooling() && hit) return hit.data;
     try {
-      const d = await this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/${unit}?aggregate=${agg}&limit=120&currency=usd`, 'geckoterminal'));
+      const d = await this.getGt(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/${unit}?aggregate=${agg}&limit=120&currency=usd`);
       const list: Candle[] = (d?.data?.attributes?.ohlcv_list || []).map((r: any[]) => r.map(num)).reverse();
-      this.ohlcvCache.set(key, { at: Date.now(), data: list });
-      return list;
+      if (list.length) this.ohlcvCache.set(key, { at: Date.now(), data: list });
+      return list.length ? list : (hit?.data || []);
     } catch { return hit?.data || []; }
   }
 }

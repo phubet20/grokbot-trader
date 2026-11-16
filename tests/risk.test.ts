@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, evaluateExit, activeStop, reserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
+import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, evaluateExit, activeStop, reserveSol, exitReserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
 
 const P = { positionPct: 8, minTradeUsd: 0.5, maxPositions: 4, hardStopPct: 8, trailingStopPct: 12, maxHoldMin: 120, dailyLossLimitPct: 15 };
 const T0 = 1_000_000;
@@ -9,12 +9,12 @@ test('position size is % of portfolio', () => {
   assert.equal(positionSizeUsd(P, 81, 81, 0.5), 6.48);
   assert.equal(positionSizeUsd(P, 1000, 1000, 0.5), 80);
 });
-test('works with a $10 portfolio', () => {
-  assert.equal(positionSizeUsd(P, 10, 10, 0.57), 0.8);
+test('tiny $10 book uses all spendable, not 8%', () => {
+  assert.equal(positionSizeUsd(P, 10, 10, 0.57), 9.43);
 });
-test('size capped by free cash minus reserve, 0 when below min trade', () => {
+test('size capped by free cash minus reserve; no min-trade floor', () => {
   assert.equal(positionSizeUsd(P, 100, 3, 0.5), 2.5);
-  assert.equal(positionSizeUsd(P, 100, 0.8, 0.5), 0);
+  assert.equal(positionSizeUsd(P, 100, 0.8, 0.5), 0.3);
   assert.equal(positionSizeUsd(P, 0, 0, 0), 0);
 });
 test('entry gates', () => {
@@ -69,15 +69,15 @@ test('reserve is rent plus two (base+priority) fees, far below 0.008 SOL', () =>
   assert.ok(r > ATA_RENT_SOL);
   assert.ok(r < 0.003, 'reserve=' + r);
 });
-test('tiny $2 and $5 portfolios size up when 8% is below min trade', () => {
-  const P2 = { ...P, minTradeUsd: 0.25 };
+test('tiny $2 and $5 portfolios use all spendable so the buy exceeds ATA rent', () => {
+  const P2 = { ...P, minTradeUsd: 0 };
   const reserve = 0.35;
   const s2 = positionSizeUsd(P2, 2, 2, reserve);
-  assert.ok(s2 >= 1.6 && s2 <= 1.65, 's2=' + s2); // spendable 1.65, 8% of $2 is $0.16 < 0.25
+  assert.equal(s2, 1.65);
   const s5 = positionSizeUsd(P2, 5, 5, reserve);
-  assert.equal(s5, 0.4); // 8% of $5
+  assert.equal(s5, 4.65);
   const s10 = positionSizeUsd(P2, 10, 10, 0.57);
-  assert.equal(s10, 0.8);
+  assert.equal(s10, 9.43);
 });
 test('anti-martingale grows after wins and shrinks after losses, never martingales', () => {
   assert.equal(sizeMultiplier([]), 1);
@@ -107,7 +107,7 @@ test('momentum entry requires buy pressure and acceleration; fade on ratio drop'
   assert.equal(fade.exit, true);
 });
 
-test('even slot sizing: $81 gets 10 slots, $2 uses fewer so each trade stays viable', () => {
+test('even slot sizing: $81 can use multiple slots; tiny books get one all-in slot', () => {
   const P2 = { ...P, minTradeUsd: 0.25, maxPositions: 10 };
   const n81 = usableSlots(P2, 81, 81, 0.35, 0);
   assert.equal(n81, 10);
@@ -128,17 +128,17 @@ test('paper $8 book can still size a trade with up to 10 slots and fee reserve',
   const n = usableSlots(P2, 8, 8, reserve, 0);
   assert.ok(n >= 1, 'usable slots for $8, n=' + n + ' reserve=' + reserve.toFixed(2));
   const size = slotSizeUsd(P2, 8, 8, reserve, 0);
-  assert.ok(size >= P2.minTradeUsd, 'size=' + size);
-  assert.equal(lowBalanceReason(8, 8, reserve, P2.minTradeUsd), null);
+  assert.ok(size > 0, 'size=' + size);
+  assert.equal(lowBalanceReason(8, 8, reserve, 0), null);
 });
 
 test('openSizeUsd is a % of free cash, never exceeds spendable, and is not capped at 10 positions', () => {
   const P2 = { ...P, minTradeUsd: 0.25, positionPct: 8 };
   const reserve = 0.35;
   const s = openSizeUsd(P2, 81, 81, reserve);
-  assert.ok(s >= P2.minTradeUsd, 'size=' + s);
+  assert.ok(s > 0, 'size=' + s);
   assert.ok(s <= 81 - reserve);
-  const expected = Math.floor((81 - reserve) * 0.08 * 100) / 100;
+  const expected = Math.floor((81 - reserve) * 0.08 * 1e6) / 1e6;
   assert.equal(s, expected);
   let cash = 81, n = 0, spent = 0;
   while (n < 500) {
@@ -151,21 +151,30 @@ test('openSizeUsd is a % of free cash, never exceeds spendable, and is not cappe
   assert.ok(n > 10, 'keeps opening past 10 while cash remains, n=' + n);
   assert.ok(spent <= 81 - reserve + 1e-9);
   assert.equal(openSizeUsd(P2, 8, 0.20, reserve), 0);
-  assert.ok(openSizeUsd(P2, 8, 8, reserve) >= P2.minTradeUsd);
+  assert.equal(openSizeUsd(P2, 8, 8, reserve), 8 - reserve);
 });
 
-test('tiny $2 book sizes a meaningful share of spendable, not fee-dominated dust', () => {
-  const P2 = { ...P, minTradeUsd: 0.25, positionPct: 8 };
+test('tiny $2 and $1.73 books use all spendable (no min floor, no 24% cap)', () => {
+  const P2 = { ...P, minTradeUsd: 0, positionPct: 8 };
   const reserve = 0.17;
   const s = openSizeUsd(P2, 2, 2, reserve);
-  assert.ok(s >= 0.25, 'size=' + s);
-  assert.ok(s >= 0.36, 'should be ~20% of spendable after rounding, size=' + s);
-  assert.ok(s <= 2 * 0.24 + 1e-9, 'capped at 24% equity, size=' + s);
-  assert.ok(s <= 2 - reserve);
+  assert.equal(s, 1.83);
+  const sTiny = openSizeUsd(P2, 1.73, 1.73, 0.16);
+  assert.equal(sTiny, 1.57);
+  assert.equal(openSizeUsd(P2, 1.73, 0.16, 0.16), 0);
 });
 
 test('lowBalanceReason asks for fee SOL and mentions the banner copy', () => {
   assert.equal(lowBalanceReason(1.73, 0, 0.18, 0.25, 1.73), 'Need ~0.01 SOL for fees');
   assert.match(lowBalanceReason(0, 0, 0.18, 0.25, 0) || '', /Need ~0.01 SOL for fees/);
   assert.equal(lowBalanceReason(10, 10, 0.3, 0.25, 0), null);
+});
+
+test('exitReserveSol keeps sell fees for open positions plus buy cost when opening', () => {
+  const fee = 0.000005 + 0.0002;
+  assert.ok(Math.abs(exitReserveSol(0.0002, 0, false)) < 1e-12);
+  const open1 = exitReserveSol(0.0002, 0, true);
+  assert.ok(Math.abs(open1 - (ATA_RENT_SOL + 2 * fee)) < 1e-12);
+  const twoOpenPlusNew = exitReserveSol(0.0002, 2, true);
+  assert.ok(Math.abs(twoOpenPlusNew - (3 * fee + ATA_RENT_SOL + fee)) < 1e-12);
 });
