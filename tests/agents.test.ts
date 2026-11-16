@@ -27,7 +27,7 @@ test('safety pre-check passes a healthy pool', () => {
 });
 test('safety pre-check rejects thin/young/honeypot pools', () => {
   assert.ok(!preCheck({ ...base, liquidityUsd: 5000 }, DEFAULTS, now).ok);
-  assert.ok(!preCheck({ ...base, createdAt: now - 60_000 }, DEFAULTS, now).ok);
+  assert.ok(!preCheck({ ...base, createdAt: now - 10_000 }, DEFAULTS, now).ok);
   assert.ok(preCheck({ ...base, txns: { ...base.txns, h1b: 300, h1s: 0 } }, DEFAULTS, now).reasons.some((r) => r.includes('honeypot')));
   assert.ok(!preCheck({ ...base, quoteSymbol: 'BONK' }, DEFAULTS, now).ok);
 });
@@ -36,7 +36,7 @@ test('safety security check: authorities, holders, missing data fail closed', ()
   assert.ok(securityCheck(s, DEFAULTS).ok);
   assert.ok(!securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS).ok);
   assert.ok(!securityCheck({ ...s, freezeAuthority: 'X' }, DEFAULTS).ok);
-  assert.ok(!securityCheck({ ...s, holders: 50 }, DEFAULTS).ok);
+  assert.ok(!securityCheck({ ...s, holders: 10 }, DEFAULTS).ok);
   assert.ok(!securityCheck({ ...s, topHolderPct: 40 }, DEFAULTS).ok);
   assert.ok(!securityCheck(null, DEFAULTS).ok);
 });
@@ -46,7 +46,9 @@ test('live mode needs mode=live AND the exact confirmation phrase', () => {
   assert.equal(liveGate({ ...DEFAULTS, mode: 'live', liveConfirm: 'yes' }).live, false);
   assert.equal(liveGate({ ...DEFAULTS, mode: 'live', liveConfirm: LIVE_CONFIRM_PHRASE }).live, true);
 });
-test('config sanitize: min $10 start, bogus mode -> paper', () => {
-  assert.equal(sanitize({ startUsd: 3 }).startUsd, 10);
+test('config sanitize: min $2 start, live-auto kept, bogus mode -> paper', () => {
+  assert.equal(sanitize({ startUsd: 3 }).startUsd, 3);
+  assert.equal(sanitize({ startUsd: 1 }).startUsd, 2);
+  assert.equal(sanitize({ mode: 'live-auto' as any }).mode, 'live-auto');
   assert.equal(sanitize({ mode: 'yolo' as any }).mode, 'paper');
 });

@@ -5,6 +5,11 @@ import { BotIcon, TokenAvatar, BellI, SunI, MoonI, WalletI } from './Icons';
 
 const RANGES = ['LIVE', '1H', '4H', '1D', '1W', 'ALL'];
 
+export function LowBalanceBanner({ snap }: { snap: any }) {
+  if (!snap.lowBalance) return null;
+  return <div className="low-bal" data-testid="low-balance">{snap.lowBalance}</div>;
+}
+
 export function Header({ snap, theme, setTheme, onRecap }: any) {
   return (
     <div className="hdr">
@@ -14,7 +19,7 @@ export function Header({ snap, theme, setTheme, onRecap }: any) {
       <div style={{ flex: 1 }} />
       <button className="icon-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="theme">{theme === 'dark' ? <SunI size={19} /> : <MoonI size={19} />}</button>
       <button className="icon-btn" onClick={onRecap} aria-label="recap"><BellI size={19} /></button>
-      <span className={`live-pill ${snap.wallet.running ? '' : 'off'} ${snap.mode === 'live' ? 'real' : 'test'}`} title={snap.modeReason}><i />{!snap.wallet.running ? 'Paused' : snap.mode === 'live' ? 'Live $' : 'Live · test'}</span>
+      <span className={`live-pill ${snap.wallet.running ? '' : 'off'} ${snap.mode === 'paper' ? 'test' : 'real'}`} title={snap.modeReason}><i />{!snap.wallet.running ? 'Paused' : snap.mode === 'live-auto' ? 'Live auto' : snap.mode === 'live' ? 'Live $' : 'Live · test'}</span>
     </div>
   );
 }

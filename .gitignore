@@ -11,3 +11,6 @@ node_modules/
 web/dist/
 web/node_modules/
 RENDER_ACCESS_TOKEN.txt
+
+BOT_WALLET_SECRET.txt
+*.secret

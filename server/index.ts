@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
 import { join, extname, normalize } from 'node:path';
 import { config, updateConfig, liveGate, ROOT } from './config.ts';
+import { redactSecrets, botPublicKey } from './wallet.ts';
 import { LiveMarket } from './market.ts';
 import { ReplayMarket } from './replay.ts';
 import { Store } from './store.ts';
@@ -77,8 +78,10 @@ const server = createServer(async (req, res) => {
       if (p === '/api/bot/run') { engine.setRunning(!!b.running); return json(200, { ok: true }); }
       if (p === '/api/config') { updateConfig(b); engine.emitState(); return json(200, { ...config, liveConfirm: undefined }); }
       if (p === '/api/reset') { engine.reset(); return json(200, { ok: true }); }
-      if (p === '/api/live/signed') { if (!liveGate().live) return json(403, { error: 'live disabled' }); engine.liveSigned(String(b.id), String(b.signature)); return json(200, { ok: true }); }
+      if (p === '/api/live/signed') { if (!liveGate().live || liveGate().auto) return json(403, { error: 'live disabled' }); engine.liveSigned(String(b.id), String(b.signature)); return json(200, { ok: true }); }
       if (p === '/api/live/rejected') { engine.liveRejected(String(b.id)); return json(200, { ok: true }); }
+      if (p === '/api/withdraw/lock') return json(200, engine.lockWithdraw(String(b.address || ''), String(b.message || ''), String(b.signature || '')));
+      if (p === '/api/withdraw') return json(200, await engine.withdraw());
     }
     if (p.startsWith('/api/')) return json(404, { error: 'not found' });
     // static
@@ -88,7 +91,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': MIME[extname(f)] || 'application/octet-stream', 'cache-control': f.endsWith('index.html') ? 'no-cache' : 'public, max-age=86400' });
     res.end(await readFile(f));
   } catch (e: any) {
-    json(400, { error: e?.message || String(e) });
+    json(400, { error: redactSecrets(e?.message || String(e)) });
   }
 });
 
@@ -97,10 +100,26 @@ if (process.env.RENDER && !ACCESS_TOKEN) { console.error('Refusing to start on R
 if (host !== '127.0.0.1' && host !== 'localhost' && !ACCESS_TOKEN) console.warn('  WARNING: listening on a network interface without ACCESS_TOKEN - anyone on the network can use the app.');
 server.listen(config.port, host, async () => {
   const g = liveGate();
-  console.log(`\n  ${config.appName} · ${g.live ? 'LIVE' : 'PAPER/TEST'} mode · data: ${market.name}`);
+  const auto = g.auto ? ' AUTO' : '';
+  console.log(`\n  ${config.appName} · ${g.live ? 'LIVE' + auto : 'PAPER/TEST'} mode · data: ${market.name}`);
   console.log(`  ${g.reason}`);
+  if (g.auto) console.log(`  bot wallet: ${botPublicKey() || '(not configured)'}`);
   console.log(`  open http://${host === '0.0.0.0' ? 'localhost' : host}:${config.port}/${ACCESS_TOKEN ? '<ACCESS_TOKEN>/' : ''}\n`);
   await engine.start();
+  startKeepalive();
 });
 const shutdown = () => { engine.stop(); server.close(); process.exit(0); };
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
+
+/** Render free instances sleep after ~15 min without inbound HTTP. Pinging the
+ *  public /healthz may count as inbound traffic and keep the process awake.
+ *  This is not officially guaranteed. The free plan also caps 750 instance-hours
+ *  per month (~24/7 uses ~720–744 hours). Localhost pings do not prevent sleep. */
+function startKeepalive() {
+  const url = process.env.KEEPALIVE_URL || (process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '') + '/healthz' : '');
+  if (!url) return;
+  const tick = () => fetch(url, { method: 'GET' }).then((r) => { if (!r.ok) console.log('keepalive', r.status); }).catch((e) => console.log('keepalive fail', e?.message || e));
+  setTimeout(tick, 15_000);
+  setInterval(tick, 8 * 60_000);
+  console.log('  keepalive -> public /healthz every 8 minutes');
+}

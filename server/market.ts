@@ -19,6 +19,7 @@ export interface MarketSource {
   quote(inputMint: string, outputMint: string, amountRaw: bigint, slippageBps: number): Promise<Quote | null>;
   decimals(mint: string): Promise<number>;
   ohlcv(pool: string, tf: string): Promise<Candle[]>;
+  pair(mint: string): Promise<Candidate | null>;
 }
 
 const UA = { 'user-agent': 'grokbot-trader/1.0', accept: 'application/json' };
@@ -26,8 +27,11 @@ const UA = { 'user-agent': 'grokbot-trader/1.0', accept: 'application/json' };
 class Limiter {
   private q: Promise<void> = Promise.resolve();
   private last = 0;
-  private gapMs: number;
-  constructor(gapMs: number) { this.gapMs = gapMs; }
+  baseGap: number;
+  gapMs: number;
+  constructor(gapMs: number) { this.baseGap = gapMs; this.gapMs = gapMs; }
+  on429() { this.gapMs = Math.min(this.gapMs * 2, 15_000); }
+  onOk() { this.gapMs = Math.max(this.baseGap, this.gapMs * 0.92); }
   run<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.q.then(async () => {
       const wait = this.last + this.gapMs - Date.now();
@@ -46,22 +50,36 @@ export class LiveMarket implements MarketSource {
   calls: Record<string, number> = { geckoterminal: 0, dexscreener: 0, rugcheck: 0, jupiter: 0 };
   errors = 0;
   lastError = '';
-  private gt = new Limiter(2200);      // GeckoTerminal free tier ~30 req/min
+  private gt = new Limiter(2100);      // GeckoTerminal free tier ~30 req/min
+  private ds = new Limiter(800);       // DexScreener; back off hard on 429 (shared IPs)
   private rc = new Limiter(1500);
-  private jup = new Limiter(1000);    // Jupiter lite API is ~60 req/min
+  private jup = new Limiter(1100);    // Jupiter lite API is ~60 req/min
   private secCache = new Map<string, TokenSecurity>();
   private decCache = new Map<string, number>([[SOL_MINT, 9], [USDC_MINT, 6]]);
   private ohlcvCache = new Map<string, { at: number; data: Candle[] }>();
   private scanTick = 0;
 
+  private limiterFor(src: string): Limiter | null {
+    if (src === 'geckoterminal') return this.gt;
+    if (src === 'dexscreener') return this.ds;
+    if (src === 'rugcheck') return this.rc;
+    if (src === 'jupiter') return this.jup;
+    return null;
+  }
   private async get(url: string, src: string, timeoutMs = 12000, retry = true): Promise<any> {
     this.calls[src] = (this.calls[src] || 0) + 1;
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeoutMs);
+    const lim = this.limiterFor(src);
     try {
       const r = await fetch(url, { headers: UA, signal: ctl.signal });
-      if (r.status === 429 && retry) { clearTimeout(t); await new Promise((res) => setTimeout(res, 2000)); return this.get(url, src, timeoutMs, false); }
+      if (r.status === 429) {
+        lim?.on429();
+        if (retry) { clearTimeout(t); await new Promise((res) => setTimeout(res, Math.max(2000, lim?.gapMs || 2000))); return this.get(url, src, timeoutMs, false); }
+        throw new Error(`${src} HTTP 429`);
+      }
       if (!r.ok) throw new Error(`${src} HTTP ${r.status}`);
+      lim?.onOk();
       return await r.json();
     } catch (e: any) {
       this.errors++;
@@ -70,31 +88,44 @@ export class LiveMarket implements MarketSource {
     } finally { clearTimeout(t); }
   }
 
+  private ingestGt(d: any, out: Map<string, Candidate>): number {
+    let scanned = 0;
+    const inc = new Map<string, any>((d.included || []).map((x: any) => [x.id, x]));
+    for (const pool of d.data || []) {
+      scanned++;
+      const c = mapGt(pool, inc);
+      if (c && !out.has(c.mint)) out.set(c.mint, c);
+    }
+    return scanned;
+  }
+
   async candidates() {
     const out = new Map<string, Candidate>();
     let scanned = 0;
     this.scanTick++;
-    const rot = ['trending_pools?page=2&duration=1h', 'trending_pools?page=1&duration=5m', 'new_pools?page=2', 'trending_pools?page=1&duration=6h'];
-    const gtPages = ['new_pools?page=1', 'trending_pools?page=1&duration=1h', rot[this.scanTick % rot.length]];
+    const dexes = ['pumpswap', 'pump-fun', 'raydium', 'meteora'];
+    const dex = dexes[this.scanTick % dexes.length];
+    const rot = [
+      `dexes/${dex}/new_pools?page=1`,
+      'trending_pools?page=1&duration=5m',
+      'new_pools?page=2',
+      'trending_pools?page=1&duration=1h',
+    ];
+    // Always prefer brand-new pools; rotate a second GT page so we stay under ~30 req/min.
+    const gtPages = ['new_pools?page=1', rot[this.scanTick % rot.length]];
     for (const p of gtPages) {
       try {
         const sep = p.includes('?') ? '&' : '?';
         const d = await this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${p}${sep}include=base_token,quote_token,dex`, 'geckoterminal'));
-        const inc = new Map<string, any>((d.included || []).map((x: any) => [x.id, x]));
-        for (const pool of d.data || []) {
-          scanned++;
-          const c = mapGt(pool, inc);
-          if (c && !out.has(c.mint)) out.set(c.mint, c);
-        }
+        scanned += this.ingestGt(d, out);
       } catch {}
     }
-    // DexScreener boosted/profiled tokens -> pair data
     try {
       const feed = this.scanTick % 2 ? 'token-profiles/latest/v1' : 'token-boosts/latest/v1';
-      const prof = await this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener');
+      const prof = await this.ds.run(() => this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener'));
       const mints = [...new Set<string>((Array.isArray(prof) ? prof : []).filter((x: any) => x.chainId === 'solana').map((x: any) => x.tokenAddress))].slice(0, 30);
       if (mints.length) {
-        const pairs = await this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener');
+        const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener'));
         const best = new Map<string, any>();
         for (const p of Array.isArray(pairs) ? pairs : []) {
           scanned++;
@@ -108,7 +139,32 @@ export class LiveMarket implements MarketSource {
         }
       }
     } catch {}
+    if (this.scanTick % 3 === 0) {
+      try {
+        const d = await this.jup.run(() => this.get('https://lite-api.jup.ag/tokens/v2/recent', 'jupiter', 8000, false));
+        const addrs = (Array.isArray(d) ? d : d?.tokens || []).map((x: any) => x.id || x.address).filter(Boolean).slice(0, 20);
+        if (addrs.length) {
+          const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${addrs.join(',')}`, 'dexscreener'));
+          for (const p of Array.isArray(pairs) ? pairs : []) {
+            scanned++;
+            const c = mapDs(p);
+            if (c && !out.has(c.mint)) out.set(c.mint, c);
+          }
+        }
+      } catch {}
+    }
     return { list: [...out.values()], scanned };
+  }
+
+  async pair(mint: string): Promise<Candidate | null> {
+    try {
+      const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mint}`, 'dexscreener'));
+      let best: any = null;
+      for (const p of Array.isArray(pairs) ? pairs : []) {
+        if (!best || num(p.liquidity?.usd) > num(best.liquidity?.usd)) best = p;
+      }
+      return best ? mapDs(best) : null;
+    } catch { return null; }
   }
 
   async security(mint: string): Promise<TokenSecurity | null> {

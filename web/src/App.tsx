@@ -3,7 +3,7 @@ import { useLive, api } from './api';
 import { Splash } from './components/Splash';
 import { ConnectSheet } from './components/ConnectSheet';
 import { Setup } from './components/Setup';
-import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, AgentsList, Decisions, Activity } from './components/Dashboard';
+import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, AgentsList, Decisions, Activity, LowBalanceBanner } from './components/Dashboard';
 import { TokenDetail } from './components/TokenDetail';
 import { Toasts, Confetti, Recap } from './components/Overlays';
 import { Account } from './components/Account';
@@ -48,6 +48,7 @@ export default function App() {
         {!online && <div className="offline mono tiny">reconnecting to engine…</div>}
         {tab === 'home' && <>
           <Header snap={snap} theme={theme} setTheme={setTheme} onRecap={() => setRecap(true)} />
+          <LowBalanceBanner snap={snap} />
           <Ticker items={snap.ticker} onOpen={open} />
           <Balance snap={snap} />
           <EquityCard snap={snap} />

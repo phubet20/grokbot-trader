@@ -1,6 +1,6 @@
 // LIVE mode only: asks Phantom to sign + send the swap that the server built.
 import { api } from '../api';
-import { getPhantom, phantomBrowseUrl } from './ConnectSheet';
+import { getPhantom, phantomBrowseUrl } from '../phantom';
 import { PhantomIcon } from './Icons';
 
 export function Approvals({ items, setItems }: { items: any[]; setItems: (f: (a: any[]) => any[]) => void }) {

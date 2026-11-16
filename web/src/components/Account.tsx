@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api, usd, short } from '../api';
+import { BotWalletPanel } from './BotWallet';
 
 const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of portfolio)', 1, 50, 1],
@@ -30,11 +31,13 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
         <div className="kv mono small"><span className="muted">SOL price</span><span>{usd(snap.stats.solPrice)}</span></div>
         <div className="kv mono small"><span className="muted">data</span><span>{snap.dataSource} · api errors {snap.apiErrors}</span></div>
         <p className="note">{snap.modeReason}</p>
+        {snap.lowBalance && <p className="note neg" data-testid="low-balance">{snap.lowBalance}</p>}
         <div className="btn-row">
-          <button className="pill-btn small-btn" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Pause bot' : 'Resume bot'}</button>
+          <button className="pill-btn small-btn" data-testid="bot-toggle" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Stop bot' : 'Start bot'}</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
         </div>
       </div>
+      {snap.mode === 'live-auto' && <div className="section card"><BotWalletPanel snap={snap} /></div>}
       <div className="section card">
         <div className="sec-hd"><b>Risk & strategy</b><span className="pos small">{msg}</span></div>
         {FIELDS.map(([k, label, min, max, step]) => (
@@ -45,7 +48,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
       </div>
       <div className="section card">
         <div className="sec-hd"><b>Go live (later)</b></div>
-        <p className="small muted">Real trading is locked. It can only be enabled by the owner editing <code>data/config.json</code> (<code>"mode": "live"</code> + the exact confirmation phrase in <code>"liveConfirm"</code>) and restarting. Every live swap must then be approved in Phantom.</p>
+        <p className="small muted">{snap.mode === 'live-auto' ? 'LIVE AUTO is on: the bot wallet signs swaps. Withdrawals go only to the locked Phantom address. The app never shows or asks for a private key.' : snap.mode === 'live' ? 'LIVE (Phantom): every swap still needs your approval in Phantom. No private keys are stored.' : 'Real trading is locked unless the owner sets MODE=live or MODE=live-auto plus LIVE_CONFIRM and restarts.'}</p>
       </div>
       {snap.mode !== 'live' && <div className="section card">
         <div className="btn-row">

@@ -9,12 +9,13 @@ import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts'
 import { Store } from './store.ts';
 import { preCheck, securityCheck } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
-import { positionSizeUsd, entryBlocked, evaluateExit, activeStop, FEE_RESERVE_SOL, fmtPct } from './risk.ts';
-import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, ATA_RENT_SOL } from './executor.ts';
+import { positionSizeUsd, entryBlocked, evaluateExit, activeStop, reserveSol, fmtPct, momentumEntryOk, momentumFade, adaptFilters, lowBalanceReason } from './risk.ts';
+import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
+import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 
 export type Wallet = {
   connected: boolean;
-  type: 'paper' | 'phantom';
+  type: 'paper' | 'phantom' | 'bot';
   address: string;
   realSol: number | null;      // read-only on-chain balance of a connected Phantom wallet
   solBalance: number;          // trading cash (SOL) - simulated in paper mode
@@ -56,6 +57,8 @@ export class Engine extends EventEmitter {
   private scanning = false;
   private monitoring = false;
   private scanHistory: { t: number; n: number }[] = [];
+  private lastPairAt = 0;
+  private lossPauseUntil = 0;
   lastEquity = 0;
 
   constructor(cfg: Config, m: MarketSource, store: Store) {
@@ -70,10 +73,17 @@ export class Engine extends EventEmitter {
     if (saved) for (const k of Object.keys(this.agents) as (keyof typeof this.agents)[]) Object.assign(this.agents[k], saved[k] || {});
   }
 
-  get mode() { return liveGate(this.cfg).live ? 'live' : 'paper'; }
+  get mode(): 'paper' | 'live' | 'live-auto' {
+    const g = liveGate(this.cfg);
+    if (!g.live) return 'paper';
+    return g.auto ? 'live-auto' : 'live';
+  }
+
 
   async start() {
     await this.refreshSol();
+    if (this.mode === 'live-auto') await this.syncBotBalance();
+    this.lossPauseUntil = this.store.get('lossPauseUntil', 0);
     const loop = (fn: () => Promise<void>, sec: () => number) => {
       const tick = async () => { try { await fn(); } catch (e: any) { this.log('Core', 'info', `error: ${e?.message || e}`); } this.timers.push(setTimeout(tick, sec() * 1000)); };
       tick();
@@ -88,14 +98,32 @@ export class Engine extends EventEmitter {
   async connect(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number }) {
     await this.refreshSol();
     if (!this.solPrice) throw new Error('SOL price unavailable - check internet / use DATA_SOURCE=replay');
-    const startUsd = Math.max(10, Number(opts.startUsd) || this.cfg.startUsd);
+    const startUsd = Math.max(2, Number(opts.startUsd) || this.cfg.startUsd);
     let realSol: number | null = null;
     if (opts.type === 'phantom') {
       if (!opts.address || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(opts.address)) throw new Error('invalid wallet address');
       realSol = await getSolBalance(this.cfg.rpcUrl, opts.address);
     }
-    const live = this.mode === 'live' && opts.type === 'phantom';
-    const solBalance = live ? (realSol ?? 0) : startUsd / this.solPrice;
+    const auto = this.mode === 'live-auto';
+    const livePhantom = this.mode === 'live' && opts.type === 'phantom';
+    if (auto && hasBotWallet()) {
+      const pub = botPublicKey()!;
+      const onchain = await getSolBalance(this.cfg.rpcUrl, pub);
+      this.wallet = {
+        ...this.wallet,
+        connected: true, type: 'bot', address: pub, realSol: onchain,
+        solBalance: onchain ?? 0,
+        depositUsd: (onchain ?? 0) * this.solPrice || this.wallet.depositUsd,
+        startedAt: this.wallet.startedAt || Date.now(),
+        running: true,
+      };
+      if (!this.wallet.dayKey) { this.wallet.dayKey = dayKey(); this.wallet.dayStartEquity = this.equity(); this.store.addEquity(Date.now(), this.equity()); }
+      this.saveWallet();
+      this.log('Core', 'info', `Bot wallet ready · LIVE AUTO · $${this.equity().toFixed(2)}`);
+      this.emitState();
+      return this.wallet;
+    }
+    const solBalance = livePhantom ? (realSol ?? 0) : startUsd / this.solPrice;
     const fresh = !this.wallet.connected || this.wallet.depositUsd === 0;
     this.wallet = {
       ...this.wallet,
@@ -114,7 +142,7 @@ export class Engine extends EventEmitter {
   /** Read-only preview used by the Connect sheet before connecting. */
   async preview(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number }) {
     await this.refreshSol();
-    const startUsd = Math.max(10, Number(opts.startUsd) || this.cfg.startUsd);
+    const startUsd = Math.max(2, Number(opts.startUsd) || this.cfg.startUsd);
     let realSol: number | null = null;
     if (opts.type === 'phantom' && opts.address) realSol = await getSolBalance(this.cfg.rpcUrl, opts.address);
     const useReal = this.mode === 'live' && opts.type === 'phantom';
@@ -140,6 +168,18 @@ export class Engine extends EventEmitter {
   private async refreshSol() {
     const p = await this.m.prices([SOL_MINT]);
     if (p[SOL_MINT]) this.solPrice = p[SOL_MINT];
+  }
+  private async syncBotBalance() {
+    const pub = botPublicKey();
+    if (!pub || !this.solPrice) return;
+    const b = await getSolBalance(this.cfg.rpcUrl, pub);
+    if (b !== null) { this.wallet.realSol = b; this.wallet.solBalance = b; if (!this.wallet.address) this.wallet.address = pub; this.wallet.type = 'bot'; }
+  }
+  private recentPnls(): number[] {
+    return this.store.trades(40).slice().reverse().map((t: any) => t.pnlUsd);
+  }
+  private riskAdapted() {
+    return adaptFilters({ minScore: this.cfg.minScore, trailingStopPct: this.cfg.trailingStopPct, hardStopPct: this.cfg.hardStopPct }, this.recentPnls());
   }
 
   // ---------------------------------------------------------------- SCANNER
@@ -182,18 +222,25 @@ export class Engine extends EventEmitter {
 
       if (!this.wallet.connected || !this.wallet.running) return;
       this.rollDay();
+      if (this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length >= this.cfg.maxPositions) {
+        this.agents.risk.label = 'holding — one at a time';
+        return;
+      }
+      const adapted = this.riskAdapted();
       let checks = 0;
       for (const { c, s } of scored) {
-        if (s.score < this.cfg.minScore) break;
-        if (checks >= 4) break;
+        if (s.score < adapted.minScore) continue;
+        if (!momentumEntryOk(c)) continue;
+        if (checks >= 3) break;
         const blocked = entryBlocked(this.cfg, {
           openPositions: this.positions.length + [...this.pending.values()].filter((p) => p.side === 'buy').length,
           dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
           alreadyHolding: this.positions.some((p) => p.mint === c.mint) || [...this.pending.values()].some((p) => p.mint === c.mint),
           inCooldown: (this.cooldown[c.mint] || 0) > now,
+          pausedUntil: this.lossPauseUntil, now,
         });
         if (blocked) {
-          if (blocked.startsWith('max') || blocked.startsWith('daily')) { this.agents.risk.label = blocked; break; }
+          if (blocked.startsWith('max') || blocked.startsWith('daily') || blocked.startsWith('cooldown after consecutive')) { this.agents.risk.label = blocked; break; }
           continue;
         }
         checks++;
@@ -205,12 +252,22 @@ export class Engine extends EventEmitter {
         if (!sr.ok) {
           this.agents.safety.rejected++;
           this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `safety: ${sr.reasons.slice(0, 2).join(', ')}` });
-          this.cooldown[c.mint] = Date.now() + 30 * 60_000;
+          this.cooldown[c.mint] = Date.now() + 20 * 60_000;
+          continue;
+        }
+        const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
+        const trialSize = positionSizeUsd(this.cfg, this.equity(), this.cashUsd(), reserveUsd, adapted.sizeMult);
+        if (!trialSize) { this.agents.risk.label = lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) || 'not enough free cash'; break; }
+        const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
+        if (!okSell) {
+          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'safety: Jupiter reverse quote failed (not sellable)' });
+          this.cooldown[c.mint] = Date.now() + 15 * 60_000;
           continue;
         }
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
         await this.openPosition(c, s.score, `score ${s.score} · bull ${s.bull}/bear ${s.bear}`);
+        break; // one position at a time
       }
       this.store.set('cooldown', this.cooldown);
     } finally {
@@ -225,10 +282,14 @@ export class Engine extends EventEmitter {
     await this.refreshSol();
     if (!this.solPrice) return;
     const eq = this.equity();
-    const reserveUsd = (FEE_RESERVE_SOL + ATA_RENT_SOL) * this.solPrice;
-    const size = positionSizeUsd(this.cfg, eq, this.cashUsd(), reserveUsd);
+    const adapted = this.riskAdapted();
+    const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
+    const low = lowBalanceReason(eq, this.cashUsd(), reserveUsd, this.cfg.minTradeUsd);
+    if (low) { this.agents.risk.label = low; return; }
+    const size = positionSizeUsd(this.cfg, eq, this.cashUsd(), reserveUsd, adapted.sizeMult);
     if (!size) { this.agents.risk.label = 'not enough free cash'; return; }
     const solAmt = size / this.solPrice;
+    if (this.mode === 'live-auto') return this.execLiveAuto('buy', c, { solAmt, score, why });
     if (this.mode === 'live') return this.requestLive('buy', c, { solAmt, score, why });
 
     const f = await this.exec.buy(c.mint, solAmt, this.solPrice);
@@ -258,11 +319,24 @@ export class Engine extends EventEmitter {
       const prices = await this.m.prices([SOL_MINT, ...this.positions.map((p) => p.mint)]);
       if (prices[SOL_MINT]) this.solPrice = prices[SOL_MINT];
       const now = Date.now();
+      const adapted = this.riskAdapted();
+      const riskP = { ...this.cfg, hardStopPct: adapted.hardStopPct, trailingStopPct: adapted.trailingStopPct };
+      if (this.positions.length && now - this.lastPairAt > 3000) {
+        this.lastPairAt = now;
+        for (const p of this.positions) {
+          const fresh = await this.m.pair(p.mint).catch(() => null);
+          if (fresh) {
+            this.candidates.set(p.mint, { ...this.candidates.get(p.mint), ...fresh, seenAt: now } as any);
+            const fade = momentumFade(fresh, p.peakPrice, p.lastPrice || fresh.priceUsd);
+            if (fade.exit) { await this.closePosition(p, 'momentum_fade', fade.reason); continue; }
+          }
+        }
+      }
       for (const p of [...this.positions]) {
         const px = prices[p.mint];
         if (!px) continue;
         p.lastPrice = px;
-        const d = evaluateExit(this.cfg, p, px, now);
+        const d = evaluateExit(riskP, p, px, now);
         p.peakPrice = d.peak;
         if (d.exit) await this.closePosition(p, d.kind!, d.reason);
       }
@@ -275,9 +349,12 @@ export class Engine extends EventEmitter {
         this.store.addEquity(now, eq);
         this.emit('equity', { ts: now, usd: eq });
       }
-      if (this.mode === 'live' && this.wallet.type === 'phantom' && now % 60_000 < this.cfg.monitorIntervalSec * 1000) {
-        const b = await getSolBalance(this.cfg.rpcUrl, this.wallet.address);
-        if (b !== null) { this.wallet.realSol = b; this.wallet.solBalance = b; }
+      if (((this.mode === 'live' && this.wallet.type === 'phantom') || this.mode === 'live-auto') && now % 20_000 < this.cfg.monitorIntervalSec * 1000) {
+        if (this.mode === 'live-auto') await this.syncBotBalance();
+        else {
+          const b = await getSolBalance(this.cfg.rpcUrl, this.wallet.address);
+          if (b !== null) { this.wallet.realSol = b; this.wallet.solBalance = b; }
+        }
       }
       this.persist();
       this.emit('positions', this.positionsView());
@@ -285,6 +362,7 @@ export class Engine extends EventEmitter {
   }
 
   async closePosition(p: Position, kind: string, reason: string) {
+    if (this.mode === 'live-auto') return this.execLiveAuto('sell', p as any, { position: p, kind, reason });
     if (this.mode === 'live') return this.requestLive('sell', p as any, { position: p, kind, reason });
     const f = await this.exec.sell(p.mint, p.qty, p.decimals, this.solPrice);
     let solBack: number, fillPrice: number, note = '';
@@ -302,7 +380,7 @@ export class Engine extends EventEmitter {
   private finishClose(p: Position, exitPrice: number, proceedsUsd: number, kind: string, reason: string) {
     this.positions = this.positions.filter((x) => x.id !== p.id);
     const pnlUsd = proceedsUsd - p.costUsd;
-    const t: ClosedTrade = { ...p, closedAt: Date.now(), exitPrice, proceedsUsd, pnlUsd, pnlPct: (pnlUsd / p.costUsd) * 100, reason };
+    const t: ClosedTrade = { ...p, closedAt: Date.now(), exitPrice, proceedsUsd, pnlUsd, pnlPct: (pnlUsd / p.costUsd) * 100, reason, kind, heldSec: (Date.now() - p.openedAt) / 1000 } as ClosedTrade;
     this.store.addTrade(t);
     this.cooldown[p.mint] = Date.now() + this.cfg.cooldownMin * 60_000;
     this.agents.risk.exits++; this.agents.executor.fills++; this.agents.executor.last = `SELL ${p.symbol}`;
@@ -311,7 +389,15 @@ export class Engine extends EventEmitter {
     this.decision({ ts: Date.now(), side: 'SELL', symbol: p.symbol, image: p.image, text: `${reason} · ${pnlUsd >= 0 ? '+' : '-'}$${Math.abs(pnlUsd).toFixed(2)} via Jupiter`, usd: pnlUsd });
     this.log('Risk', stopped ? 'stop' : 'sell', `${stopped ? 'Stopped' : 'Sold'} ${p.symbol}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: pnlUsd, pct: t.pnlPct, text2: reason } as any);
     if (pnlUsd > 0) this.emit('toast', { kind: 'profit', title: `Risk sold ${p.symbol} - locked the gain`, usd: pnlUsd, pct: t.pnlPct, symbol: p.symbol, image: p.image });
+    const adapted = this.riskAdapted();
+    if (pnlUsd < 0 && adapted.pauseMs) {
+      this.lossPauseUntil = Date.now() + adapted.pauseMs;
+      this.store.set('lossPauseUntil', this.lossPauseUntil);
+      this.log('Risk', 'info', `consecutive losses — pausing new entries ${Math.round(adapted.pauseMs / 60000)}m`);
+    }
     this.emitState();
+    // Rotate immediately into the next candidate once the slot is free.
+    if (this.wallet.running) setTimeout(() => { this.scan().catch(() => {}); }, 80);
   }
 
   // ---------------------------------------------------------------- LIVE (Phantom approval) path
@@ -353,6 +439,68 @@ export class Engine extends EventEmitter {
   }
   liveRejected(id: string) { const p = this.pending.get(id); this.pending.delete(id); if (p) this.log('Core', 'info', `you rejected the ${p.side} in Phantom`); }
 
+  private async sellable(mint: string, solAmt: number): Promise<boolean> {
+    const lamports = BigInt(Math.max(1, Math.floor(solAmt * 1e9)));
+    const buy = await this.m.quote(SOL_MINT, mint, lamports, this.cfg.slippageBps);
+    if (!buy?.outAmount) return false;
+    const sell = await this.m.quote(mint, SOL_MINT, BigInt(Math.floor(buy.outAmount)), this.cfg.slippageBps);
+    if (!sell?.outAmount) return false;
+    return sell.outAmount >= Number(lamports) * 0.85;
+  }
+
+  /** LIVE AUTO: bot wallet signs and sends. Never logs the secret. */
+  private async execLiveAuto(side: 'buy' | 'sell', c: any, meta: any) {
+    if (!hasBotWallet()) { this.log('Core', 'info', 'live-auto needs BOT_WALLET_SECRET'); return; }
+    const pub = botPublicKey()!;
+    try {
+      const args = side === 'buy'
+        ? { inputMint: SOL_MINT, outputMint: c.mint, amountRaw: BigInt(Math.floor(meta.solAmt * 1e9)), userPublicKey: pub }
+        : { inputMint: c.mint, outputMint: SOL_MINT, amountRaw: BigInt(Math.floor(meta.position.qty * 10 ** meta.position.decimals)), userPublicKey: pub, closeOutputAta: true };
+      if (side === 'sell' && [...this.pending.values()].some((x) => x.mint === c.mint && x.side === 'sell')) return;
+      const built = await buildLiveSwapTx(this.cfg, this.m, args);
+      // Prompt-equivalent: the swap is sent immediately; toast the user in the UI.
+      this.emit('toast', { kind: 'fill', title: side === 'buy' ? `Sending buy ${c.symbol}` : `Sending sell ${c.symbol}`, text: 'bot wallet signing · real funds', symbol: c.symbol });
+      const signature = await signAndSendSwap(this.cfg.rpcUrl, built.swapTransaction);
+      const decimals = await this.m.decimals(c.mint);
+      const id = randomUUID();
+      this.pending.set(id, { id, side, mint: c.mint, createdAt: Date.now(), tx: built.swapTransaction, meta: { ...meta, candidate: side === 'buy' ? c : undefined, outAmount: built.quote.outAmount, decimals }, signature });
+      await this.liveSigned(id, signature);
+      this.log('Executor', 'info', `live-auto ${side} ${c.symbol} confirmed`);
+    } catch (e: any) { this.log('Executor', 'info', `live-auto ${side} not sent: ${e.message}`); }
+  }
+
+  lockedWithdrawTo(): string | null {
+    const env = (process.env.WITHDRAW_TO || '').trim();
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(env)) return env;
+    const stored = this.store.get<string>('withdrawTo', '');
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(stored) ? stored : null;
+  }
+  withdrawLockedBy(): 'env' | 'signature' | null {
+    const env = (process.env.WITHDRAW_TO || '').trim();
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(env)) return 'env';
+    return this.lockedWithdrawTo() ? 'signature' : null;
+  }
+  lockWithdraw(address: string, message: string, signature: string) {
+    if (this.lockedWithdrawTo()) throw new Error('withdraw address is already locked and cannot be changed in the app');
+    if (!verifyWithdrawLock(address, message, signature)) throw new Error('invalid Phantom signature — withdraw address not locked');
+    if (address === botPublicKey()) throw new Error('cannot lock withdrawals to the bot wallet');
+    this.store.set('withdrawTo', address);
+    this.log('Core', 'info', `withdraw address locked to ${address.slice(0, 4)}…${address.slice(-4)}`);
+    this.emitState();
+    return { ok: true, withdrawTo: address };
+  }
+  async withdraw() {
+    const to = this.lockedWithdrawTo();
+    if (!to) throw new Error('lock a withdraw address first (connect Phantom once and sign) or set WITHDRAW_TO');
+    if (this.positions.length) throw new Error('close open positions and pause the bot before withdrawing');
+    if (this.pending.size) throw new Error('a swap is still pending');
+    const r = await withdrawToLocked(this.cfg.rpcUrl, to);
+    await this.syncBotBalance();
+    this.log('Core', 'info', `withdrew ${(r.lamports / 1e9).toFixed(4)} SOL to locked address (closed ${r.closedAccounts} empty token accounts)`);
+    this.emitState();
+    return { ok: true, signature: r.signature, sol: r.lamports / 1e9, closedAccounts: r.closedAccounts, to };
+  }
+
   // ---------------------------------------------------------------- views
   private rollDay() {
     const k = dayKey();
@@ -381,15 +529,29 @@ export class Engine extends EventEmitter {
   }
   snapshot() {
     const gate = liveGate(this.cfg);
-    const ticker = [...this.candidates.values()].filter((c) => c.liquidityUsd > 10000).sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 12)
+    const ticker = [...this.candidates.values()].filter((c) => c.liquidityUsd > 5000).sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 12)
       .map((c) => ({ symbol: c.symbol, mint: c.mint, image: c.image, change: c.change.h1 }));
+    const reserve = reserveSol(this.cfg.priorityFeeSol);
+    const reserveUsd = reserve * (this.solPrice || 0);
+    const low = this.wallet.connected ? lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd) : null;
+    const adapted = this.riskAdapted();
+    const botPub = botPublicKey();
     return {
-      appName: this.cfg.appName, mode: this.mode, modeReason: gate.reason, dataSource: this.m.name,
+      appName: this.cfg.appName, mode: this.mode, modeReason: gate.reason, dataSource: this.m.name, auto: !!gate.auto,
       wallet: { ...this.wallet }, stats: this.stats(), positions: this.positionsView(), agents: this.agents,
       activity: this.store.activity(60), decisions: this.store.decisions(40), ticker,
       calls: { ...this.m.calls }, apiErrors: this.m.errors, lastApiError: this.m.lastError,
       config: { ...this.cfg, liveConfirm: undefined },
       pending: [...this.pending.values()].map((p) => ({ id: p.id, side: p.side, mint: p.mint, tx: p.tx, signature: p.signature })),
+      lowBalance: low, reserveSol: reserve, reserveUsd, spendableUsd: Math.max(0, this.cashUsd() - reserveUsd),
+      sizeMult: adapted.sizeMult, pauseUntil: this.lossPauseUntil,
+      botWallet: botPub ? {
+        publicKey: botPub,
+        withdrawTo: this.lockedWithdrawTo(),
+        withdrawLocked: !!this.lockedWithdrawTo(),
+        lockedBy: this.withdrawLockedBy(),
+        lockMessage: this.lockedWithdrawTo() ? '' : LOCK_MESSAGE('YOUR_PHANTOM_ADDRESS'),
+      } : null,
     };
   }
   equitySeries(range: string) {

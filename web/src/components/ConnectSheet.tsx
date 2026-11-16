@@ -1,15 +1,10 @@
 import { useEffect, useState } from 'react';
 import { api, usd, short } from '../api';
 import { BotIcon, PhantomIcon, CheckI, XI } from './Icons';
+import { BotWalletPanel } from './BotWallet';
 
-declare global { interface Window { phantom?: any; solana?: any } }
-export const getPhantom = () => (typeof window !== 'undefined' ? window.phantom?.solana || (window.solana?.isPhantom ? window.solana : null) : null);
-
-/** Phantom universal link that opens the current app URL in Phantom's in-app browser. */
-export function phantomBrowseUrl(href = typeof window !== 'undefined' ? window.location.href : '', origin = typeof window !== 'undefined' ? window.location.origin : '') {
-  return `https://phantom.app/ul/browse/${encodeURIComponent(href)}?ref=${encodeURIComponent(origin)}`;
-}
-
+export { getPhantom, phantomBrowseUrl } from '../phantom';
+import { getPhantom, phantomBrowseUrl } from '../phantom';
 function LinkDots({ state }: { state: 'idle' | 'busy' | 'done' }) {
   if (state === 'idle') return <span className="sheet-dot" />;
   if (state === 'done') return <span className="sheet-link done" aria-hidden>——</span>;
@@ -22,10 +17,11 @@ function LinkDots({ state }: { state: 'idle' | 'busy' | 'done' }) {
 
 export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void }) {
   const phantom = getPhantom();
-  const isLive = snap?.mode === 'live';
-  const needPhantomApp = isLive && !phantom;
+  const isAuto = snap?.mode === 'live-auto';
+  const isLive = snap?.mode === 'live' || isAuto;
+  const needPhantomApp = snap?.mode === 'live' && !phantom;
   const [address, setAddress] = useState<string>(snap?.wallet?.address || '');
-  const startUsd = snap?.config?.startUsd || 81;
+  const [startUsd, setStartUsd] = useState<number>(Math.max(2, snap?.config?.startUsd || 81));
   const [pv, setPv] = useState<any>(null);
   const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
   const [ready, setReady] = useState(false);
@@ -46,14 +42,15 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
     const started = Date.now();
     try {
       let addr = address;
-      if (isLive) {
+      if (isAuto) {
+        await api('wallet/connect', { type: 'bot' });
+      } else if (isLive) {
         if (!phantom) throw new Error('Phantom not detected — tap Open in Phantom, or install the Phantom extension');
         const r = await phantom.connect();
         addr = r.publicKey.toString(); setAddress(addr);
         await api('wallet/connect', { type: 'phantom', address: addr });
       } else {
-        // Paper / test mode: simulated Phantom connect, no real wallet is touched.
-        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd });
+        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd: Math.max(2, startUsd) });
       }
       const wait = 900 - (Date.now() - started);
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
@@ -63,7 +60,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   }
 
   const shownAddr = address || pv?.address || '';
-  const btnLabel = ready ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? 'Approving…' : 'Connect';
+  const btnLabel = ready ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? (isAuto ? 'Starting…' : 'Approving…') : (isAuto ? 'Start bot' : 'Connect');
   const btnTestId = ready ? 'start' : 'connect';
   const bal = pv
     ? (isLive ? (pv.address || address ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : 'open Phantom to read balance') : `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL`)
@@ -74,14 +71,20 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
       <div className="sheet">
         <div className="grabber" />
         <div className="sheet-icons"><BotIcon size={46} /><LinkDots state={state} /><PhantomIcon size={46} /></div>
-        <h2>Connect Phantom</h2>
-        <p className="muted">{snap?.appName || 'Grok Bot'} wants to connect to your wallet</p>
+        <h2>{isAuto ? 'Bot wallet' : 'Connect Phantom'}</h2>
+        <p className="muted">{isAuto ? 'Deposit SOL, lock your withdraw address, then start.' : `${snap?.appName || 'Grok Bot'} wants to connect to your wallet`}</p>
+        {isAuto ? <BotWalletPanel snap={snap} compact /> : <>
         <div className="kv-box mono">
           <div><span className="muted">network</span><span>Solana</span></div>
           <div><span className="muted">wallet</span><span>Phantom{shownAddr ? ' · ' + short(shownAddr) : ''}</span></div>
           <div><span className="muted">balance</span><span>{bal}</span></div>
           <div><span className="muted">mode</span><span className={isLive ? 'neg' : 'warn'}>{isLive ? 'LIVE · real funds' : 'TEST · simulated fills'}</span></div>
         </div>
+        {!isLive && (
+          <label className="start-usd mono"><span className="muted">test balance (min $2)</span>
+            <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => setStartUsd(Math.max(2, Number(e.target.value) || 2))} /></span>
+          </label>
+        )}
         {needPhantomApp && (
           <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Connect. Never enter a seed phrase here.</p>
         )}
@@ -90,6 +93,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
           <li><CheckI size={15} /> request approval for transactions</li>
           <li className="x"><XI size={15} /> can&apos;t move funds without your approval</li>
         </ul>
+        </>}
         {err && <p className="err">{err}</p>}
         <div className="sheet-actions">
           {needPhantomApp && !ready && (

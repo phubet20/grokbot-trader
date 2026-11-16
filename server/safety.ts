@@ -17,7 +17,10 @@ export function preCheck(c: Candidate, cfg: Config, now = Date.now()): SafetyRes
   if (ageMin > cfg.maxAgeHours * 60) r.push(`age > ${cfg.maxAgeHours}h`);
   // honeypot-ish: lots of buys, (almost) no sells
   if (c.txns.h1b >= 30 && c.txns.h1s <= Math.max(1, c.txns.h1b * 0.05)) r.push('honeypot? buys but no sells');
-  if (c.txns.h1b + c.txns.h1s < 40) r.push('too few trades 1h');
+  else if (c.txns.m5b >= 20 && c.txns.m5s <= Math.max(1, c.txns.m5b * 0.05)) r.push('honeypot? buys but no sells');
+  const tx1h = c.txns.h1b + c.txns.h1s, tx5 = c.txns.m5b + c.txns.m5s;
+  if (ageMin < 60) { if (tx5 < 6 && tx1h < 12) r.push('too few trades (new pool)'); }
+  else if (tx1h < 15) r.push('too few trades 1h');
   // liquidity vs mcap - extremely thin pools are easy to rug / impossible to exit
   if (c.mcapUsd > 0 && c.liquidityUsd / c.mcapUsd < 0.03) r.push('liq/mcap < 3%');
   // wash-trading heuristic: huge volume relative to liquidity with few traders

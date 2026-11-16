@@ -112,6 +112,11 @@ export class ReplayMarket implements MarketSource {
     return { inAmount: amt, outAmount: Math.floor(sol * 1e9), priceImpactPct: impact, route: 'Replay AMM' };
   }
 
+  async pair(mint: string) {
+    const { list } = await this.candidates();
+    return list.find((c) => c.mint === mint) || null;
+  }
+
   async ohlcv(pool: string, tf: string): Promise<Candle[]> {
     const s = this.sims.find((x) => x.pool === pool); if (!s) return [];
     const agg = ({ '1m': 1, '5m': 5, '15m': 15, '1h': 60 } as Record<string, number>)[tf] || 1;
