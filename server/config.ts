@@ -51,19 +51,19 @@ export const DEFAULTS: Config = {
   positionPct: 8,
   minTradeUsd: 0.25,
   maxPositions: 10,
-  hardStopPct: 3,
-  trailingStopPct: 5,
-  maxHoldMin: 12,
+  hardStopPct: 35,
+  trailingStopPct: 60,
+  maxHoldMin: 0,
   dailyLossLimitPct: 15,
-  cooldownMin: 3,
+  cooldownMin: 0.25,
   minScore: 48,
-  minLiquidityUsd: 12000,
-  maxLiquidityUsd: 5_000_000,
+  minLiquidityUsd: 800,
+  maxLiquidityUsd: 50_000_000,
   minHolders: 40,
-  minAgeMin: 3,
-  maxAgeHours: 48,
-  minMcapUsd: 8_000,
-  maxMcapUsd: 50_000_000,
+  minAgeMin: 0,
+  maxAgeHours: 336,
+  minMcapUsd: 1_000,
+  maxMcapUsd: 500_000_000,
   maxTopHolderPct: 25,
   slippageBps: 400,
   extraSlippageBps: 50,
@@ -102,8 +102,8 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   if (out.startUsd !== undefined) out.startUsd = Math.max(2, out.startUsd);
   if (out.positionPct !== undefined) out.positionPct = Math.min(100, Math.max(1, out.positionPct));
   if (out.maxPositions !== undefined) out.maxPositions = Math.min(20, Math.max(1, Math.round(out.maxPositions)));
-  if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(50, Math.max(1, out.hardStopPct));
-  if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(60, Math.max(2, out.trailingStopPct));
+  if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(80, Math.max(1, out.hardStopPct));
+  if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(80, Math.max(2, out.trailingStopPct));
   if (out.mode !== undefined && out.mode !== 'live' && out.mode !== 'live-auto') out.mode = 'paper';
   if (out.dataSource !== undefined && out.dataSource !== 'replay') out.dataSource = 'live';
   return out;

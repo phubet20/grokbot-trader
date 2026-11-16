@@ -223,3 +223,19 @@ code { font-family: var(--mono); font-size: 12px; background: var(--chip); paddi
 .notify-box .hint { margin-top: 8px; }
 .deposit-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
 .deposit-row input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); }
+
+.autotune { margin: 10px 12px 16px; }
+.autotune-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.autotune-metrics { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 8px; }
+.autotune-metrics b { color: var(--text); }
+.tune-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.tune-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 4px 6px 0; }
+.tune-table td { padding: 5px 6px 5px 0; border-top: 1px solid var(--line); }
+.tune-table td.num, .tune-table th.num { text-align: right; }
+.tune-pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 10px; }
+.tune-pill.on { background: color-mix(in srgb, var(--green, #10b981) 18%, transparent); color: var(--green, #10b981); }
+.tune-pill.off { background: color-mix(in srgb, var(--red, #ef4444) 16%, transparent); color: var(--red, #ef4444); }
+.tune-pill.learn { background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+.tune-pill.ex { background: color-mix(in srgb, var(--amber, #f59e0b) 18%, transparent); color: var(--amber, #f59e0b); }
+.bar-w { display: inline-block; width: 48px; height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+.bar-w i { display: block; height: 100%; background: var(--text); border-radius: 99px; }

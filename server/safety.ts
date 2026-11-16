@@ -14,19 +14,14 @@ export function preCheck(c: Candidate, cfg: Config, now = Date.now()): SafetyRes
   const ageMin = (now - c.createdAt) / 60_000;
   const pump = isPumpCurve(c);
   if (!['SOL', 'WSOL', 'USDC', 'USDT'].includes((c.quoteSymbol || 'SOL').toUpperCase())) r.push(`quote ${c.quoteSymbol}`);
-  if (pump) {
-    // Bonding-curve tokens start thin; require a modest virtual-liq floor, not the AMM $12k cut.
-    if (c.liquidityUsd < 400 && (c.flow?.netBuySol || 0) <= 0 && (c.volume.m5 || 0) <= 0) r.push('curve liq/flow too thin');
-  } else {
-    if (c.liquidityUsd < cfg.minLiquidityUsd) r.push(`liq $${k(c.liquidityUsd)} < $${k(cfg.minLiquidityUsd)}`);
-    if (ageMin < cfg.minAgeMin) r.push(`age ${ageMin.toFixed(0)}m < ${cfg.minAgeMin}m`);
-    if (c.mcapUsd && c.mcapUsd < cfg.minMcapUsd) r.push(`mcap $${k(c.mcapUsd)} too small`);
-    if (c.mcapUsd > 0 && c.liquidityUsd / c.mcapUsd < 0.03) r.push('liq/mcap < 3%');
-    const tx1h = c.txns.h1b + c.txns.h1s, tx5 = c.txns.m5b + c.txns.m5s;
-    if (ageMin < 60) { if (tx5 < 6 && tx1h < 12) r.push('too few trades (new pool)'); }
-    else if (tx1h < 15) r.push('too few trades 1h');
-    if (c.volume.h1 > c.liquidityUsd * 8 && c.traders1h < 80) r.push('wash-trade pattern');
-  }
+  const floor = Math.min(400, cfg.minLiquidityUsd || 400);
+  // Scan pump.fun (curve + PumpSwap), Raydium, and Meteora — small and large caps.
+  // Only reject dust with no flow; age/mcap/liq-ratio cuts were dropping fresh launches and dips.
+  if (c.liquidityUsd < floor && (c.flow?.netBuySol || 0) <= 0 && (c.volume.m5 || 0) <= 0)
+    r.push(pump ? 'curve liq/flow too thin' : `liq $${k(c.liquidityUsd)} < $${k(floor)}`);
+  const tx1h = c.txns.h1b + c.txns.h1s, tx5 = c.txns.m5b + c.txns.m5s;
+  if (!pump && ageMin > 30 && tx5 === 0 && tx1h === 0) r.push('no trades');
+  if (!pump && c.volume.h1 > c.liquidityUsd * 12 && c.traders1h < 30 && c.liquidityUsd > 0) r.push('wash-trade pattern');
   if (c.liquidityUsd > cfg.maxLiquidityUsd) r.push('liq too large (not a meme play)');
   if (c.mcapUsd > cfg.maxMcapUsd) r.push(`mcap $${k(c.mcapUsd)} too large`);
   if (ageMin > cfg.maxAgeHours * 60) r.push(`age > ${cfg.maxAgeHours}h`);

@@ -98,7 +98,7 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
           <div className="muted tiny">score /100 · buy ≥ {snap.config.minScore}</div></div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ec4899' }}>⚖️</span><div><b>Risk</b><div className="muted tiny">{a.risk.status}</div></div></div>
           {trailing ? <button className="mini-pos" onClick={() => onOpen(trailing.mint)}><TokenAvatar src={trailing.image} symbol={trailing.symbol} size={16} /> <span className="mono">${trailing.symbol}</span> <b className={trailing.pnlPct >= 0 ? 'pos' : 'neg'}>{pct(trailing.pnlPct)}</b></button> : <div className="muted tiny">no open risk</div>}
-          <div className="tiny mono">size {snap.config.positionPct}% · stop -{snap.config.hardStopPct}% · trail {snap.config.trailingStopPct}%</div>
+          <div className="tiny mono">size {snap.config.positionPct}% · catastrophic -{snap.config.hardStopPct}%</div>
           {a.risk.label && <div className="tiny muted">{a.risk.label}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#10b981' }}>⚡</span><div><b>Executor</b><div className="muted tiny">{pos.length} active trades</div></div></div>
           <div className="big-num">{pos.length}</div><div className="muted tiny">{a.executor.fills} fills · {snap.mode === 'live' ? 'Phantom' : 'paper'}</div>
@@ -146,7 +146,7 @@ export function AgentsList({ snap }: { snap: any }) {
     ['SCANNER', `${compact(a.scanner.perHour)}/h → $${a.scanner.top || '—'}`, 'ai-memecoin-bot', '#f59e0b'],
     ['SAFETY', `$${a.safety.lastSymbol || '—'} ${a.safety.last || 'waiting'}`, 'ai-memecoin-bot', '#ef4444'],
     ['ANALYST', `$${a.analyst.lastSymbol || '—'} bull ${a.analyst.bull}/bear ${a.analyst.bear}`, 'TradingAgents', '#8b5cf6'],
-    ['RISK', `size ${snap.config.positionPct}% · stop -${snap.config.hardStopPct}%`, 'TradingAgents', '#ec4899'],
+    ['RISK', `size ${snap.config.positionPct}% · catastrophic -${snap.config.hardStopPct}%`, 'TradingAgents', '#ec4899'],
     ['EXECUTOR', a.executor.last || 'idle', 'solana-agent-kit', '#10b981'],
   ];
   return (
@@ -206,5 +206,67 @@ export function ScanStatus({ snap }: { snap: any }) {
       <span>{cadence} cadence</span>
       {ka?.enabled && <span className="muted" title={ka.officialGuarantee ? 'guaranteed' : 'best-effort keepalive, not officially guaranteed'}>keep {ka.lastOkAt ? `${Math.round((now - ka.lastOkAt) / 60000)}m ago` : 'pending'}</span>}
     </div>
+  );
+}
+
+
+function fmtExp(n: number) {
+  if (!Number.isFinite(n)) return '—';
+  const s = (n * 100).toFixed(1);
+  return `${n >= 0 ? '+' : ''}${s}%`;
+}
+
+export function AutoTunePanel({ snap }: { snap: any }) {
+  const t = snap.autotune;
+  if (!t) return null;
+  const rows = t.patterns || [];
+  return (
+    <section className="card autotune" data-testid="autotune">
+      <div className="autotune-head">
+        <div className="card-title">Auto-tune</div>
+        <div className="mono tiny muted">{t.note}</div>
+      </div>
+      <div className="autotune-metrics mono tiny">
+        <span>equity score <b>{(t.equityScore || 0).toFixed(2)}</b></span>
+        <span>slope <b>{(t.slope || 0).toFixed(3)}</b></span>
+        <span>smooth <b>{Math.round((t.smoothness || 0) * 100)}%</b></span>
+        <span>exit sens <b>{(t.exitSensitivity || 1).toFixed(2)}</b></span>
+        <span>closes <b>{t.trades || 0}</b></span>
+      </div>
+      {rows.length === 0 ? (
+        <div className="mono tiny muted">No closed paper trades yet — patterns will appear here after the first exits.</div>
+      ) : (
+        <table className="tune-table mono">
+          <thead>
+            <tr>
+              <th>pattern</th>
+              <th className="num">n</th>
+              <th className="num">win</th>
+              <th className="num">E</th>
+              <th>weight</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((p: any) => {
+              const st = p.exploring ? 'explore' : p.n < (t.minSamples || 8) ? 'learning' : p.disabled ? 'off' : 'on';
+              return (
+                <tr key={p.key}>
+                  <td>{p.key}</td>
+                  <td className="num">{p.n}</td>
+                  <td className="num">{Math.round((p.wr || 0) * 100)}%</td>
+                  <td className="num">{fmtExp(p.expectancy)}</td>
+                  <td>
+                    <span className="bar-w"><i style={{ width: `${Math.min(100, (p.weight || 0) / 1.8 * 100)}%` }} /></span>
+                    {(p.weight || 0).toFixed(2)}
+                  </td>
+                  <td><span className={`tune-pill ${st === 'on' ? 'on' : st === 'off' ? 'off' : st === 'explore' ? 'ex' : 'learn'}`}>{st}</span></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }

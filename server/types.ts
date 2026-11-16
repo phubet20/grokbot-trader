@@ -67,6 +67,10 @@ export type Position = {
   rentSol: number;         // token-account rent locked while open
   reconciled?: boolean;
   entryEstimated?: boolean;
+  adds?: number;
+  entryLiq?: number;
+  entryPattern?: string;
+  entryFeatures?: Record<string, number>;
 };
 
 export type ClosedTrade = Position & {

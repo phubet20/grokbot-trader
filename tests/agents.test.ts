@@ -26,8 +26,9 @@ test('safety pre-check passes a healthy pool', () => {
   assert.deepEqual(preCheck(base, DEFAULTS, now).reasons, []);
 });
 test('safety pre-check rejects thin/young/honeypot pools', () => {
-  assert.ok(!preCheck({ ...base, liquidityUsd: 5000 }, DEFAULTS, now).ok);
-  assert.ok(!preCheck({ ...base, createdAt: now - 10_000 }, DEFAULTS, now).ok);
+  assert.ok(!preCheck({ ...base, liquidityUsd: 50, volume: { ...base.volume, m5: 0 } }, DEFAULTS, now).ok);
+  // Fresh launches are allowed through pre-check so the scanner can catch the first pump.
+  assert.ok(preCheck({ ...base, createdAt: now - 10_000 }, DEFAULTS, now).ok);
   assert.ok(preCheck({ ...base, txns: { ...base.txns, h1b: 300, h1s: 0 } }, DEFAULTS, now).reasons.some((r) => r.includes('honeypot')));
   assert.ok(!preCheck({ ...base, quoteSymbol: 'BONK' }, DEFAULTS, now).ok);
 });

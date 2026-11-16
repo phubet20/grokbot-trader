@@ -3,7 +3,7 @@ import { useLive, api } from './api';
 import { Splash } from './components/Splash';
 import { ConnectSheet } from './components/ConnectSheet';
 import { Setup } from './components/Setup';
-import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, AgentsList, Decisions, Activity, LowBalanceBanner, ScanStatus } from './components/Dashboard';
+import { Header, Ticker, Balance, EquityCard, AgentCards, Positions, Repos, AgentsList, Decisions, Activity, LowBalanceBanner, ScanStatus, AutoTunePanel } from './components/Dashboard';
 import { TokenDetail } from './components/TokenDetail';
 import { Toasts, Confetti, Recap } from './components/Overlays';
 import { Account } from './components/Account';
@@ -53,13 +53,14 @@ export default function App() {
           <Ticker items={snap.ticker} onOpen={open} />
           <Balance snap={snap} />
           <EquityCard snap={snap} />
+          <AutoTunePanel snap={snap} />
           <AgentCards snap={snap} onOpen={open} />
           <Positions snap={snap} onOpen={open} />
           <Activity snap={snap} onOpen={open} limit={6} />
           <Repos snap={snap} />
           <Decisions snap={snap} limit={6} />
         </>}
-        {tab === 'agents' && <div className="page"><div className="page-title"><BotIcon size={28} /> Agents</div><ScanStatus snap={snap} /><AgentCards snap={snap} onOpen={open} /><AgentsList snap={snap} /><Repos snap={snap} /><Decisions snap={snap} limit={30} /></div>}
+        {tab === 'agents' && <div className="page"><div className="page-title"><BotIcon size={28} /> Agents</div><ScanStatus snap={snap} /><AgentCards snap={snap} onOpen={open} /><AutoTunePanel snap={snap} /><AgentsList snap={snap} /><Repos snap={snap} /><Decisions snap={snap} limit={30} /></div>}
         {tab === 'activity' && <div className="page"><div className="page-title"><BotIcon size={28} /> Activity</div><Positions snap={snap} onOpen={open} /><Activity snap={snap} onOpen={open} limit={100} title={false} /></div>}
         {tab === 'account' && <><div className="page-title" style={{ padding: '16px 16px 0' }}><BotIcon size={28} /> Account</div><Account snap={snap} onRecap={() => setRecap(true)} onDisconnected={() => setStage('connect')} /></>}
         <div style={{ height: 90 }} />

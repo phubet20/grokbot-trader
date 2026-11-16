@@ -6,7 +6,7 @@ import { NotifyPanel } from './NotifyPanel';
 const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of portfolio)', 1, 50, 1],
   ['maxPositions', 'Max open positions', 1, 20, 1],
-  ['hardStopPct', 'Hard stop (% below entry)', 1, 50, 0.5],
+  ['hardStopPct', 'Catastrophic stop (% below entry)', 10, 80, 1],
   ['trailingStopPct', 'Trailing stop (% from top)', 2, 60, 0.5],
   ['dailyLossLimitPct', 'Daily loss limit (%)', 1, 100, 1],
   ['maxHoldMin', 'Max hold (minutes)', 5, 1440, 5],

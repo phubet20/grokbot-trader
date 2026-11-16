@@ -1,0 +1,283 @@
+// Online self-tuning for paper trading. Learns per-pattern expectancy and
+// adjusts weights / score floors / exit sensitivity with tight guardrails.
+// Objective: equity-curve slope and smoothness (Sharpe-like), not raw PnL alone.
+
+export const MIN_SAMPLES = 8;
+export const EPS = 0.08;
+const W_MIN = 0;
+const W_MAX = 1.8;
+const SENS_MIN = 0.75;
+const SENS_MAX = 1.35;
+const SCORE_ADJ_MIN = -4;
+const SCORE_ADJ_MAX = 16;
+
+export type PatternKey =
+  | 'fresh-launch'
+  | 'curve-breakout'
+  | 'near-graduation'
+  | 'post-graduation'
+  | 'dip-reclaim'
+  | 'buy-candle'
+  | 'whale-inflow'
+  | 'big-money'
+  | 'bounce'
+  | 'momentum-burst'
+  | 'score'
+  | 'other';
+
+export type PatternStats = {
+  key: PatternKey;
+  n: number;
+  wins: number;
+  losses: number;
+  wr: number;
+  expectancy: number;
+  sumPnl: number;
+  ddContrib: number;
+  weight: number;
+  minScoreAdj: number;
+  disabled: boolean;
+  exploring: boolean;
+};
+
+export type TuneSnapshot = {
+  enabled: boolean;
+  patterns: PatternStats[];
+  exitSensitivity: number;
+  equityScore: number;
+  slope: number;
+  smoothness: number;
+  trades: number;
+  minSamples: number;
+  updatedAt: number;
+  note: string;
+};
+
+type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number };
+
+function classify(reason: string): PatternKey {
+  const r = (reason || '').toLowerCase();
+  if (r.includes('fresh-launch') || r.includes('fresh launch')) return 'fresh-launch';
+  if (r.includes('curve breakout')) return 'curve-breakout';
+  if (r.includes('near-graduation') || r.includes('near graduation')) return 'near-graduation';
+  if (r.includes('post-graduation') || r.includes('post graduation')) return 'post-graduation';
+  if (r.includes('dip-reclaim') || r.includes('dip-buy') || r.includes('dip reclaim')) return 'dip-reclaim';
+  if (r.includes('buy candle')) return 'buy-candle';
+  if (r.includes('whale') || r.includes('big-money inflow') || r.includes('big money')) return 'whale-inflow';
+  if (r.includes('net buy volume')) return 'big-money';
+  if (r.includes('bounce')) return 'bounce';
+  if (r.includes('momentum burst') || r.includes('breakout')) return 'momentum-burst';
+  if (r.startsWith('score') || r.includes('score ')) return 'score';
+  return 'other';
+}
+
+export function patternKey(reason: string): PatternKey {
+  return classify(reason);
+}
+
+function empty(key: PatternKey): PatternStats {
+  return { key, n: 0, wins: 0, losses: 0, wr: 0, expectancy: 0, sumPnl: 0, ddContrib: 0, weight: 1, minScoreAdj: 0, disabled: false, exploring: false };
+}
+
+/** Sample Beta(a,b) via two gamma draws (Marsaglia-Tsang for a>=1). */
+export function betaSample(a: number, b: number, rnd: () => number = Math.random): number {
+  const g = (shape: number) => {
+    const s = Math.max(1, shape);
+    const d = s - 1 / 3, c = 1 / Math.sqrt(9 * d);
+    for (let i = 0; i < 40; i++) {
+      let x: number, v: number;
+      do { x = gaussian(rnd); v = 1 + c * x; } while (v <= 0);
+      v = v * v * v;
+      const u = rnd();
+      if (u < 1 - 0.0331 * (x * x) * (x * x) || Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v)))
+        return d * v * (shape < 1 ? Math.pow(rnd(), 1 / Math.max(shape, 1e-6)) : 1);
+    }
+    return s;
+  };
+  const x = g(Math.max(0.5, a)), y = g(Math.max(0.5, b));
+  return x / Math.max(1e-9, x + y);
+}
+
+function gaussian(rnd: () => number) {
+  const u = Math.max(1e-12, rnd()), v = Math.max(1e-12, rnd());
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function clamp(n: number, lo: number, hi: number) { return Math.min(hi, Math.max(lo, n)); }
+
+export class AutoTune {
+  enabled = true;
+  minSamples = MIN_SAMPLES;
+  exitSensitivity = 1;
+  equityScore = 0;
+  slope = 0;
+  smoothness = 1;
+  updatedAt = 0;
+  private trades: TradeRec[] = [];
+  private patterns = new Map<PatternKey, PatternStats>();
+
+  load(raw: any) {
+    if (!raw || typeof raw !== 'object') return;
+    this.exitSensitivity = clamp(Number(raw.exitSensitivity) || 1, SENS_MIN, SENS_MAX);
+    this.equityScore = Number(raw.equityScore) || 0;
+    this.slope = Number(raw.slope) || 0;
+    this.smoothness = Number(raw.smoothness) || 1;
+    this.updatedAt = Number(raw.updatedAt) || 0;
+    if (Array.isArray(raw.trades)) this.trades = raw.trades.slice(-400);
+    if (Array.isArray(raw.patterns)) {
+      for (const p of raw.patterns) {
+        if (p && p.key) this.patterns.set(p.key, { ...empty(p.key), ...p });
+      }
+    }
+  }
+
+  dump() {
+    return {
+      exitSensitivity: this.exitSensitivity,
+      equityScore: this.equityScore,
+      slope: this.slope,
+      smoothness: this.smoothness,
+      updatedAt: this.updatedAt,
+      trades: this.trades.slice(-400),
+      patterns: [...this.patterns.values()],
+    };
+  }
+
+  record(opts: { reason: string; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts?: number }) {
+    if (!this.enabled) return;
+    const pattern = classify(opts.reason);
+    const cost = Math.max(1e-6, opts.costUsd);
+    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now() };
+    this.trades.push(rec);
+    if (this.trades.length > 400) this.trades = this.trades.slice(-400);
+    this.rebuild();
+  }
+
+  private rebuild() {
+    const map = new Map<PatternKey, PatternStats>();
+    const eqs = this.trades.map((t) => t.equity).filter((x) => x > 0);
+    const { slope, smoothness, score } = equityScore(eqs);
+    this.slope = slope;
+    this.smoothness = smoothness;
+    this.equityScore = score;
+
+    for (const t of this.trades) {
+      const s = map.get(t.pattern) || empty(t.pattern);
+      s.n++;
+      if (t.pnlUsd > 0) s.wins++; else s.losses++;
+      s.sumPnl += t.pnlUsd;
+      if (t.pnlUsd < 0) s.ddContrib += t.pnlUsd;
+      s.expectancy += t.pnlUsd / t.costUsd;
+      map.set(t.pattern, s);
+    }
+    for (const s of map.values()) {
+      s.wr = s.n ? s.wins / s.n : 0;
+      s.expectancy = s.n ? s.expectancy : 0; // already summed as pnl/cost, divide
+      s.expectancy = s.n ? s.sumPnl / Math.max(1e-6, this.trades.filter((t) => t.pattern === s.key).reduce((a, t) => a + t.costUsd, 0)) : 0;
+      if (s.n >= this.minSamples) {
+        if (s.expectancy < -0.04 || (s.wr < 0.35 && s.expectancy < 0)) {
+          s.disabled = true;
+          s.weight = 0;
+          s.minScoreAdj = SCORE_ADJ_MAX;
+        } else {
+          s.disabled = false;
+          // Map expectancy to a bounded weight; positive gets more size, negative is down-weighted.
+          const w = 1 + clamp(s.expectancy * 3, -0.7, 0.8) + clamp((s.wr - 0.5) * 0.6, -0.3, 0.3);
+          s.weight = clamp(w, 0.35, W_MAX);
+          s.minScoreAdj = clamp(Math.round(-s.expectancy * 20), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
+          if (s.expectancy < 0) s.minScoreAdj = clamp(6 + Math.round(-s.expectancy * 20), 4, SCORE_ADJ_MAX);
+          else s.minScoreAdj = clamp(Math.round(-s.expectancy * 15), SCORE_ADJ_MIN, 2);
+        }
+      } else {
+        s.weight = 1;
+        s.disabled = false;
+        s.minScoreAdj = 0;
+      }
+    }
+    this.patterns = map;
+    this.tuneExitSensitivity();
+    this.updatedAt = Date.now();
+  }
+
+  private tuneExitSensitivity() {
+    const recent = this.trades.slice(-40);
+    if (recent.length < this.minSamples) { this.exitSensitivity = 1; return; }
+    const rets = recent.map((t) => t.pnlUsd / t.costUsd);
+    const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+    const varr = rets.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, rets.length - 1);
+    const sharpe = mean / Math.max(0.02, Math.sqrt(varr));
+    // Choppy negative curve → exit a bit sooner; smooth positive → give trades more room.
+    let s = 1;
+    if (sharpe < 0) s = 1.1;
+    if (mean < -0.05) s = 1.2;
+    if (sharpe > 0.4 && mean > 0) s = 0.9;
+    if (this.smoothness < 0.5 && mean < 0) s = 1.15;
+    this.exitSensitivity = clamp(s, SENS_MIN, SENS_MAX);
+  }
+
+  /** Thompson sample vs a uniform exploration arm. */
+  allow(reason: string, rnd: () => number = Math.random): { ok: boolean; key: PatternKey; weight: number; minScoreAdj: number; exploring: boolean } {
+    const key = classify(reason);
+    const s = this.patterns.get(key) || empty(key);
+    if (s.n < this.minSamples) return { ok: true, key, weight: 1, minScoreAdj: 0, exploring: false };
+    if (s.disabled) {
+      const explore = rnd() < EPS;
+      return { ok: explore, key, weight: explore ? 0.5 : 0, minScoreAdj: s.minScoreAdj, exploring: explore };
+    }
+    // Thompson: P(arm beats a baseline Beta(2,2) dummy)
+    const draw = betaSample(1 + s.wins, 1 + s.losses, rnd);
+    const baseline = betaSample(2, 2, rnd);
+    const explore = rnd() < EPS;
+    const ok = explore || draw >= baseline * 0.85 || s.expectancy > 0;
+    return { ok, key, weight: s.weight, minScoreAdj: s.minScoreAdj, exploring: explore && !ok ? true : explore };
+  }
+
+  sizeMult(reason: string): number {
+    const key = classify(reason);
+    const s = this.patterns.get(key);
+    if (!s || s.n < this.minSamples) return 1;
+    return clamp(s.weight, 0.5, 1.5);
+  }
+
+  snapshot(): TuneSnapshot {
+    const list = [...this.patterns.values()].sort((a, b) => b.n - a.n);
+    return {
+      enabled: this.enabled,
+      patterns: list,
+      exitSensitivity: this.exitSensitivity,
+      equityScore: this.equityScore,
+      slope: this.slope,
+      smoothness: this.smoothness,
+      trades: this.trades.length,
+      minSamples: this.minSamples,
+      updatedAt: this.updatedAt,
+      note: this.trades.length < this.minSamples
+        ? `learning — need ${this.minSamples} closes per pattern before weights move`
+        : 'tuning from rolling expectancy and equity-curve smoothness',
+    };
+  }
+}
+
+/** Sharpe-like score of an equity path: slope of OLS fit, penalized by residual noise. */
+export function equityScore(eqs: number[]): { slope: number; smoothness: number; score: number } {
+  if (eqs.length < 3) return { slope: 0, smoothness: 1, score: 0 };
+  const n = eqs.length;
+  const xs = eqs.map((_, i) => i);
+  const xBar = (n - 1) / 2;
+  const yBar = eqs.reduce((a, b) => a + b, 0) / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - xBar, dy = eqs[i] - yBar;
+    sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+  }
+  const slope = sxx > 0 ? sxy / sxx : 0;
+  const ssRes = syy - (sxx > 0 ? (sxy * sxy) / sxx : 0);
+  const r2 = syy > 0 ? Math.max(0, 1 - ssRes / syy) : 1;
+  const rets: number[] = [];
+  for (let i = 1; i < n; i++) rets.push((eqs[i] - eqs[i - 1]) / Math.max(1e-6, eqs[i - 1]));
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const sd = Math.sqrt(rets.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, rets.length - 1));
+  const sharpe = mean / Math.max(0.002, sd);
+  const score = slope / Math.max(0.5, eqs[0] / 20) * 0.5 + sharpe * 0.35 + r2 * 0.15;
+  return { slope, smoothness: r2, score };
+}

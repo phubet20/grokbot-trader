@@ -268,3 +268,146 @@ export function momentumFadeStrict(s: TapeSnap): { exit: boolean; reason: string
   if (s.m5 < -2.5) return { exit: true, reason: 'momentum fade · 5m reversal' };
   return { exit: false, reason: '' };
 }
+
+/** Build coarse OHLC-style candles from in-memory trade ticks (1s / 15s / 1m). */
+export function candlesFromTicks(hist: TapeSnap[], bucketMs: number) {
+  if (!hist.length) return [] as { t: number; o: number; h: number; l: number; c: number; buy: number; sell: number }[];
+  const out: { t: number; o: number; h: number; l: number; c: number; buy: number; sell: number }[] = [];
+  const start = Math.floor(hist[0].t / bucketMs) * bucketMs;
+  let cur = { t: start, o: hist[0].px, h: hist[0].px, l: hist[0].px, c: hist[0].px, buy: 0, sell: 0 };
+  for (const s of hist) {
+    const tb = Math.floor(s.t / bucketMs) * bucketMs;
+    if (tb !== cur.t) {
+      out.push(cur);
+      cur = { t: tb, o: s.px, h: s.px, l: s.px, c: s.px, buy: 0, sell: 0 };
+    }
+    cur.h = Math.max(cur.h, s.px);
+    cur.l = Math.min(cur.l || s.px, s.px);
+    cur.c = s.px;
+    cur.buy = s.b5;
+    cur.sell = s.s5;
+  }
+  out.push(cur);
+  return out;
+}
+
+export function buyCandlePattern(hist: TapeSnap[]): { ok: boolean; reason: string } {
+  for (const ms of [1000, 15_000, 60_000]) {
+    const cs = candlesFromTicks(hist, ms);
+    if (cs.length < 2) continue;
+    const last = cs[cs.length - 1], prev = cs[cs.length - 2];
+    const green = last.c > last.o && last.buy >= last.sell;
+    const body = last.c - last.o;
+    const prevBody = Math.max(0, prev.c - prev.o);
+    const big = body > 0 && body >= prevBody;
+    const lows = cs.slice(-4).map((x) => x.l);
+    const higherLows = lows.length >= 3 && lows[lows.length - 1] >= lows[lows.length - 2] && lows[lows.length - 2] >= lows[0] * 0.997;
+    if (green && (big || higherLows))
+      return { ok: true, reason: `buy candle ${ms / 1000}s` + (higherLows ? ' · higher lows' : '') };
+  }
+  return { ok: false, reason: '' };
+}
+
+/** Confirmed dip-then-reclaim: a 3–28% pullback that has already bounced, with buy flow back. Never signals while still falling. */
+export function dipReclaim(hist: TapeSnap[]): { ok: boolean; reason: string; dip?: number } {
+  if (hist.length < 3) return { ok: false, reason: '' };
+  const last = hist[hist.length - 1];
+  const prev = hist[hist.length - 2];
+  if (!(last.px > 0)) return { ok: false, reason: '' };
+  if (last.px < prev.px) return { ok: false, reason: 'still falling' };
+  const r5 = buyRatio(last.b5, last.s5);
+  const peak = Math.max(...hist.map((h) => h.px));
+  const peakI = hist.reduce((bi, h, i) => (h.px >= hist[bi].px ? i : bi), 0);
+  const after = hist.slice(peakI);
+  const trough = Math.min(...after.map((h) => h.px));
+  const dip = peak > 0 ? (1 - trough / peak) * 100 : 0;
+  const mid = (trough + peak) / 2;
+  const reclaimed = last.px >= trough * 1.012 && last.px >= mid * 0.97;
+  if (dip >= 3 && dip <= 28 && reclaimed && r5 >= 0.52)
+    return { ok: true, reason: `dip-reclaim ${dip.toFixed(1)}%`, dip };
+  return { ok: false, reason: '' };
+}
+
+export function bigMoneyInflow(c: Candidate, s: TapeSnap): { ok: boolean; reason: string } {
+  const r5 = buyRatio(s.b5, s.s5);
+  const net = s.b5 - s.s5;
+  const whale = c.flow?.whaleBuyUsd || 0;
+  const large = c.flow?.largeBuys || 0;
+  if ((whale >= 30 || large >= 1) && r5 >= 0.55 && net > 0) return { ok: true, reason: 'big-money inflow' };
+  if (s.vol5 > 0 && r5 >= 0.65 && s.b5 >= 6 && net > 0) return { ok: true, reason: 'net buy volume spike' };
+  return { ok: false, reason: '' };
+}
+
+/** Immediate entry signals: fresh launch, dip-reclaim, buy candles, bounce, big-money flow. */
+export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()): { ok: boolean; reason: string } {
+  const snap = toSnap(now, c);
+  const h = hist.length ? hist : [snap];
+  if (h[h.length - 1].t !== snap.t) h.push(snap);
+  const pat = matchEntryPatterns(c, h, p, now);
+  if (pat.ok) return pat;
+  const dip = dipReclaim(h);
+  if (dip.ok) return dip;
+  const candle = buyCandlePattern(h);
+  if (candle.ok) return candle;
+  const money = bigMoneyInflow(c, snap);
+  if (money.ok) return money;
+  const r5 = buyRatio(snap.b5, snap.s5);
+  if (h.length >= 3 && snap.m5 < 0 && snap.px > h[h.length - 2].px && r5 >= 0.55 && (snap.b5 - snap.s5) > 0)
+    return { ok: true, reason: 'bounce · buy flow returning' };
+  if ((c.score || 0) >= 0 && r5 >= 0.6 && snap.m5 >= 3 && (snap.b5 + snap.s5) >= 4)
+    return { ok: true, reason: 'momentum burst · buy pressure' };
+  return { ok: false, reason: 'no signal' };
+}
+
+export function momentumBreakdown(c: Candidate | undefined, s: TapeSnap, hist: TapeSnap[] = [], opts: { sensitivity?: number } = {}): { exit: boolean; reason: string } {
+  const flow = c?.flow;
+  if (flow?.devSold) return { exit: true, reason: 'momentum break · dev/top-holder selling' };
+  if ((flow?.largeSells || 0) >= 1 && (flow!.largeSells || 0) > (flow!.largeBuys || 0))
+    return { exit: true, reason: 'momentum break · large sell' };
+  const sens = Math.min(1.35, Math.max(0.75, opts.sensitivity || 1));
+  const r5 = buyRatio(s.b5, s.s5);
+  const tot = s.b5 + s.s5;
+  const r5Cut = Math.min(0.55, Math.max(0.40, 0.48 * sens));
+  if (tot >= 6 && (s.b5 - s.s5) < 0 && r5 < r5Cut) return { exit: true, reason: 'momentum break · net sell flow' };
+  if (hist.length >= 3) {
+    const volCut = Math.min(0.55, Math.max(0.3, 0.4 / sens));
+    const prevVol = Math.max(...hist.slice(0, Math.max(1, hist.length - 1)).map((h) => h.vol5 || 0));
+    if (prevVol > 0 && s.vol5 < prevVol * volCut && r5 < 0.5 && tot >= 4)
+      return { exit: true, reason: 'momentum break · buy volume collapse' };
+    const peakI = hist.reduce((bi, h, i) => (h.px >= hist[bi].px ? i : bi), 0);
+    const peak = hist[peakI]?.px || 0;
+    const llDrop = 12 / sens;
+    if (peak > 0 && peakI < hist.length - 2) {
+      const minAfter = Math.min(...hist.slice(peakI).map((h) => h.px));
+      const drop = (1 - minAfter / peak) * 100;
+      if (drop >= llDrop && s.px <= minAfter * 1.002 && s.px < peak * (1 - llDrop / 100))
+        return { exit: true, reason: 'momentum break · lower low after peak' };
+    }
+  }
+  return { exit: false, reason: '' };
+}
+
+/** Live/paper exits: 100% out on momentum break, plus a wide catastrophic / rug stop. No tight SL/TP. */
+export function liveExit(
+  pos: PosMark & { entryLiq?: number },
+  price: number,
+  c: Candidate | undefined,
+  hist: TapeSnap[],
+  opts: { catStopPct?: number; sensitivity?: number } = {},
+): { exit: boolean; kind: ExitKind | null; reason: string; partial: boolean; peak: number } {
+  const cat = opts.catStopPct ?? 35;
+  const peak = Math.max(pos.peakPrice, price);
+  if (!(price > 0)) return { exit: false, kind: null, reason: 'no price', partial: false, peak };
+  const fromEntry = (price / pos.entryPrice - 1) * 100;
+  if (pos.entryLiq && pos.entryLiq > 0 && (c?.liquidityUsd || 0) > 0 && c!.liquidityUsd < pos.entryLiq * 0.4)
+    return { exit: true, kind: 'hard_stop', reason: `rug · liquidity pulled (${fromEntry.toFixed(1)}%)`, partial: false, peak };
+  if (fromEntry <= -cat)
+    return { exit: true, kind: 'hard_stop', reason: `catastrophic stop -${cat}% (${fromEntry.toFixed(1)}%)`, partial: false, peak };
+  const s = hist[hist.length - 1] || (c ? toSnap(Date.now(), c) : undefined);
+  if (s) {
+    const br = momentumBreakdown(c, s, hist, { sensitivity: opts.sensitivity });
+    if (br.exit) return { exit: true, kind: 'momentum_fade', reason: br.reason, partial: false, peak };
+  }
+  return { exit: false, kind: null, reason: '', partial: false, peak };
+}
+

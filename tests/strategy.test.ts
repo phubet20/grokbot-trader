@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -66,4 +66,56 @@ test('partial take-profit then breakeven on the runner', () => {
   assert.equal(be.kind, 'breakeven');
   const hard = exitReason(after, 96, p, 6000);
   assert.equal(hard.kind, 'hard_stop');
+});
+
+test('liveExit does not use a tight stop or take-profit, only momentum break or a wide catastrophic stop', () => {
+  const pos = { entryPrice: 100, peakPrice: 110, openedAt: 0 };
+  const hold = liveExit(pos, 97, undefined, [], { catStopPct: 35 }); // -3%, a normal pullback
+  assert.equal(hold.exit, false, hold.reason);
+  const tp = liveExit(pos, 115, undefined, [], { catStopPct: 35 });
+  assert.equal(tp.exit, false, 'no fixed take-profit');
+  const cat = liveExit(pos, 64, undefined, [], { catStopPct: 35 });
+  assert.equal(cat.exit, true);
+  assert.match(cat.reason, /catastrophic/);
+  const rug = liveExit({ ...pos, entryLiq: 10_000 }, 100, { liquidityUsd: 3000 } as any, [], { catStopPct: 35 });
+  assert.equal(rug.exit, true);
+  assert.match(rug.reason, /liquidity pulled/);
+});
+
+test('momentum breakdown exits on net sell flow or a lower low after the peak', () => {
+  const now = 1_000_000;
+  const dump = { t: now, px: 90, liq: 20_000, mc: 80_000, m5: -4, m15: 2, h1: 10, vol5: 1000, vol1h: 5000, b5: 4, s5: 16, b1: 20, s1: 40, tr: 40, age: now };
+  assert.equal(momentumBreakdown(undefined, dump, [dump]).exit, true);
+  const hist = [
+    snap({ t: now, px: 100 }),
+    snap({ t: now + 1000, px: 120 }),
+    snap({ t: now + 2000, px: 110 }),
+    snap({ t: now + 3000, px: 108, b5: 8, s5: 6 }),
+  ];
+  const shallow = momentumBreakdown(undefined, hist[3], hist);
+  assert.equal(shallow.exit, false, shallow.reason);
+  const ll = [
+    snap({ t: now, px: 100 }),
+    snap({ t: now + 1000, px: 120 }),
+    snap({ t: now + 2000, px: 108 }),
+    snap({ t: now + 3000, px: 100 }),
+  ];
+  assert.equal(momentumBreakdown(undefined, ll[3], ll).exit, true);
+});
+
+test('dip-reclaim fires only after a bounce with buy flow, never while still falling', () => {
+  const t0 = 2_000_000;
+  const falling: TapeSnap[] = [
+    snap({ t: t0, px: 100 }),
+    snap({ t: t0 + 1000, px: 92 }),
+    snap({ t: t0 + 2000, px: 88, b5: 8, s5: 6 }),
+  ];
+  assert.equal(dipReclaim(falling).ok, false);
+  const rebound: TapeSnap[] = [
+    snap({ t: t0, px: 100 }),
+    snap({ t: t0 + 1000, px: 88 }),
+    snap({ t: t0 + 2000, px: 95, b5: 20, s5: 8 }),
+  ];
+  const r = dipReclaim(rebound);
+  assert.equal(r.ok, true, r.reason);
 });

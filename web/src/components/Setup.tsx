@@ -8,8 +8,8 @@ const REPOS = [
     blurb: 'multi-agent LLM trading · analysts · risk team',
     color: '#8b5cf6',
     agents: [
-      { id: 'analyst', name: 'ANALYST', color: '#8b5cf6', at: 500 },
-      { id: 'risk', name: 'RISK', color: '#ec4899', at: 900 },
+      { id: 'analyst', name: 'ANALYST', color: '#8b5cf6', at: 180 },
+      { id: 'risk', name: 'RISK', color: '#ec4899', at: 350 },
     ],
   },
   {
@@ -17,7 +17,7 @@ const REPOS = [
     stars: '1.7k',
     blurb: 'AI agents → Solana · Jupiter · pump.fun',
     color: '#22c55e',
-    agents: [{ id: 'executor', name: 'EXECUTOR', color: '#10b981', at: 2100 }],
+    agents: [{ id: 'executor', name: 'EXECUTOR', color: '#10b981', at: 900 }],
   },
   {
     owner: 'Jackhuang166/ai-memecoin-trading-bot',
@@ -25,8 +25,8 @@ const REPOS = [
     blurb: 'new token scan · honeypot check · win prob',
     color: '#f59e0b',
     agents: [
-      { id: 'scanner', name: 'SCANNER', color: '#f59e0b', at: 1400 },
-      { id: 'safety', name: 'SAFETY', color: '#ef4444', at: 1700 },
+      { id: 'scanner', name: 'SCANNER', color: '#f59e0b', at: 500 },
+      { id: 'safety', name: 'SAFETY', color: '#ef4444', at: 700 },
     ],
   },
 ];
@@ -53,8 +53,8 @@ export function Setup({ snap, onDone }: { snap: any; onDone: () => void }) {
   useEffect(() => {
     const timers: number[] = [];
     const marks = [
-      { t: 200, show: 2 },
-      { t: 700, show: 3 },
+      { t: 120, show: 2 },
+      { t: 280, show: 3 },
     ];
     for (const m of marks) timers.push(window.setTimeout(() => setShown(m.show), m.t));
     for (const repo of REPOS) {
@@ -62,12 +62,14 @@ export function Setup({ snap, onDone }: { snap: any; onDone: () => void }) {
         timers.push(window.setTimeout(() => setReady((r) => ({ ...r, [a.id]: true })), a.at));
       }
     }
-    timers.push(window.setTimeout(() => doneRef.current(), 2800));
+    timers.push(window.setTimeout(() => doneRef.current(), 1300));
     return () => { for (const t of timers) clearTimeout(t); };
   }, []);
 
+  function skip() { doneRef.current(); }
+
   return (
-    <div className="setup" data-testid="setup">
+    <div className="setup" data-testid="setup" onClick={skip} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') skip(); }}>
       <div className="setup-hdr">
         <BotIcon size={34} />
         <div className="hdr-title">{snap?.appName || 'Grok Bot'}</div>
@@ -75,7 +77,7 @@ export function Setup({ snap, onDone }: { snap: any; onDone: () => void }) {
         <div style={{ flex: 1 }} />
         <span className="ph-pill"><PhantomIcon size={22} /> Phantom</span>
       </div>
-      <div className="setup-sub mono muted">3 repos → 5 agents · night mode 22:00 → 08:00</div>
+      <div className="setup-sub mono muted">3 repos → 5 agents · tap to skip</div>
       {REPOS.slice(0, shown).map((repo) => (
         <div key={repo.owner} className="setup-card">
           <div className="setup-card-hd">
