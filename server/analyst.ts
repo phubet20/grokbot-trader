@@ -1,4 +1,6 @@
-// ANALYST agent - deterministic 0-100 score from momentum, flow, volume and liquidity.
+// ANALYST agent — score 0-100 from big-money flow, not EMA/RSI.
+// Weights: whale/large buys, net-buy acceleration, unique-buyer growth,
+// bonding-curve progress velocity, and anti-bundle / dev-not-selling quality.
 import type { Candidate } from './types.ts';
 
 const clamp = (x: number, a = 0, b = 1) => Math.max(a, Math.min(b, x));
@@ -7,34 +9,64 @@ export type Score = { score: number; parts: Record<string, number>; bull: number
 
 export function scoreCandidate(c: Candidate): Score {
   const parts: Record<string, number> = {};
-  // 1. short-term momentum (25): want positive m5/m15/h1 but not a vertical blow-off
-  const m = c.change;
-  let mom = 0;
-  mom += clamp(m.m5 / 6) * 8;           // +6% in 5m = full
-  mom += clamp(m.m15 / 12) * 7;
-  mom += clamp(m.h1 / 25) * 10;
-  if (m.m5 > 40 || m.h1 > 250) mom *= 0.4; // chasing a blow-off top
-  else if (m.h1 > 120) mom *= 0.6;
-  if (m.m5 < -5) mom -= 6;
-  parts.momentum = mom;
-  // 2. buy pressure (25)
   const b5 = c.txns.m5b, s5 = c.txns.m5s, b1 = c.txns.h1b, s1 = c.txns.h1s;
   const r5 = b5 + s5 > 0 ? b5 / (b5 + s5) : 0.5;
   const r1 = b1 + s1 > 0 ? b1 / (b1 + s1) : 0.5;
-  parts.flow = clamp((r5 - 0.45) / 0.25) * 13 + clamp((r1 - 0.45) / 0.2) * 12;
-  // 3. activity: volume relative to liquidity (20)
-  const turn1h = c.liquidityUsd > 0 ? c.volume.h1 / c.liquidityUsd : 0;
-  parts.volume = clamp(turn1h / 1.0) * 12 + clamp(Math.log10(Math.max(1, c.volume.h1)) / 5.5) * 8;
-  // 4. liquidity depth (15): deeper = safer exits
-  parts.liquidity = clamp((Math.log10(Math.max(1, c.liquidityUsd)) - 4) / 2) * 15;
-  // 5. participation (15)
-  parts.traders = clamp(c.traders1h / 400) * 15;
+  const flow = c.flow;
+  const netUsd = flow?.netBuyUsd ?? ((c.volume.m5 || 0) * (r5 - (1 - r5)));
+  const unique = flow?.uniqueBuyers || c.traders1h || 0;
+  const whale = flow?.whaleBuyUsd || 0;
+  const avgBuy = b5 > 0 ? (c.volume.m5 || 0) / b5 : 0;
+  const largeBuys = flow?.largeBuys ?? (avgBuy >= 40 ? Math.min(5, Math.round(avgBuy / 40)) : 0);
+  const progress = c.curve?.progress ?? flow?.progress ?? 0;
+  const vel = flow?.progressVel ?? 0;
+  const ageMin = Math.max(0.05, (Date.now() - (c.createdAt || Date.now())) / 60_000);
+
+  // 1. large / whale buys (22)
+  const whaleScore = clamp((whale || avgBuy) / 80) * 14 + clamp(largeBuys / 3) * 8;
+  parts.whale = whaleScore * (flow?.bundled ? 0.35 : 1);
+
+  // 2. net buy volume acceleration (22)
+  const net5 = r5 - 0.5;
+  const net1 = r1 - 0.5;
+  const accel = net5 - net1 * 0.5;
+  parts.accel = clamp((netUsd > 0 ? 1 : 0.3) * (0.5 + net5 * 2)) * 12 + clamp(accel / 0.25) * 10;
+  if (s5 > b5 * 1.15) parts.accel *= 0.25;
+  if (netUsd < 0) parts.accel *= 0.5;
+
+  // 3. unique buyer growth (16)
+  const buyerRate = unique / Math.max(ageMin, 0.5);
+  parts.buyers = clamp(unique / 40) * 9 + clamp(buyerRate / 8) * 7;
+  if (unique <= 2 && (c.volume.m5 || 0) > 200) parts.buyers *= 0.3; // bundled / sniper
+
+  // 4. bonding-curve progress velocity (16) — for graduated AMM, use volume burst instead
+  if (c.curve && !c.curve.graduated) {
+    parts.curve = clamp(progress / 0.85) * 7 + clamp(vel / 0.15) * 9;
+  } else {
+    const burst = c.liquidityUsd > 0 ? (c.volume.m5 || 0) / c.liquidityUsd : 0;
+    parts.curve = clamp(burst / 0.4) * 16;
+  }
+
+  // 5. quality: dev not selling, no bundle dump, not a vertical blow-off with no buyers (14)
+  let qual = 14;
+  if (flow?.devSold) qual -= 10;
+  if (flow?.bundled) qual -= 8;
+  if ((flow?.devHoldPct || 0) > 12) qual -= 6;
+  if ((flow?.largeSells || 0) > (largeBuys || 0) + 1) qual -= 6;
+  if (c.change.m5 > 50) qual -= unique < 15 ? 8 : 5;
+  if (r5 < 0.45) qual -= 6;
+  if ((c.change.m5 || 0) < -5) { parts.accel *= 0.4; parts.whale *= 0.5; parts.curve *= 0.6; qual -= 5; }
+  parts.quality = Math.max(0, qual);
+
+  // 6. exit room / liquidity (10)
+  const liq = c.liquidityUsd || 0;
+  parts.liquidity = clamp((Math.log10(Math.max(1, liq)) - 2.5) / 2.5) * 10;
+
   const raw = Object.values(parts).reduce((a, b) => a + b, 0);
   const score = Math.round(clamp(raw, 0, 100));
-  // bull/bear "votes" like a debate panel (cosmetic summary of signals)
-  const signals = [m.m5 > 0, m.h1 > 0, r5 > 0.55, r1 > 0.52, turn1h > 0.5, c.liquidityUsd > 50_000];
+  const signals = [net5 > 0, r5 > 0.55, unique >= 8, whale > 20 || largeBuys > 0, !flow?.devSold, !flow?.bundled, (c.change.m5 || 0) > -3];
   const bull = signals.filter(Boolean).length;
   const bear = signals.length - bull;
-  const note = `mom ${parts.momentum.toFixed(0)} · flow ${parts.flow.toFixed(0)} · vol ${parts.volume.toFixed(0)} · liq ${parts.liquidity.toFixed(0)} · traders ${parts.traders.toFixed(0)}`;
+  const note = `whale ${parts.whale.toFixed(0)} · accel ${parts.accel.toFixed(0)} · buyers ${parts.buyers.toFixed(0)} · curve ${parts.curve.toFixed(0)} · qual ${parts.quality.toFixed(0)}`;
   return { score, parts, bull, bear, note };
 }

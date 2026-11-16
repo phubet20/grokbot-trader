@@ -67,7 +67,7 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (p === '/api/state') return json(200, engine.snapshot());
-    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus() });
+    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
     if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt });
     if (p === '/api/trades') return json(200, store.trades(500));
@@ -120,6 +120,7 @@ server.listen(config.port, host, async () => {
   if (g.auto) console.log(`  bot wallet: ${botPublicKey() || '(not configured)'}`);
   console.log(`  open http://${host === '0.0.0.0' ? 'localhost' : host}:${config.port}/${ACCESS_TOKEN ? '<ACCESS_TOKEN>/' : ''}\n`);
   initPush(store);
+  if (typeof (market as any).start === 'function') (market as any).start();
   await engine.start();
   startKeepalive();
 });

@@ -41,7 +41,8 @@ export class PaperExecutor {
     const slip = this.cfg.slippageBps;
     const q = await this.m.quote(SOL_MINT, mint, lamports, slip);
     if (!q || q.outAmount <= 0) return { ok: false, error: 'no Jupiter route' };
-    if (q.priceImpactPct > 6) return { ok: false, error: `price impact ${q.priceImpactPct.toFixed(1)}%` };
+    const impactCap = q.route === 'pump-curve' ? 15 : 6;
+    if (q.priceImpactPct > impactCap) return { ok: false, error: `price impact ${q.priceImpactPct.toFixed(1)}%` };
     const decimals = await this.m.decimals(mint);
     const tokens = (q.outAmount / 10 ** decimals) * (1 - this.cfg.extraSlippageBps / 1e4);
     const feesSol = BASE_FEE_SOL + this.cfg.priorityFeeSol;

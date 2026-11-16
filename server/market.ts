@@ -1,6 +1,8 @@
 // Market data: GeckoTerminal + DexScreener (discovery), RugCheck (security),
 // Jupiter (prices + swap quotes). All public, no API keys.
 import type { Candidate, TokenSecurity } from './types.ts';
+import { getPumpFeed, mergePumpOnto, curveQuote } from './pump.ts';
+import { fetchMintAuthorities } from './reconcile.ts';
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -59,6 +61,17 @@ export class LiveMarket implements MarketSource {
   private decCache = new Map<string, number>([[SOL_MINT, 9], [USDC_MINT, 6]]);
   private ohlcvCache = new Map<string, { at: number; data: Candle[] }>();
   private scanTick = 0;
+  lastSolPrice = 0;
+  private pump = getPumpFeed();
+  private pumpStarted = false;
+
+  start() {
+    if (this.pumpStarted) return;
+    this.pumpStarted = true;
+    this.pump.start();
+  }
+  stop() { this.pump.stop(); this.pumpStarted = false; }
+  pumpStatus() { return this.pump.status; }
 
   private limiterFor(src: string): Limiter | null {
     if (src === 'geckoterminal') return this.gt;
@@ -157,10 +170,17 @@ export class LiveMarket implements MarketSource {
       } catch {}
     })();
     // Hard deadline: a slow second hop on one source must not hold the scan loop.
+    this.start();
     await Promise.race([
       Promise.all([...gtJobs, dsJob, jupJob]),
       new Promise((r) => setTimeout(r, 4500)),
     ]);
+    const pumpList = this.pump.toCandidates(this.lastSolPrice || 70);
+    scanned += pumpList.length;
+    for (const p of pumpList) {
+      const prev = out.get(p.mint);
+      out.set(p.mint, prev ? mergePumpOnto(prev, p) : p);
+    }
     return { list: [...out.values()], scanned };
   }
 
@@ -217,7 +237,18 @@ export class LiveMarket implements MarketSource {
       this.secCache.set(mint, s);
       return s;
     } catch {
-      return null;
+      const rpc = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+      const auth = await fetchMintAuthorities(rpc, mint);
+      if (!auth) return null;
+      const s: TokenSecurity = {
+        mintAuthority: auth.mintAuthority, freezeAuthority: auth.freezeAuthority,
+        holders: null, topHolderPct: null, top10Pct: null, dangerRisks: [], rugged: false,
+        fetchedAt: Date.now(), available: true,
+      };
+      (s as any).freshPump = !!this.pump.get(mint);
+      this.secCache.set(mint, s);
+      if (auth.decimals) this.decCache.set(mint, auth.decimals);
+      return s;
     }
   }
 
@@ -232,6 +263,7 @@ export class LiveMarket implements MarketSource {
           if (v?.usdPrice) out[m] = num(v.usdPrice);
           if (v?.decimals !== undefined) this.decCache.set(m, num(v.decimals));
         }
+        if (out[SOL_MINT]) this.lastSolPrice = out[SOL_MINT];
       } catch {}
     }
     return out;
@@ -246,12 +278,20 @@ export class LiveMarket implements MarketSource {
   async quote(inputMint: string, outputMint: string, amountRaw: bigint, slippageBps: number): Promise<Quote | null> {
     try {
       const d = await this.jup.run(() => this.get(`https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${slippageBps}&restrictIntermediateTokens=true`, 'jupiter'));
-      if (!d?.outAmount) return null;
+      if (!d?.outAmount) {
+        const t = this.pump.get(outputMint === SOL_MINT ? inputMint : outputMint);
+        if (t && !t.graduated) return curveQuote(t, inputMint, outputMint, amountRaw, this.lastSolPrice || 0);
+        return null;
+      }
       return {
         inAmount: num(d.inAmount), outAmount: num(d.outAmount), priceImpactPct: num(d.priceImpactPct) * 100,
         route: (d.routePlan || []).map((r: any) => r.swapInfo?.label).filter(Boolean).join(' → ') || 'Jupiter', raw: d,
       };
-    } catch { return null; }
+    } catch {
+      const t = this.pump.get(outputMint === SOL_MINT ? inputMint : outputMint);
+      if (t && !t.graduated) return curveQuote(t, inputMint, outputMint, amountRaw, this.lastSolPrice || 0);
+      return null;
+    }
   }
 
   async ohlcv(pool: string, tf: string): Promise<Candle[]> {

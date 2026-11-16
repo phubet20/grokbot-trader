@@ -97,7 +97,7 @@ export function BotWalletPanel({ snap, compact = false }: { snap: any; compact?:
       {bw.withdrawLocked ? (
         <p className="tiny mono">Withdrawals locked to {short(bw.withdrawTo)} {bw.lockedBy === 'env' ? '(env)' : '(signed)'} — cannot be changed in the app.</p>
       ) : (
-        <p className="note">Connect Phantom once and sign to lock withdrawals to <b>your</b> address. After that, nobody with the link can send funds elsewhere.</p>
+        <p className="note">Connect Phantom once and sign to lock withdrawals to <b>your</b> address. After a successful lock, the address is saved to the host (WITHDRAW_TO) so it survives restarts. Withdrawals always go only to that address.</p>
       )}
       {msg && <p className="tiny" data-testid="deposit-msg">{msg}</p>}
       <div className="deposit-box">

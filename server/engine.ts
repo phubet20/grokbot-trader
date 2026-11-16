@@ -10,11 +10,14 @@ import { Store } from './store.ts';
 import { preCheck, securityCheck } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason } from './risk.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, momentumFadeStrict, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
+import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './render-env.ts';
+import { rebuildPositions } from './reconcile.ts';
+import { getPumpFeed } from './pump.ts';
 
 export type Wallet = {
   connected: boolean;
@@ -122,7 +125,19 @@ export class Engine extends EventEmitter {
 
   async start() {
     await this.refreshSol();
-    if (this.mode === 'live-auto') await this.syncBotBalance();
+    if (autoStartEnabled()) {
+      this.wallet.running = true;
+      this.saveWallet();
+    }
+    if (this.mode === 'live-auto' && hasBotWallet()) {
+      await this.syncBotBalance();
+      if (this.wallet.running || autoStartEnabled()) {
+        await this.connect({ type: 'paper' });
+        await this.reconcileOnchain();
+      }
+    } else if (this.mode === 'live' && this.wallet.connected && (this.wallet.running || autoStartEnabled())) {
+      await this.reconcileOnchain();
+    }
     this.lossPauseUntil = this.store.get('lossPauseUntil', 0);
     // Independent loops: the next tick is scheduled immediately, so a slow
     // scan, buy, or sell never delays the cadence of the others.
@@ -202,7 +217,15 @@ export class Engine extends EventEmitter {
     return { network: 'Solana', mode: this.mode, address, sol, usd: sol * this.solPrice, realSol, solPrice: this.solPrice };
   }
   disconnect() { this.wallet.connected = false; this.wallet.running = false; this.saveWallet(); this.emitState(); }
-  setRunning(r: boolean) { this.wallet.running = r; this.saveWallet(); this.log('Core', 'info', r ? 'Bot resumed' : 'Bot paused - no new trades'); this.emitState(); }
+  setRunning(r: boolean) {
+    this.wallet.running = r;
+    this.saveWallet();
+    this.log('Core', 'info', r ? 'Bot resumed' : 'Bot paused - no new trades');
+    void persistRenderEnv({ AUTO_START: r ? '1' : '0' }).then((res) => {
+      if (res.ok) this.log('Core', 'info', 'Start/Stop saved to host env so it survives a restart');
+    });
+    this.emitState();
+  }
   reset() {
     if (this.mode === 'live') throw new Error('reset is disabled in live mode');
     this.store.reset(); this.positions = []; for (const a of Object.values(this.agents)) for (const k of Object.keys(a)) if (typeof (a as any)[k] === 'number') (a as any)[k] = 0; this.cooldown = {}; this.pending.clear();
@@ -506,7 +529,7 @@ export class Engine extends EventEmitter {
         const px = prices[p.mint] || fresh?.priceUsd || p.lastPrice;
         if (!px) continue;
         p.lastPrice = px;
-        const fade = fresh ? momentumFadeStrict(toSnap(now, fresh)) : { exit: false, reason: '' };
+        const fade = fresh ? sellPressure(fresh, toSnap(now, fresh)) : { exit: false, reason: '' };
         const d = exitReason(p as any, px, strat, now, fade.exit, fade.reason);
         p.peakPrice = d.peak;
         if (d.exit) void this.closePosition(p, d.kind!, d.reason, d.partial ? strat.partialPct / 100 : 1);
@@ -669,6 +692,28 @@ export class Engine extends EventEmitter {
     } catch (e: any) { this.log('Executor', 'info', `live-auto ${side} not sent: ${e.message}`); }
   }
 
+  async reconcileOnchain() {
+    if (this.mode === 'paper') return;
+    const owner = this.mode === 'live-auto' ? botPublicKey() : this.wallet.address;
+    if (!owner) return;
+    try {
+      const r = await rebuildPositions({
+        rpcUrl: this.cfg.rpcUrl, owner, solPrice: this.solPrice,
+        current: this.positions,
+        priceOf: async (mint) => {
+          const px = await this.m.prices([mint]);
+          return px[mint] || this.candidates.get(mint)?.priceUsd || 0;
+        },
+        metaOf: (mint) => this.candidates.get(mint),
+      });
+      this.positions = r.positions;
+      this.persist();
+      if (r.added) this.log('Core', 'info', `reconciled ${r.added} on-chain position(s); monitoring resumes`);
+    } catch (e: any) {
+      this.log('Core', 'info', `reconcile skipped: ${e?.message || e}`);
+    }
+  }
+
   lockedWithdrawTo(): string | null {
     const env = (process.env.WITHDRAW_TO || '').trim();
     if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(env)) return env;
@@ -687,7 +732,11 @@ export class Engine extends EventEmitter {
     this.store.set('withdrawTo', address);
     this.log('Core', 'info', `withdraw address locked to ${address.slice(0, 4)}…${address.slice(-4)}`);
     this.emitState();
-    return { ok: true, withdrawTo: address };
+    void persistRenderEnv({ WITHDRAW_TO: address }).then((res) => {
+      if (res.ok) this.log('Core', 'info', 'withdraw lock saved to host env — it will survive restarts');
+      else this.log('Core', 'info', `withdraw lock is signed but not in host env yet (${res.error || 'no API key'}). Message the bot after locking so it can be saved.`);
+    });
+    return { ok: true, withdrawTo: address, persisted: canPersistRenderEnv() };
   }
   async withdraw() {
     const to = this.lockedWithdrawTo();
@@ -747,7 +796,8 @@ export class Engine extends EventEmitter {
       sizeMult: adapted.sizeMult, pauseUntil: this.lossPauseUntil, scan: this.scanStatus(),
       keepalive: keepaliveSnapshot(),
       push: { enabled: pushEnabled(), subscribers: subscriberCount() },
-      background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH },
+      background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, autoStart: autoStartEnabled(), ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH, withdrawPersist: canPersistRenderEnv() ? 'env' : 'local-until-saved' },
+      pump: getPumpFeed().status,
       botWallet: botPub ? {
         publicKey: botPub,
         withdrawTo: this.lockedWithdrawTo(),

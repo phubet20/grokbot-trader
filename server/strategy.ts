@@ -163,12 +163,66 @@ export function entryReason(hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, n
   return { ok: true, reason: `fast entry · r5 ${(r5 * 100).toFixed(0)}% · m5 ${c.m5.toFixed(1)}%` };
 }
 
+export function matchEntryPatterns(c: Candidate, hist: TapeSnap[], p: StratParams, now: number): { ok: boolean; reason: string } {
+  const s = hist[hist.length - 1] || toSnap(now, c);
+  const r5 = buyRatio(s.b5, s.s5);
+  const ageMin = s.age ? (now - s.age) / 60_000 : (now - (c.createdAt || now)) / 60_000;
+  const flow = c.flow;
+  const progress = c.curve?.progress ?? flow?.progress ?? 0;
+  const unique = flow?.uniqueBuyers || s.tr || 0;
+  const vel = flow?.progressVel ?? 0;
+  if (r5 > p.maxBuyRatio5 && (s.b5 + s.s5) >= 8) return { ok: false, reason: 'honeypot-ratio' };
+  if (flow?.devSold) return { ok: false, reason: 'dev selling' };
+  if (flow?.bundled) return { ok: false, reason: 'bundled sniper' };
+  if ((flow?.devHoldPct || 0) > 25) return { ok: false, reason: 'dev hold cap' };
+  if (s.m5 > 80 && unique < 10) return { ok: false, reason: 'blow-off' };
+
+  const onCurve = !!c.curve && !c.curve.graduated;
+  const volBurst = s.liq > 0 ? s.vol5 / s.liq : (s.vol5 > 0 ? 1 : 0);
+  const risingBuyers = unique >= 3 || (hist.length >= 2 && unique > (hist[0].tr || 0));
+
+  // 1. fresh-launch burst
+  if (ageMin <= 8 && (onCurve || c.source === 'pumpportal' || c.dex === 'pump') && (s.b5 + s.s5 >= 1 || (flow?.netBuySol || 0) > 0) && r5 >= 0.52 && risingBuyers)
+    return { ok: true, reason: `fresh-launch burst · ${ageMin.toFixed(1)}m · r5 ${(r5 * 100).toFixed(0)}%` };
+  // 2. bonding-curve breakout
+  if (onCurve && progress >= 0.12 && progress < 0.72 && vel > 0.02 && r5 >= 0.52 && unique >= 4)
+    return { ok: true, reason: `curve breakout · ${(progress * 100).toFixed(0)}% · vel ${vel.toFixed(2)}` };
+  // 3. near-graduation run
+  if (onCurve && progress >= 0.72 && r5 >= 0.52 && (flow?.largeSells || 0) === 0)
+    return { ok: true, reason: `near-graduation · ${(progress * 100).toFixed(0)}%` };
+  // 4. post-graduation breakout
+  if (c.curve?.graduated && ageMin <= 45 && r5 >= 0.55 && (s.b5 + s.s5) >= 6 && s.liq >= Math.min(p.minLiq, 4000))
+    return { ok: true, reason: `post-graduation breakout · r5 ${(r5 * 100).toFixed(0)}%` };
+  // 5. dip-buy after a whale buy
+  const whale = flow?.whaleBuyUsd || 0;
+  if (whale >= 30 && hist.length >= 2) {
+    const peak = Math.max(...hist.map((x) => x.px).filter((x) => x > 0));
+    const dip = peak > 0 ? (1 - s.px / peak) * 100 : 0;
+    if (dip >= 2 && dip <= 18 && r5 >= 0.55)
+      return { ok: true, reason: `dip-buy after whale · dip ${dip.toFixed(1)}%` };
+  }
+  return { ok: false, reason: 'no pattern' };
+}
+
 /** Candidate-shaped entry for the live engine (builds hist from a short in-memory ring). */
 export function liveEntryOk(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()) {
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
+  const pat = matchEntryPatterns(c, h, p, now);
+  if (pat.ok) return pat;
   return entryReason(h, p, now);
+}
+
+export function sellPressure(c: Candidate | undefined, s: TapeSnap): { exit: boolean; reason: string } {
+  const r5 = buyRatio(s.b5, s.s5);
+  const flow = c?.flow;
+  if (flow?.devSold) return { exit: true, reason: 'sell pressure · dev/top-holder selling' };
+  if ((flow?.largeSells || 0) >= 2 && (flow?.largeSells || 0) > (flow?.largeBuys || 0))
+    return { exit: true, reason: 'sell pressure · large sells' };
+  const net = (s.b5 - s.s5);
+  if ((s.b5 + s.s5) >= 6 && net < 0 && r5 < 0.48) return { exit: true, reason: 'sell pressure · net sell flow' };
+  return momentumFadeStrict(s);
 }
 
 export type PosMark = {

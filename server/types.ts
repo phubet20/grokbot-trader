@@ -15,6 +15,25 @@ export type Candidate = {
   traders1h: number;
   quoteSymbol: string;
   source: string;
+  curve?: { progress: number; vSol: number; vTokens: number; graduated: boolean };
+  flow?: FlowStats;
+  entryPattern?: string;
+};
+
+export type FlowStats = {
+  netBuySol: number;
+  netBuyUsd?: number;
+  largeBuys: number;
+  largeSells: number;
+  uniqueBuyers: number;
+  uniqueSellers: number;
+  whaleBuyUsd: number;
+  bundled?: boolean;
+  devSold?: boolean;
+  devPubkey?: string;
+  devHoldPct?: number;
+  progress?: number;
+  progressVel?: number;
 };
 
 export type TokenSecurity = {
@@ -46,6 +65,8 @@ export type Position = {
   lastPrice: number;
   score: number;
   rentSol: number;         // token-account rent locked while open
+  reconciled?: boolean;
+  entryEstimated?: boolean;
 };
 
 export type ClosedTrade = Position & {
