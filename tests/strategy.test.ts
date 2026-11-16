@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, signalAdjustments, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -174,13 +174,14 @@ test('firstPullback fires on a modest impulse then a reclaim with buy pressure',
   assert.equal(entrySignal(c, hist, STRAT_DEFAULTS, t0 + 3000).ok, true);
 });
 
-test('already-pumped coins and second-leg chases are skipped', () => {
+test('already-pumped coins take a penalty, they are not hard-skipped', () => {
   const t0 = 4_000_000;
   const pumped = { ...baseCoin, createdAt: t0 - 20 * 60_000, change: { m5: 42, m15: 55, h1: 80, h6: 80, h24: 80 }, priceUsd: 180 } as any;
   const histP: TapeSnap[] = [snap({ t: t0, px: 100, m5: 42, m15: 55, h1: 80 })];
   assert.equal(alreadyPumpedHard(pumped, histP, t0), true);
-  assert.equal(entrySignal(pumped, histP, STRAT_DEFAULTS, t0).ok, false);
-  assert.equal(entrySignal(pumped, histP, STRAT_DEFAULTS, t0).reason, 'already pumped');
+  const adj = signalAdjustments(pumped, histP, t0);
+  assert.ok(adj.notes.some((n) => n.includes('already pumped')), adj.notes.join('|'));
+  assert.ok(adj.adj <= 8, 'pumped penalty should offset some bonuses, adj=' + adj.adj);
 
   const second: TapeSnap[] = [
     snap({ t: t0, px: 100, m5: 0, m15: 0, b5: 10, s5: 5 }),

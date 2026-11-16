@@ -545,3 +545,18 @@ export function liveExit(
   return { exit: false, kind: null, reason: '', partial: false, peak };
 }
 
+/** Combine entry rules as bonuses and penalties. Nothing here blocks a buy. */
+export function signalAdjustments(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { adj: number; notes: string[]; why: string } {
+  const notes: string[] = [];
+  let adj = 0;
+  const fp = firstPullback(c, hist, now);
+  if (fp.ok) { adj += 12; notes.push('first pullback +12'); }
+  if (alreadyPumpedHard(c, hist, now)) { adj -= 8; notes.push('already pumped −8'); }
+  const conf = momentumConfirm(c, hist, now);
+  if (conf.ok) { adj += 8; notes.push('momentum +8'); }
+  else if (conf.reason === 'dumping') { adj -= 8; notes.push('dumping −8'); }
+  const sig = entrySignal(c, hist, STRAT_DEFAULTS, now);
+  if (sig.ok && !fp.ok) { adj += 6; notes.push(`${sig.reason} +6`); }
+  const why = fp.ok ? fp.reason : sig.ok ? sig.reason : conf.ok ? conf.reason : (notes[0] || 'score');
+  return { adj, notes, why };
+}

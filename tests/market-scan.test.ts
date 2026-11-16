@@ -103,6 +103,8 @@ test('pre-check does not drop older or large-cap coins when caps are unlimited',
   };
   const r = preCheck(c, { ...DEFAULTS, maxAgeHours: 0, maxMcapUsd: 500_000_000, maxLiquidityUsd: 50_000_000 }, now);
   assert.equal(r.ok, true, r.reasons.join(','));
+  assert.ok(!r.reasons.some((x) => x.startsWith('age')));
   const capped = preCheck(c, { ...DEFAULTS, maxAgeHours: 24 }, now);
-  assert.ok(!capped.ok && capped.reasons.some((x) => x.startsWith('age')));
+  assert.equal(capped.ok, true, 'age is a penalty, not a block');
+  assert.ok(capped.adj < 0 && capped.reasons.some((x) => x.startsWith('age')));
 });

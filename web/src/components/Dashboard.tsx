@@ -91,9 +91,9 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
           <div className="big-num">{compact(a.scanner.total)}</div><div className="muted tiny">pools scanned · {a.scanner.pools} live</div>
           <SourceCounts sources={a.scanner.sources || snap.scan?.sources} />
           {a.scanner.top && <div className="tiny mono row"><TokenAvatar symbol={a.scanner.top} src={a.scanner.topImage} size={14} /> top: ${a.scanner.top}</div>}</div>
-        <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ef4444' }}>🛡</span><div><b>Safety</b><div className="muted tiny">{a.safety.lastOk ? 'Guarding' : 'Rejected'}</div></div></div>
-          <div className="big-num">{a.safety.rejected}</div><div className="muted tiny">rejected · {a.safety.passed} passed</div>
-          {a.safety.lastSymbol && <div className={`tiny mono ${a.safety.lastOk !== false ? 'pos' : 'neg'}`}>${a.safety.lastSymbol} {a.safety.last || '—'}</div>}</div>
+        <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ef4444' }}>🛡</span><div><b>Safety</b><div className="muted tiny">Penalties</div></div></div>
+          <div className="big-num">{a.safety.penalties || a.safety.rejected || 0}</div><div className="muted tiny">penalties · {a.safety.passed} bought</div>
+          {a.safety.lastSymbol && <div className={`tiny mono ${(a.safety.lastAdj || 0) < 0 ? 'neg' : 'pos'}`}>${a.safety.lastSymbol} {a.safety.last || '—'}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#8b5cf6' }}>🧠</span><div><b>Analyst</b><div className="muted tiny">Scoring</div></div></div>
           <div className="row"><Ring v={a.analyst.lastScore || 0} /><div className="tiny"><div className="mono"><TokenAvatar symbol={a.analyst.lastSymbol} src={a.analyst.lastImage} size={14} /> ${a.analyst.lastSymbol || '—'}</div><div className="muted">bull {a.analyst.bull} / bear {a.analyst.bear}</div></div></div>
           <div className="muted tiny">score /100 · buy ≥ {snap.config.minScore}</div></div>
@@ -168,7 +168,7 @@ export function AgentsList({ snap }: { snap: any }) {
   const a = snap.agents;
   const rows = [
     ['SCANNER', `${compact(a.scanner.perHour)}/h → $${a.scanner.top || '—'}`, 'ai-memecoin-bot', '#f59e0b'],
-    ['SAFETY', `$${a.safety.lastSymbol || '—'} ${a.safety.last || 'waiting'}`, 'ai-memecoin-bot', '#ef4444'],
+    ['SAFETY', `$${a.safety.lastSymbol || '—'} ${a.safety.last || 'penalties'}`, 'ai-memecoin-bot', '#ef4444'],
     ['ANALYST', `$${a.analyst.lastSymbol || '—'} bull ${a.analyst.bull}/bear ${a.analyst.bear}`, 'TradingAgents', '#8b5cf6'],
     ['RISK', `size ${snap.config.positionPct}% · catastrophic -${snap.config.hardStopPct}%`, 'TradingAgents', '#ec4899'],
     ['EXECUTOR', a.executor.last || 'idle', 'solana-agent-kit', '#10b981'],

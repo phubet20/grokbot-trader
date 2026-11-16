@@ -7,11 +7,11 @@ import type { MarketSource } from './market.ts';
 import { SOL_MINT } from './market.ts';
 import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts';
 import { Store } from './store.ts';
-import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
+import { preCheck, securityCheck, isPumpCurve, clampScore } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -77,7 +77,7 @@ export class Engine extends EventEmitter {
   pending = new Map<string, Pending>();
   agents = {
     scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0, sources: {} as Record<string, { total: number; last: number; ok: boolean; error?: string }> },
-    safety: { checked: 0, rejected: 0, passed: 0, last: '', lastSymbol: '', lastOk: true, calls: 0, reasons: {} as Record<string, number> },
+    safety: { checked: 0, rejected: 0, passed: 0, penalties: 0, last: '', lastSymbol: '', lastOk: true, lastAdj: 0, calls: 0, reasons: {} as Record<string, number> },
     analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
     risk: { status: 'Guarding', label: '', exits: 0 },
     executor: { fills: 0, last: '', failures: 0 },
@@ -363,7 +363,7 @@ export class Engine extends EventEmitter {
     if (now - this.lastRejectLogAt > 20_000) {
       this.lastRejectLogAt = now;
       const top = Object.entries(s.reasons).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k}×${n}`).join(' · ');
-      this.log('Safety', 'info', `rejects ${s.rejected} · passed ${s.passed} · ${top || 'none yet'}`);
+      this.log('Safety', 'info', `penalties ${s.penalties || s.rejected} · passed ${s.passed} · ${top || 'none yet'}`);
     }
   }
 
@@ -444,24 +444,26 @@ export class Engine extends EventEmitter {
         const merged = prev ? mergePumpOnto(prev, c) : c;
         this.candidates.set(c.mint, { ...merged, seenAt: now, score: prev?.score, safety: prev?.safety });
         this.remember(this.candidates.get(c.mint)!, now);
-        const pc = preCheck(this.candidates.get(c.mint)!, this.cfg, now);
         const cc = this.candidates.get(c.mint)!;
-        if (!pc.ok) {
-          cc.safety = pc.label;
-          if (first) { rejectedNew++; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); }
-          continue;
-        }
+        const pc = preCheck(cc, this.cfg, now);
+        cc.safety = pc.label;
+        (cc as any)._preAdj = pc.adj;
         const s = scoreCandidate(cc);
-        cc.score = s.score;
+        cc.score = clampScore(s.score + pc.adj);
+        if (pc.adj < 0) {
+          if (first) rejectedNew++;
+          this.noteReject('pre:' + (pc.reasons[0] || pc.label));
+        }
         if (first) scoredNew++;
-        if (s.score >= (this.agents.analyst.lastScore || 0)) {
-          Object.assign(this.agents.analyst, { lastScore: s.score, lastSymbol: cc.symbol, lastImage: cc.image, bull: s.bull, bear: s.bear, note: s.note });
+        if (cc.score >= (this.agents.analyst.lastScore || 0)) {
+          Object.assign(this.agents.analyst, { lastScore: cc.score, lastSymbol: cc.symbol, lastImage: cc.image, bull: s.bull, bear: s.bear, note: s.note });
           this.agents.scanner.top = cc.symbol; this.agents.scanner.topImage = cc.image;
         }
         if (first) newN++;
       }
       this.agents.safety.checked += newN + rejectedNew;
-      this.agents.safety.rejected += rejectedNew;
+      this.agents.safety.penalties = (this.agents.safety.penalties || 0) + rejectedNew;
+      this.agents.safety.rejected = this.agents.safety.penalties;
       this.agents.analyst.scored += scoredNew;
       if (scoredNew) this.agents.analyst.calls++;
       this.agents.scanner.lastScanAt = now;
@@ -497,19 +499,23 @@ export class Engine extends EventEmitter {
       const solChg = this.solDayOpen ? ((this.solPrice - this.solDayOpen) / this.solDayOpen) * 100 : 0;
       this.narrative = dailyNarrative([...this.candidates.values()], solChg);
 
-      // SAFETY pre-check + ANALYST scoring
+      // SAFETY flags become score penalties; every coin is scored and can be bought.
       const scored: { c: Candidate; s: ReturnType<typeof scoreCandidate> }[] = [];
+      let penalized = 0;
       for (const c of list) {
         const cc = this.candidates.get(c.mint)!;
         cc.narrativeBoost = narrativeBoost(cc, this.narrative);
         const pc = preCheck(cc, this.cfg, now);
-        if (!pc.ok) { cc.safety = pc.label; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); continue; }
+        cc.safety = pc.label;
+        (cc as any)._preAdj = pc.adj;
         const s = scoreCandidate(cc);
-        cc.score = s.score;
-        scored.push({ c: cc, s });
+        cc.score = clampScore(s.score + pc.adj);
+        if (pc.adj < 0) { penalized++; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); }
+        scored.push({ c: cc, s: { ...s, score: cc.score } });
       }
       this.agents.safety.checked += list.length;
-      this.agents.safety.rejected += list.length - scored.length;
+      this.agents.safety.penalties = (this.agents.safety.penalties || 0) + penalized;
+      this.agents.safety.rejected = this.agents.safety.penalties;
       this.agents.analyst.scored += scored.length;
       this.agents.analyst.calls++;
       scored.sort((a, b) => b.s.score - a.s.score);
@@ -542,7 +548,7 @@ export class Engine extends EventEmitter {
       const recent = [...this.candidates.values()].filter((c) => now - c.seenAt < 180_000);
       this.uni.watch = 0;
       for (const c of recent) {
-        if (!c.score) c.score = scoreCandidate(c).score;
+        const base = scoreCandidate(c).score;
         const hist = this.mintHist.get(c.mint) || [];
         const sig = entrySignal(c, hist, this.strat(), now);
         if (sig.ok) (c as any)._sig = sig.reason;
@@ -550,14 +556,16 @@ export class Engine extends EventEmitter {
         const conf = momentumConfirm(c, hist, now);
         (c as any)._conf = conf.ok;
         if (!(c as any)._conf) (c as any)._confWhy = conf.reason;
+        const adj = signalAdjustments(c, hist, now);
+        const preAdj = Number((c as any)._preAdj || 0);
+        c.score = clampScore(base + preAdj + adj.adj);
+        (c as any)._adjNotes = adj.notes;
+        if (adj.why && adj.why !== 'score') (c as any)._sig = (c as any)._sig || adj.why;
       }
       const scored = recent
         .filter((c) => {
-          const hist = this.mintHist.get(c.mint) || [];
-          if (alreadyPumpedHard(c, hist, now)) { this.noteReject('already pumped', c.mint); return false; }
-          // Primary: first pullback. Secondary: other unpumped momentum signals.
-          // Do not chase a high score on a coin that already pumped or has no reclaim.
-          if ((c as any)._sig) return true;
+          if ((c.score || 0) >= minScore) return true;
+          this.noteReject(`score ${c.score} < ${minScore}`, c.mint);
           return false;
         })
         .sort((a, b) => {
@@ -577,16 +585,18 @@ export class Engine extends EventEmitter {
         const held = this.alreadyHeld(c.mint);
         if (held) return this.canAdd(c, now);
         if (!openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd)) return false;
-        const blocked = entryBlocked(this.cfg, {
-          openPositions: this.occupied(),
-          dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
-          alreadyHolding: false,
-          inCooldown: (this.cooldown[c.mint] || 0) > now,
-          pausedUntil: this.lossPauseUntil, now,
-        });
-        if (blocked) { this.noteReject('risk:' + blocked); return false; }
-        const why = (c as any)._sig || `score ${c.score} ≥ ${minScore}`;
-        if (!this.tuneAllows(why, c.score || 0, minScore, !!(c as any)._sig)) return false;
+        // Risk/cooldown/autotune are penalties, not blocks. Only cash is mechanical.
+        let score = c.score || 0;
+        if ((this.cooldown[c.mint] || 0) > now) score = clampScore(score - 15);
+        if (this.lossPauseUntil && now < this.lossPauseUntil) score = clampScore(score - 15);
+        if (this.wallet.dayStartEquity > 0) {
+          const ddPct = ((this.wallet.dayStartEquity - this.equity()) / this.wallet.dayStartEquity) * 100;
+          if (ddPct >= this.cfg.dailyLossLimitPct) score = clampScore(score - 20);
+        }
+        const why = (c as any)._sig || `score ${score} ≥ ${minScore}`;
+        score = this.tuneAdjust(why, score);
+        c.score = score;
+        if (score < minScore) { this.noteReject(`score ${score} < ${minScore}`, c.mint); return false; }
         return true;
       }).slice(0, 20);
       await poolRun(todo, 6, async (c) => {
@@ -630,36 +640,36 @@ export class Engine extends EventEmitter {
         if (aborted) return;
         this.agents.safety.calls++;
         const sr = securityCheck(sec, this.cfg, { pumpCurve: pump, devHoldPct: c.flow?.devHoldPct });
-        Object.assign(this.agents.safety, { last: sr.label, lastSymbol: c.symbol, lastOk: sr.ok });
+        const adjScore = clampScore(score + (sr.adj || 0));
+        Object.assign(this.agents.safety, { last: sr.label, lastSymbol: c.symbol, lastOk: true, lastAdj: sr.adj || 0 });
         const cc = this.candidates.get(c.mint);
-        if (cc) cc.safety = sr.label;
-        if (!sr.ok) {
-          this.agents.safety.rejected++;
+        if (cc) { cc.safety = sr.label; cc.score = adjScore; }
+        if (sr.adj < 0) {
+          this.agents.safety.penalties = (this.agents.safety.penalties || 0) + 1;
+          this.agents.safety.rejected = this.agents.safety.penalties;
           this.noteReject('sec:' + (sr.reasons[0] || sr.label));
-          this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: `safety: ${sr.reasons.slice(0, 2).join(', ')}` });
-          this.cooldown[c.mint] = Date.now() + 20 * 60_000;
+        }
+        const minScore = this.riskAdapted().minScore;
+        if (adjScore < minScore) {
+          this.noteReject(`score ${adjScore} < ${minScore} after safety ${sr.adj}`, c.mint);
           return;
         }
         const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
         const trialSize = openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd);
         if (!trialSize) { this.noteReject('risk:no size'); return; }
-        // Paper: a quote timeout or API error is unknown, not a hard fail — still buy.
-        // Live keeps the reverse-quote check so we don't enter a token we cannot sell.
+        // Only mechanical skip: no route or quote, retry later (no long cooldown).
         if (this.mode !== 'paper') {
           const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
           if (aborted) return;
           if (!okSell) {
-            this.noteReject(pump ? 'not sellable on curve' : 'not sellable on Jupiter');
-            this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: pump ? 'safety: curve sell quote failed' : 'safety: Jupiter reverse quote failed (not sellable)' });
-            this.cooldown[c.mint] = Date.now() + 15 * 60_000;
+            this.noteReject(pump ? 'no curve quote' : 'no Jupiter route');
+            this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'no route/quote — skip and retry' });
             return;
           }
         }
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
-        // Buy is async. openPosition owns the in-flight flag — adding it here
-        // made alreadyOn() return before the fill and left buys stuck.
-        void this.openPosition(c, score, why);
+        void this.openPosition(c, adjScore, why);
       })();
       await withTimeout(work, CHECK_TIMEOUT_MS, `check ${c.symbol} timeout`);
     } catch {
@@ -1160,13 +1170,14 @@ export class Engine extends EventEmitter {
     return netPnlFromSellQuote(p.costUsd, solReceived, feesSol, this.solPrice);
   }
 
-  private tuneAllows(why: string, score: number, minScore: number, hasSignal: boolean) {
-    if (this.mode !== 'paper') return true;
+  private tuneAdjust(why: string, score: number) {
+    if (this.mode !== 'paper') return score;
     const g = this.tuner.allow(why);
-    if (!g.ok) { this.noteReject('tune:off ' + g.key); return false; }
-    if (!hasSignal && score < minScore + g.minScoreAdj) { this.noteReject('tune:score ' + g.key); return false; }
-    if (g.exploring) this.agents.analyst.label = `explore ${g.key}`;
-    return true;
+    let s = score;
+    if (!g.ok) s = clampScore(s - 12);
+    else if (g.minScoreAdj) s = clampScore(s - g.minScoreAdj);
+    if (g.exploring) (this.agents.analyst as any).label = `explore ${g.key}`;
+    return s;
   }
 
   // ---------------------------------------------------------------- helpers
