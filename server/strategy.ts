@@ -369,24 +369,95 @@ export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.
   return { ok: false, reason: !buyPress ? 'no buy pressure' : 'no thrust' };
 }
 
-/** Immediate entry signals: momentum thrust, fresh launch, dip-reclaim, buy candles, bounce, big-money flow. */
+
+/** True when the move has already extended — chasing here is usually late. */
+export function alreadyPumpedHard(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): boolean {
+  const s = hist[hist.length - 1] || toSnap(now, c);
+  if ((s.m5 || 0) >= 25 || (s.m15 || 0) >= 40 || (s.h1 || 0) >= 60) return true;
+  if ((s.m5 || 0) >= 18 && (s.m15 || 0) >= 30) return true;
+  const prices = hist.map((h) => h.px).filter((x) => x > 0);
+  if (prices.length >= 2) {
+    const first = prices[0], peak = Math.max(...prices), last = prices[prices.length - 1];
+    const run = first > 0 ? (peak / first - 1) * 100 : 0;
+    const fromPeak = peak > 0 ? (1 - last / peak) * 100 : 0;
+    if (run >= 80) return true;
+    if (run >= 40 && fromPeak < 3) return true;
+  }
+  return false;
+}
+
+/**
+ * Primary entry: a new coin's first pullback after a modest impulse, bought as it
+ * reclaims or bounces with buy pressure — before a large second-leg pump.
+ */
+export function firstPullback(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { ok: boolean; reason: string } {
+  const snap = toSnap(now, c);
+  const h = hist.length ? hist : [snap];
+  if (h[h.length - 1].t !== snap.t) h.push(snap);
+  const s = h[h.length - 1];
+  if (alreadyPumpedHard(c, h, now)) return { ok: false, reason: 'already pumped' };
+  if (c.flow?.devSold) return { ok: false, reason: 'dev selling' };
+  const r5 = buyRatio(s.b5, s.s5);
+  const net = (s.b5 - s.s5) > 0 || (c.flow?.netBuySol || 0) > 0;
+  const bouncing = h.length >= 2 ? s.px >= h[h.length - 2].px : (s.m5 || 0) >= -2;
+  if (!bouncing || !net || r5 < 0.52) return { ok: false, reason: 'no reclaim' };
+
+  const prices = h.map((x) => x.px).filter((x) => x > 0);
+  if (prices.length >= 3) {
+    const first = prices[0];
+    // First rising run and its peak, then the first trough after that peak.
+    let runPeak = prices[0], runPeakI = 0;
+    for (let i = 1; i < prices.length; i++) {
+      if (prices[i] >= runPeak * 0.998) { runPeak = Math.max(runPeak, prices[i]); runPeakI = i; }
+      else break;
+    }
+    const after = prices.slice(runPeakI);
+    const trough = Math.min(...after);
+    const troughI = runPeakI + after.indexOf(trough);
+    const laterHigh = Math.max(...prices.slice(troughI));
+    if (laterHigh > runPeak * 1.08) return { ok: false, reason: 'second leg already started' };
+    const impulse = first > 0 ? (runPeak / first - 1) * 100 : 0;
+    const dip = runPeak > 0 ? (1 - trough / runPeak) * 100 : 0;
+    const last = prices[prices.length - 1];
+    if (last < trough * 1.008) return { ok: false, reason: 'still falling' };
+    if (impulse >= 4 && impulse <= 35 && dip >= 3 && dip <= 18)
+      return { ok: true, reason: `first pullback ${dip.toFixed(1)}% after +${impulse.toFixed(0)}% · buy pressure` };
+  }
+
+  // Short tape (new pump.fun coin): 15m impulse, 5m fade, now reclaiming with buy flow.
+  const ageMin = s.age ? (now - s.age) / 60_000 : (c.createdAt ? (now - c.createdAt) / 60_000 : 0);
+  const fresh = ageMin <= 90 || (!!c.curve && !c.curve.graduated) || c.universe === 'new';
+  if (fresh && (s.m15 || 0) >= 5 && (s.m15 || 0) < 40 && (s.h1 || 0) < 50) {
+    const pulled = (s.m5 || 0) <= (s.m15 || 0) - 3 && (s.m5 || 0) <= 12 && (s.m5 || 0) >= -10;
+    if (pulled)
+      return { ok: true, reason: `first pullback · m15 ${(s.m15 || 0).toFixed(0)}% then m5 ${(s.m5 || 0).toFixed(0)}% reclaim · buy pressure` };
+  }
+  return { ok: false, reason: 'no first pullback' };
+}
+
+/** Primary: first pullback on a new coin. Secondary: other unpumped momentum signals. */
 export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()): { ok: boolean; reason: string } {
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
-  const pat = matchEntryPatterns(c, h, p, now);
-  if (pat.ok) return pat;
+  if (alreadyPumpedHard(c, h, now)) return { ok: false, reason: 'already pumped' };
+  const fp = firstPullback(c, h, now);
+  if (fp.ok) return fp;
+  // Secondary: reclaim/bounce/buy-candle on coins that have not already pumped hard.
   const dip = dipReclaim(h);
   if (dip.ok) return dip;
-  const candle = buyCandlePattern(h);
-  if (candle.ok) return candle;
-  const money = bigMoneyInflow(c, snap);
-  if (money.ok) return money;
   const r5 = buyRatio(snap.b5, snap.s5);
   if (h.length >= 3 && snap.m5 < 0 && snap.px > h[h.length - 2].px && r5 >= 0.55 && (snap.b5 - snap.s5) > 0)
     return { ok: true, reason: 'bounce · buy flow returning' };
-  if ((c.score || 0) >= 0 && r5 >= 0.6 && snap.m5 >= 3 && (snap.b5 + snap.s5) >= 4)
-    return { ok: true, reason: 'momentum burst · buy pressure' };
+  const whale = (c.flow?.whaleBuyUsd || 0) >= 30;
+  if (whale && h.length >= 2) {
+    const peak = Math.max(...h.map((x) => x.px).filter((x) => x > 0));
+    const dipPct = peak > 0 ? (1 - snap.px / peak) * 100 : 0;
+    if (dipPct >= 2 && dipPct <= 18 && r5 >= 0.55 && snap.px >= h[h.length - 2].px)
+      return { ok: true, reason: `dip-buy after whale · dip ${dipPct.toFixed(1)}%` };
+  }
+  const candle = buyCandlePattern(h);
+  if (candle.ok && /higher lows/.test(candle.reason)) return candle;
   return { ok: false, reason: 'no signal' };
 }
 

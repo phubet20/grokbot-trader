@@ -16,6 +16,7 @@ export type PatternKey =
   | 'curve-breakout'
   | 'near-graduation'
   | 'post-graduation'
+  | 'first-pullback'
   | 'dip-reclaim'
   | 'buy-candle'
   | 'whale-inflow'
@@ -66,6 +67,7 @@ function classify(reason: string): PatternKey {
   if (r.includes('curve breakout')) return 'curve-breakout';
   if (r.includes('near-graduation') || r.includes('near graduation')) return 'near-graduation';
   if (r.includes('post-graduation') || r.includes('post graduation')) return 'post-graduation';
+  if (r.includes('first pullback')) return 'first-pullback';
   if (r.includes('dip-reclaim') || r.includes('dip-buy') || r.includes('dip reclaim')) return 'dip-reclaim';
   if (r.includes('buy candle')) return 'buy-candle';
   if (r.includes('whale') || r.includes('big-money inflow') || r.includes('big money')) return 'whale-inflow';

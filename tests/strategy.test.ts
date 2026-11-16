@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -147,4 +147,49 @@ test('netPnlFromSellQuote only counts a fill as profit after fees', () => {
   // same cost, sell 0.096 SOL at $80 (= $7.68) — a loss, must not look like TP
   const loss = netPnlFromSellQuote(8, 0.096, 0.0002, 80);
   assert.ok(loss < 0, 'loss=' + loss);
+});
+
+const baseCoin = {
+  mint: 'M', pool: 'P', symbol: 'X', name: 'X', dex: 'pump', priceUsd: 1, mcapUsd: 20_000, liquidityUsd: 8_000,
+  createdAt: 0, change: { m5: 6, m15: 12, h1: 14, h6: 14, h24: 14 },
+  volume: { m5: 2000, h1: 4000, h6: 4000, h24: 4000 },
+  txns: { m5b: 12, m5s: 6, h1b: 20, h1s: 10, h24b: 20, h24s: 10 },
+  traders1h: 20, quoteSymbol: 'SOL', source: 'pumpportal', universe: 'new' as const,
+  curve: { progress: 0.15, vSol: 35, vTokens: 1e9, graduated: false },
+  flow: { netBuySol: 0.4, largeBuys: 0, largeSells: 0, uniqueBuyers: 8, uniqueSellers: 2, whaleBuyUsd: 20 },
+};
+
+test('firstPullback fires on a modest impulse then a reclaim with buy pressure', () => {
+  const t0 = 3_000_000;
+  const hist: TapeSnap[] = [
+    snap({ t: t0, px: 100, m5: 0, m15: 0, h1: 0, b5: 8, s5: 5 }),
+    snap({ t: t0 + 1000, px: 112, m5: 12, m15: 12, h1: 12, b5: 14, s5: 6 }),
+    snap({ t: t0 + 2000, px: 103, m5: 3, m15: 12, h1: 12, b5: 7, s5: 8 }),
+    snap({ t: t0 + 3000, px: 107, m5: 5, m15: 12, h1: 12, b5: 16, s5: 7 }),
+  ];
+  const c = { ...baseCoin, createdAt: t0 - 10 * 60_000, priceUsd: 107 } as any;
+  const r = firstPullback(c, hist, t0 + 3000);
+  assert.equal(r.ok, true, r.reason);
+  assert.match(r.reason, /first pullback/);
+  assert.equal(entrySignal(c, hist, STRAT_DEFAULTS, t0 + 3000).ok, true);
+});
+
+test('already-pumped coins and second-leg chases are skipped', () => {
+  const t0 = 4_000_000;
+  const pumped = { ...baseCoin, createdAt: t0 - 20 * 60_000, change: { m5: 42, m15: 55, h1: 80, h6: 80, h24: 80 }, priceUsd: 180 } as any;
+  const histP: TapeSnap[] = [snap({ t: t0, px: 100, m5: 42, m15: 55, h1: 80 })];
+  assert.equal(alreadyPumpedHard(pumped, histP, t0), true);
+  assert.equal(entrySignal(pumped, histP, STRAT_DEFAULTS, t0).ok, false);
+  assert.equal(entrySignal(pumped, histP, STRAT_DEFAULTS, t0).reason, 'already pumped');
+
+  const second: TapeSnap[] = [
+    snap({ t: t0, px: 100, m5: 0, m15: 0, b5: 10, s5: 5 }),
+    snap({ t: t0 + 1000, px: 112, m5: 12, m15: 12, b5: 14, s5: 6 }),
+    snap({ t: t0 + 2000, px: 104, m5: 4, m15: 12, b5: 8, s5: 7 }),
+    snap({ t: t0 + 3000, px: 125, m5: 16, m15: 25, b5: 18, s5: 8 }),
+    snap({ t: t0 + 4000, px: 118, m5: 10, m15: 25, b5: 16, s5: 7 }),
+  ];
+  const c = { ...baseCoin, createdAt: t0 - 15 * 60_000, priceUsd: 118, change: { m5: 10, m15: 25, h1: 25, h6: 25, h24: 25 } } as any;
+  const r = firstPullback(c, second, t0 + 4000);
+  assert.equal(r.ok, false, r.reason);
 });

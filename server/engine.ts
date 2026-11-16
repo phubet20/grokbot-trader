@@ -10,7 +10,7 @@ import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -546,12 +546,19 @@ export class Engine extends EventEmitter {
       }
       const scored = recent
         .filter((c) => {
-          // Immediate buy: score at or above the floor, or a momentum/entry signal.
-          // Soft "no thrust" is not a hard fail and must not block a qualifying score.
-          if ((c.score || 0) >= minScore || (c as any)._sig) return true;
+          const hist = this.mintHist.get(c.mint) || [];
+          if (alreadyPumpedHard(c, hist, now)) { this.noteReject('already pumped', c.mint); return false; }
+          // Primary: first pullback. Secondary: other unpumped momentum signals.
+          // Do not chase a high score on a coin that already pumped or has no reclaim.
+          if ((c as any)._sig) return true;
           return false;
         })
-        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .sort((a, b) => {
+          const ap = String((a as any)._sig || '').includes('first pullback') ? 1 : 0;
+          const bp = String((b as any)._sig || '').includes('first pullback') ? 1 : 0;
+          if (ap !== bp) return bp - ap;
+          return (b.score || 0) - (a.score || 0);
+        })
         .slice(0, 20);
       if (!scored.length) return;
       const full = this.occupied() >= this.cfg.maxPositions;
