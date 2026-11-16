@@ -25,6 +25,9 @@ async function bootEngine() {
   const savedCfg = store.get<any>('config', null);
   if (savedCfg) updateConfig(savedCfg);
   engine = new Engine(config, market, store);
+  for (const ev of ['state', 'agents', 'activity', 'decision', 'equity', 'positions', 'toast', 'approval']) {
+    engine.on(ev, (d) => broadcast(ev, d));
+  }
   if (restored) console.log('[boot] paper book restored from remote state');
   else if (remoteStateConfigured()) console.log('[boot] remote state configured, no snapshot yet');
   return engine;
