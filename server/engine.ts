@@ -539,10 +539,10 @@ export class Engine extends EventEmitter {
         const hist = this.mintHist.get(c.mint) || [];
         const sig = entrySignal(c, hist, this.strat(), now);
         if (sig.ok) (c as any)._sig = sig.reason;
+        else delete (c as any)._sig;
         const conf = momentumConfirm(c, hist, now);
         (c as any)._conf = conf.ok;
         if (!(c as any)._conf) (c as any)._confWhy = conf.reason;
-        else if (!(c as any)._sig) (c as any)._sig = conf.reason;
       }
       const scored = recent
         .filter((c) => {
