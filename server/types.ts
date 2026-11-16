@@ -18,7 +18,11 @@ export type Candidate = {
   curve?: { progress: number; vSol: number; vTokens: number; graduated: boolean };
   flow?: FlowStats;
   entryPattern?: string;
+  universe?: 'new' | 'trending';
+  smc?: { ok: boolean; reason: string; kind: string; tf?: string };
+  narrativeBoost?: number;
 };
+
 
 export type FlowStats = {
   netBuySol: number;
@@ -71,7 +75,10 @@ export type Position = {
   entryLiq?: number;
   entryPattern?: string;
   entryFeatures?: Record<string, number>;
+  maePct?: number;
+  immediateRed?: boolean;
 };
+
 
 export type ClosedTrade = Position & {
   closedAt: number;

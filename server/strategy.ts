@@ -209,6 +209,7 @@ export function liveEntryOk(c: Candidate, hist: TapeSnap[], p: StratParams = STR
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
+  if (c.smc?.ok) return { ok: true, reason: c.smc.reason };
   const pat = matchEntryPatterns(c, h, p, now);
   if (pat.ok) return pat;
   return entryReason(h, p, now);
@@ -338,11 +339,34 @@ export function bigMoneyInflow(c: Candidate, s: TapeSnap): { ok: boolean; reason
   return { ok: false, reason: '' };
 }
 
-/** Immediate entry signals: fresh launch, dip-reclaim, buy candles, bounce, big-money flow. */
+/** True for already-listed / trending coins that should wait for timing, not a chase. */
+export function isEstablished(c: Candidate, now = Date.now()): boolean {
+  if (c.universe === 'trending') return true;
+  const ageMin = (now - (c.createdAt || now)) / 60_000;
+  if (c.curve && !c.curve.graduated && ageMin < 30) return false;
+  return ageMin >= 30;
+}
+
+/** Require buy pressure plus volume/price thrust so we skip dead or immediately-red entries. */
+export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { ok: boolean; reason: string } {
+  const s = hist[hist.length - 1] || toSnap(now, c);
+  const r5 = buyRatio(s.b5, s.s5);
+  const tot = s.b5 + s.s5;
+  const buyPress = r5 >= 0.55 && (s.b5 - s.s5) > 0 && tot >= 4;
+  const prevVol = hist.length >= 2 ? (hist[hist.length - 2].vol5 || 0) : 0;
+  const volAccel = s.vol5 > 0 && prevVol > 0 && s.vol5 >= prevVol * 1.15;
+  const freshVol = (c.volume?.m5 || 0) > 0 && (s.m5 >= 1.5 || (c.flow?.netBuySol || 0) > 0);
+  const thrust = s.m5 >= 1.5 || volAccel || freshVol;
+  if (buyPress && thrust) return { ok: true, reason: 'buy pressure + volume thrust' };
+  return { ok: false, reason: !buyPress ? 'no buy pressure' : 'no thrust' };
+}
+
+/** Immediate entry signals: fresh launch, dip-reclaim, buy candles, bounce, big-money flow, SMC. */
 export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()): { ok: boolean; reason: string } {
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
   if (h[h.length - 1].t !== snap.t) h.push(snap);
+  if (c.smc?.ok) return { ok: true, reason: c.smc.reason };
   const pat = matchEntryPatterns(c, h, p, now);
   if (pat.ok) return pat;
   const dip = dipReclaim(h);

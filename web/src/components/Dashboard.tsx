@@ -204,6 +204,10 @@ export function ScanStatus({ snap }: { snap: any }) {
       <span>{sc.candidatesPerMin || 0}/min</span>
       <span>{sc.inFlightChecks || 0} in-flight</span>
       <span>{cadence} cadence</span>
+      <span>new {sc.newScanned || 0}</span>
+      <span>trend {sc.trendingScanned || 0}</span>
+      {(sc.watch || 0) > 0 && <span>queue {sc.watch}</span>}
+      {sc.narrative?.label && <span title={sc.narrative.note}>meta {sc.narrative.label}</span>}
       {ka?.enabled && <span className="muted" title={ka.officialGuarantee ? 'guaranteed' : 'best-effort keepalive, not officially guaranteed'}>keep {ka.lastOkAt ? `${Math.round((now - ka.lastOkAt) / 60000)}m ago` : 'pending'}</span>}
     </div>
   );

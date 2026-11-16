@@ -10,7 +10,7 @@ import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, isEstablished, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -19,6 +19,8 @@ import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './rende
 import { rebuildPositions } from './reconcile.ts';
 import { getPumpFeed, mergePumpOnto } from './pump.ts';
 import { AutoTune, patternKey } from './autotune.ts';
+import { smcFromTimeframes } from './smc.ts';
+import { dailyNarrative, narrativeBoost, type Narrative } from './narrative.ts';
 
 export type Wallet = {
   connected: boolean;
@@ -95,6 +97,11 @@ export class Engine extends EventEmitter {
   private bookGen = 0;
   private reservedSol = 0;
   private tuner = new AutoTune();
+  private narrative: Narrative | null = null;
+  private solDayOpen = 0;
+  private uni = { scannedNew: 0, scannedTrending: 0, enteredNew: 0, enteredTrending: 0, watch: 0 };
+  private smcBusy = false;
+
   private lastPairAt = 0;
   private lossPauseUntil = 0;
   private mintHist = new Map<string, TapeSnap[]>();
@@ -350,6 +357,13 @@ export class Engine extends EventEmitter {
       inFlightBuys: this.buying.size,
       inFlightSells: this.selling.size,
       cadenceMs: sc.cadenceMs,
+      newScanned: this.uni.scannedNew,
+      trendingScanned: this.uni.scannedTrending,
+      enteredNew: this.uni.enteredNew,
+      enteredTrending: this.uni.enteredTrending,
+      watch: this.uni.watch,
+      sources: (this.m as any).sourceHits || {},
+      narrative: this.narrative,
     };
   }
   async flushWork(ms = 8000) {
@@ -416,22 +430,38 @@ export class Engine extends EventEmitter {
     if (this.scanning) return;
     this.scanning = true;
     try {
-      const { list, scanned } = await withTimeout(this.m.candidates(), SCAN_FETCH_TIMEOUT_MS, 'scan fetch timeout');
+      const { list, scanned, sources } = await withTimeout(this.m.candidates(), SCAN_FETCH_TIMEOUT_MS, 'scan fetch timeout') as any;
       await new Promise((r) => setImmediate(r));
       const now = Date.now();
-      for (const c of list) { this.candidates.set(c.mint, { ...this.candidates.get(c.mint), ...c, seenAt: now }); this.remember(c, now); }
+      if (this.solPrice && !this.solDayOpen) this.solDayOpen = this.solPrice;
+      let nNew = 0, nTr = 0;
+      for (const c of list) {
+        const prev = this.candidates.get(c.mint);
+        const merged = { ...prev, ...c, seenAt: now, smc: c.smc || prev?.smc } as Candidate;
+        if (isEstablished(merged, now) || merged.universe === 'trending') { merged.universe = 'trending'; nTr++; }
+        else { merged.universe = merged.universe || 'new'; nNew++; }
+        this.candidates.set(c.mint, merged);
+        this.remember(merged, now);
+      }
+      this.uni.scannedNew += nNew;
+      this.uni.scannedTrending += nTr;
       for (const [k, v] of this.candidates) if (now - v.seenAt > 3 * 3600_000 && !this.positions.some((p) => p.mint === k)) this.candidates.delete(k);
+
+      const solChg = this.solDayOpen ? ((this.solPrice - this.solDayOpen) / this.solDayOpen) * 100 : 0;
+      this.narrative = dailyNarrative([...this.candidates.values()], solChg);
 
       // SAFETY pre-check + ANALYST scoring
       const scored: { c: Candidate; s: ReturnType<typeof scoreCandidate> }[] = [];
       for (const c of list) {
-        const pc = preCheck(c, this.cfg, now);
         const cc = this.candidates.get(c.mint)!;
+        cc.narrativeBoost = narrativeBoost(cc, this.narrative);
+        const pc = preCheck(cc, this.cfg, now);
         if (!pc.ok) { cc.safety = pc.label; this.noteReject('pre:' + (pc.reasons[0] || pc.label)); continue; }
-        const s = scoreCandidate(c);
+        const s = scoreCandidate(cc);
         cc.score = s.score;
-        scored.push({ c, s });
+        scored.push({ c: cc, s });
       }
+      void this.enrichSmc(scored.map((x) => x.c));
       this.agents.safety.checked += list.length;
       this.agents.safety.rejected += list.length - scored.length;
       this.agents.analyst.scored += scored.length;
@@ -464,14 +494,27 @@ export class Engine extends EventEmitter {
       const adapted = this.riskAdapted();
       const minScore = adapted.minScore;
       const recent = [...this.candidates.values()].filter((c) => now - c.seenAt < 180_000);
+      let watch = 0;
       for (const c of recent) {
         if (!c.score) c.score = scoreCandidate(c).score;
-        const sig = entrySignal(c, this.mintHist.get(c.mint) || [], this.strat(), now);
+        const hist = this.mintHist.get(c.mint) || [];
+        const sig = entrySignal(c, hist, this.strat(), now);
         if (sig.ok) (c as any)._sig = sig.reason;
+        const conf = momentumConfirm(c, hist, now);
+        (c as any)._conf = conf.ok;
+        if (!(c as any)._conf) (c as any)._confWhy = conf.reason;
+        const established = isEstablished(c, now);
+        // Trending/FOMO: queue and wait for timing (SMC/dip/candle/flow). New coins still need thrust.
+        if (established && !(c as any)._sig) { watch++; continue; }
       }
-      // Enter on score or an immediate pump signal — never wait on a specific coin.
+      this.uni.watch = watch;
       const scored = recent
-        .filter((c) => (c.score || 0) >= minScore || (c as any)._sig)
+        .filter((c) => {
+          const established = isEstablished(c, now);
+          if (!(c as any)._conf) { if ((c.score || 0) >= minScore || (c as any)._sig) this.noteReject('no thrust'); return false; }
+          if (established) return !!(c as any)._sig;
+          return (c.score || 0) >= minScore || !!(c as any)._sig;
+        })
         .sort((a, b) => (b.score || 0) - (a.score || 0))
         .slice(0, 20);
       if (!scored.length) return;
@@ -644,11 +687,12 @@ export class Engine extends EventEmitter {
       id: randomUUID(), mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(),
       entryPrice: f.fillPrice, qty: f.tokens, decimals: f.decimals, costUsd: addUsd, costSol,
       peakPrice: f.fillPrice, lastPrice: f.fillPrice, score, rentSol: f.rentSol, adds: 0, entryLiq: c.liquidityUsd,
-      entryPattern: patternKey(why),
+      entryPattern: patternKey(why), maePct: 0, immediateRed: false,
       entryFeatures: { score, m5: c.change.m5 || 0, m15: c.change.m15 || 0, liq: c.liquidityUsd, netBuy: c.flow?.netBuySol || 0, ageMin: c.createdAt ? (Date.now() - c.createdAt) / 60000 : 0 },
     } as Position;
     (pos as any).origCost = pos.costUsd; (pos as any).partialTaken = false; (pos as any).breakeven = false;
     this.positions.push(pos);
+    if (isEstablished(c) || c.universe === 'trending') this.uni.enteredTrending++; else this.uni.enteredNew++;
     this.agents.executor.fills++; this.agents.executor.last = `BUY ${c.symbol}`;
     this.persist();
     const stake = (pos.costUsd / eq) * 100;
@@ -687,6 +731,9 @@ export class Engine extends EventEmitter {
         const px = prices[p.mint] || fresh?.priceUsd || p.lastPrice;
         if (!px) continue;
         p.lastPrice = px;
+        const fromEntry = (px / p.entryPrice - 1) * 100;
+        p.maePct = Math.min(p.maePct ?? 0, fromEntry);
+        if (now - p.openedAt < 45_000 && fromEntry <= -2) p.immediateRed = true;
         const hist = this.mintHist.get(p.mint) || [];
         const d = liveExit({ ...p, peakPrice: Math.max(p.peakPrice, px) }, px, fresh, hist, {
           catStopPct: this.cfg.hardStopPct,
@@ -779,7 +826,7 @@ export class Engine extends EventEmitter {
     const t: ClosedTrade = { ...p, closedAt: Date.now(), exitPrice, proceedsUsd, pnlUsd, pnlPct: (pnlUsd / p.costUsd) * 100, reason, kind, heldSec: (Date.now() - p.openedAt) / 1000 } as ClosedTrade;
     this.store.addTrade(t);
     if (this.mode === 'paper') {
-      this.tuner.record({ reason: p.entryPattern || reason, exitKind: kind, exitReason: reason, pnlUsd, costUsd: p.costUsd, pnlPct: t.pnlPct, equity: this.equity() });
+      this.tuner.record({ reason: p.entryPattern || reason, exitKind: kind, exitReason: reason, pnlUsd, costUsd: p.costUsd, pnlPct: t.pnlPct, equity: this.equity(), immediateRed: !!p.immediateRed || ((p.maePct || 0) <= -2 && (Date.now() - p.openedAt) < 45_000) });
       this.store.set('autotune', this.tuner.dump());
     }
     const rug = /rug|catastrophic|dev\/top-holder/i.test(reason);
@@ -933,7 +980,7 @@ export class Engine extends EventEmitter {
   // ---------------------------------------------------------------- views
   private rollDay() {
     const k = dayKey();
-    if (this.wallet.dayKey !== k) { this.wallet.dayKey = k; this.wallet.dayStartEquity = this.equity(); this.saveWallet(); }
+    if (this.wallet.dayKey !== k) { this.wallet.dayKey = k; this.wallet.dayStartEquity = this.equity(); if (this.solPrice) this.solDayOpen = this.solPrice; this.saveWallet(); }
   }
   positionsView() {
     return this.positions.map((p) => ({ ...p, valueUsd: p.qty * p.lastPrice, pnlPct: (p.lastPrice / p.entryPrice - 1) * 100, stop: activeStop(this.cfg, p) }));
@@ -979,6 +1026,7 @@ export class Engine extends EventEmitter {
       background: { tradesWithoutApp: true, runningPersisted: !!this.wallet.running, autoStart: autoStartEnabled(), ephemeralStorage: !process.env.RENDER_DISK_MOUNT_PATH, withdrawPersist: canPersistRenderEnv() ? 'env' : 'local-until-saved' },
       pump: getPumpFeed().status,
       autotune: this.tuner.snapshot(),
+      narrative: this.narrative,
       botWallet: botPub ? {
         publicKey: botPub,
         withdrawTo: this.lockedWithdrawTo(),
@@ -1019,6 +1067,23 @@ export class Engine extends EventEmitter {
       position: pos ? { ...pos, valueUsd: pos.qty * pos.lastPrice, stop: activeStop(this.cfg, pos) } : null,
       trades, candles, markers, trailingStopPct: this.cfg.trailingStopPct, hardStopPct: this.cfg.hardStopPct,
     };
+  }
+
+  private async enrichSmc(list: Candidate[]) {
+    if (this.smcBusy || this.mode !== 'paper') return;
+    const want = list.filter((c) => c.pool && (c.universe === 'trending' || isEstablished(c)) && !c.smc?.ok).slice(0, 6);
+    if (!want.length) return;
+    this.smcBusy = true;
+    try {
+      await poolRun(want, 2, async (c) => {
+        const one = await withTimeout(this.m.ohlcv(c.pool, '1m'), 1800, 'ohlcv 1m').catch(() => [] as any);
+        await new Promise((r) => setImmediate(r));
+        const five = one && one.length >= 40 ? [] : await withTimeout(this.m.ohlcv(c.pool, '5m'), 1800, 'ohlcv 5m').catch(() => [] as any);
+        const sig = smcFromTimeframes(one || [], five || []);
+        const cc = this.candidates.get(c.mint);
+        if (cc && sig.ok) { cc.smc = sig; cc.score = scoreCandidate(cc).score; }
+      });
+    } finally { this.smcBusy = false; }
   }
 
   /** Paper TP check: net % from an actual sell quote after extra slip and fees. */

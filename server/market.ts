@@ -15,7 +15,7 @@ export interface MarketSource {
   calls: Record<string, number>;
   errors: number;
   lastError: string;
-  candidates(): Promise<{ list: Candidate[]; scanned: number }>;
+  candidates(): Promise<{ list: Candidate[]; scanned: number; sources?: Record<string, { ok: boolean; n: number; error?: string }> }>;
   security(mint: string): Promise<TokenSecurity | null>;
   prices(mints: string[]): Promise<Record<string, number>>;
   quote(inputMint: string, outputMint: string, amountRaw: bigint, slippageBps: number): Promise<Quote | null>;
@@ -50,7 +50,7 @@ const num = (x: any) => { const n = Number(x); return Number.isFinite(n) ? n : 0
 
 export class LiveMarket implements MarketSource {
   name = 'live';
-  calls: Record<string, number> = { geckoterminal: 0, dexscreener: 0, rugcheck: 0, jupiter: 0 };
+  calls: Record<string, number> = { geckoterminal: 0, dexscreener: 0, rugcheck: 0, jupiter: 0, pumpfun: 0, gmgn: 0 };
   errors = 0;
   lastError = '';
   private gt = new Limiter(2100);      // GeckoTerminal free tier ~30 req/min
@@ -65,6 +65,9 @@ export class LiveMarket implements MarketSource {
   lastSolAt = 0;
   private pump = getPumpFeed();
   private pumpStarted = false;
+  private pumpApi = new Limiter(4000);
+  private gmgn = new Limiter(4000);
+  sourceHits: Record<string, { ok: boolean; n: number; error?: string }> = {};
 
   start() {
     if (this.pumpStarted) return;
@@ -79,6 +82,8 @@ export class LiveMarket implements MarketSource {
     if (src === 'dexscreener') return this.ds;
     if (src === 'rugcheck') return this.rc;
     if (src === 'jupiter') return this.jup;
+    if (src === 'pumpfun') return this.pumpApi;
+    if (src === 'gmgn') return this.gmgn;
     return null;
   }
   private async get(url: string, src: string, timeoutMs = 12000, retry = true): Promise<any> {
@@ -114,6 +119,34 @@ export class LiveMarket implements MarketSource {
     return scanned;
   }
 
+
+  private markSrc(name: string, ok: boolean, n: number, error?: string) {
+    this.sourceHits[name] = { ok, n, error: ok ? undefined : (error || 'fail') };
+  }
+  private strongVol(c: Candidate) {
+    return (c.volume?.m5 || 0) >= 800 || (c.volume?.h1 || 0) >= 5_000 || (c.volume?.h24 || 0) >= 20_000;
+  }
+  private tag(c: Candidate, universe: 'new' | 'trending') {
+    if (!c.universe || universe === 'trending') c.universe = universe;
+    return c;
+  }
+  private mintsFromUnknown(d: any): string[] {
+    const out: string[] = [];
+    const walk = (x: any, depth = 0) => {
+      if (!x || depth > 5) return;
+      if (Array.isArray(x)) { for (const i of x.slice(0, 80)) walk(i, depth + 1); return; }
+      if (typeof x !== 'object') return;
+      for (const k of ['mint', 'tokenAddress', 'address', 'base_token', 'token']) {
+        const v = x[k];
+        if (typeof v === 'string' && v.length >= 32 && v.length <= 48) out.push(v);
+        else if (v && typeof v === 'object' && typeof v.address === 'string') out.push(v.address);
+      }
+      for (const k of ['coins', 'data', 'list', 'rank', 'items', 'tokens', 'results']) if (x[k]) walk(x[k], depth + 1);
+    };
+    walk(d);
+    return [...new Set(out)];
+  }
+
   async candidates() {
     const out = new Map<string, Candidate>();
     let scanned = 0;
@@ -125,10 +158,25 @@ export class LiveMarket implements MarketSource {
       'trending_pools?page=1&duration=5m',
       'new_pools?page=2',
       'trending_pools?page=1&duration=1h',
+      'trending_pools?page=1&duration=6h',
+      'trending_pools?page=1&duration=24h',
     ];
     const gtPages = ['new_pools?page=1', rot[this.scanTick % rot.length]];
-    const addGt = (d: any) => { if (d) scanned += this.ingestGt(d, out); };
-    const addDsPairs = (pairs: any) => {
+    const trendingGt = rot[this.scanTick % rot.length].includes('trending');
+    const addGt = (d: any, universe: 'new' | 'trending' = 'new') => {
+      if (!d) return;
+      const before = new Set(out.keys());
+      scanned += this.ingestGt(d, out);
+      let n = 0;
+      for (const [m, c] of out) {
+        if (before.has(m)) continue;
+        n++;
+        if (universe === 'trending' && this.strongVol(c)) this.tag(c, 'trending');
+        else if (universe === 'new' && !c.universe) c.universe = 'new';
+      }
+      this.markSrc('geckoterminal' + (universe === 'trending' ? '-trending' : '-new'), true, n);
+    };
+    const addDsPairs = (pairs: any, universe: 'new' | 'trending' = 'new') => {
       const best = new Map<string, any>();
       for (const p of Array.isArray(pairs) ? pairs : []) {
         scanned++;
@@ -136,28 +184,36 @@ export class LiveMarket implements MarketSource {
         if (!m) continue;
         if (!best.has(m) || num(p.liquidity?.usd) > num(best.get(m).liquidity?.usd)) best.set(m, p);
       }
+      let n = 0;
       for (const p of best.values()) {
         const c = mapDs(p);
-        if (c && !out.has(c.mint)) out.set(c.mint, c);
+        if (!c) continue;
+        if (universe === 'trending' && !this.strongVol(c)) continue;
+        if (universe === 'trending') this.tag(c, 'trending');
+        if (!out.has(c.mint)) { out.set(c.mint, c); n++; }
+        else if (universe === 'trending') this.tag(out.get(c.mint)!, 'trending');
       }
+      return n;
     };
     // Each source has its own limiter/backoff. They run in parallel so a slow
     // or 429'd API does not hold up the others.
     const gtJobs = gtPages.map((p) => {
       const sep = p.includes('?') ? '&' : '?';
+      const uni: 'new' | 'trending' = p.includes('trending') ? 'trending' : 'new';
       return this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${p}${sep}include=base_token,quote_token,dex`, 'geckoterminal', 5000))
-        .then(addGt).catch(() => {});
+        .then((d) => addGt(d, uni)).catch((e: any) => this.markSrc('geckoterminal', false, 0, e?.message));
     });
     const dsJob = (async () => {
       try {
-        const feed = this.scanTick % 2 ? 'token-profiles/latest/v1' : 'token-boosts/latest/v1';
+        const feed = this.scanTick % 3 === 0 ? 'token-boosts/top/v1' : this.scanTick % 3 === 1 ? 'token-boosts/latest/v1' : 'token-profiles/latest/v1';
         const prof = await this.ds.run(() => this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener', 5000));
         const mints = [...new Set<string>((Array.isArray(prof) ? prof : []).filter((x: any) => x.chainId === 'solana').map((x: any) => x.tokenAddress))].slice(0, 30);
         if (mints.length) {
           const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
-          addDsPairs(pairs);
-        }
-      } catch {}
+          const n = addDsPairs(pairs, 'trending');
+          this.markSrc('dexscreener-trending', true, n);
+        } else this.markSrc('dexscreener-trending', true, 0);
+      } catch (e: any) { this.markSrc('dexscreener-trending', false, 0, e?.message); }
     })();
     const jupJob = (async () => {
       if (this.scanTick % 3 !== 0) return;
@@ -166,23 +222,54 @@ export class LiveMarket implements MarketSource {
         const addrs = (Array.isArray(d) ? d : d?.tokens || []).map((x: any) => x.id || x.address).filter(Boolean).slice(0, 20);
         if (addrs.length) {
           const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${addrs.join(',')}`, 'dexscreener', 5000));
-          addDsPairs(pairs);
+          addDsPairs(pairs, 'new');
         }
       } catch {}
+    })();
+    const pumpJob = (async () => {
+      if (this.scanTick % 4 !== 1) return;
+      const urls = [
+        'https://frontend-api-v3.pump.fun/coins/king-of-the-hill',
+        'https://frontend-api-v3.pump.fun/coins?offset=0&limit=20&sort=market_cap&order=DESC&includeNsfw=false',
+      ];
+      const url = urls[Math.floor(this.scanTick / 4) % urls.length];
+      try {
+        const d = await this.pumpApi.run(() => this.get(url, 'pumpfun', 3000, false));
+        const mints = this.mintsFromUnknown(d).slice(0, 20);
+        if (!mints.length) { this.markSrc('pumpfun-top', false, 0, 'no mints'); return; }
+        const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
+        const n = addDsPairs(pairs, 'trending');
+        this.markSrc('pumpfun-top', true, n);
+      } catch (e: any) { this.markSrc('pumpfun-top', false, 0, e?.message || 'blocked'); }
+    })();
+    const gmgnJob = (async () => {
+      if (this.scanTick % 4 !== 2) return;
+      const url = 'https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=swaps&direction=desc';
+      try {
+        const d = await this.gmgn.run(() => this.get(url, 'gmgn', 3000, false));
+        const mints = this.mintsFromUnknown(d).slice(0, 20);
+        if (!mints.length) { this.markSrc('gmgn-trending', false, 0, 'no mints'); return; }
+        const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
+        const n = addDsPairs(pairs, 'trending');
+        this.markSrc('gmgn-trending', true, n);
+      } catch (e: any) { this.markSrc('gmgn-trending', false, 0, e?.message || 'blocked'); }
     })();
     // Hard deadline: a slow second hop on one source must not hold the scan loop.
     this.start();
     await Promise.race([
-      Promise.all([...gtJobs, dsJob, jupJob]),
+      Promise.all([...gtJobs, dsJob, jupJob, pumpJob, gmgnJob]),
       new Promise((r) => setTimeout(r, 4500)),
     ]);
     const pumpList = this.pump.toCandidates(this.lastSolPrice || 70);
     scanned += pumpList.length;
     for (const p of pumpList) {
       const prev = out.get(p.mint);
-      out.set(p.mint, prev ? mergePumpOnto(prev, p) : p);
+      const merged = prev ? mergePumpOnto(prev, p) : p;
+      if (!merged.universe) merged.universe = 'new';
+      out.set(p.mint, merged);
     }
-    return { list: [...out.values()], scanned };
+    this.markSrc('pumpportal-new', pumpList.length > 0 || !!this.pump.status?.connected, pumpList.length, this.pump.status?.lastError || undefined);
+    return { list: [...out.values()], scanned, sources: { ...this.sourceHits } };
   }
 
   async pair(mint: string): Promise<Candidate | null> {

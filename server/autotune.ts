@@ -22,6 +22,8 @@ export type PatternKey =
   | 'big-money'
   | 'bounce'
   | 'momentum-burst'
+  | 'ob-pullback'
+  | 'fvg-pullback'
   | 'score'
   | 'other';
 
@@ -38,6 +40,8 @@ export type PatternStats = {
   minScoreAdj: number;
   disabled: boolean;
   exploring: boolean;
+  immediateRed: number;
+  immediateRate: number;
 };
 
 export type TuneSnapshot = {
@@ -54,7 +58,7 @@ export type TuneSnapshot = {
   note: string;
 };
 
-type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string };
+type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string; immediateRed?: boolean };
 
 function classify(reason: string): PatternKey {
   const r = (reason || '').toLowerCase();
@@ -67,7 +71,9 @@ function classify(reason: string): PatternKey {
   if (r.includes('whale') || r.includes('big-money inflow') || r.includes('big money')) return 'whale-inflow';
   if (r.includes('net buy volume')) return 'big-money';
   if (r.includes('bounce')) return 'bounce';
-  if (r.includes('momentum burst') || r.includes('breakout')) return 'momentum-burst';
+  if (r.includes('momentum burst') || (r.includes('breakout') && !r.includes('curve'))) return 'momentum-burst';
+  if (r.includes('ob pullback') || r.includes('order block')) return 'ob-pullback';
+  if (r.includes('fvg pullback') || r.includes('fair value')) return 'fvg-pullback';
   if (r.startsWith('score') || r.includes('score ')) return 'score';
   return 'other';
 }
@@ -77,7 +83,7 @@ export function patternKey(reason: string): PatternKey {
 }
 
 function empty(key: PatternKey): PatternStats {
-  return { key, n: 0, wins: 0, losses: 0, wr: 0, expectancy: 0, sumPnl: 0, ddContrib: 0, weight: 1, minScoreAdj: 0, disabled: false, exploring: false };
+  return { key, n: 0, wins: 0, losses: 0, wr: 0, expectancy: 0, sumPnl: 0, ddContrib: 0, weight: 1, minScoreAdj: 0, disabled: false, exploring: false, immediateRed: 0, immediateRate: 0 };
 }
 
 /** Sample Beta(a,b) via two gamma draws (Marsaglia-Tsang for a>=1). */
@@ -144,11 +150,11 @@ export class AutoTune {
     };
   }
 
-  record(opts: { reason: string; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts?: number; exitKind?: string; exitReason?: string }) {
+  record(opts: { reason: string; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts?: number; exitKind?: string; exitReason?: string; immediateRed?: boolean }) {
     if (!this.enabled) return;
     const pattern = classify(opts.reason);
     const cost = Math.max(1e-6, opts.costUsd);
-    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now(), exitKind: opts.exitKind, exitReason: opts.exitReason };
+    const rec: TradeRec = { pattern, pnlUsd: opts.pnlUsd, costUsd: cost, pnlPct: opts.pnlPct, equity: opts.equity, ts: opts.ts || Date.now(), exitKind: opts.exitKind, exitReason: opts.exitReason, immediateRed: !!opts.immediateRed };
     this.trades.push(rec);
     if (this.trades.length > 400) this.trades = this.trades.slice(-400);
     this.rebuild();
@@ -165,6 +171,7 @@ export class AutoTune {
     for (const t of this.trades) {
       const s = map.get(t.pattern) || empty(t.pattern);
       s.n++;
+      if (t.immediateRed) s.immediateRed++;
       if (t.pnlUsd > 0) s.wins++; else s.losses++;
       s.sumPnl += t.pnlUsd;
       if (t.pnlUsd < 0) s.ddContrib += t.pnlUsd;
@@ -173,6 +180,7 @@ export class AutoTune {
     }
     for (const s of map.values()) {
       s.wr = s.n ? s.wins / s.n : 0;
+      s.immediateRate = s.n ? s.immediateRed / s.n : 0;
       s.expectancy = s.n ? s.expectancy : 0; // already summed as pnl/cost, divide
       s.expectancy = s.n ? s.sumPnl / Math.max(1e-6, this.trades.filter((t) => t.pattern === s.key).reduce((a, t) => a + t.costUsd, 0)) : 0;
       if (s.n >= this.minSamples) {
@@ -183,11 +191,14 @@ export class AutoTune {
         } else {
           s.disabled = false;
           // Map expectancy to a bounded weight; positive gets more size, negative is down-weighted.
-          const w = 1 + clamp(s.expectancy * 3, -0.7, 0.8) + clamp((s.wr - 0.5) * 0.6, -0.3, 0.3);
+          let w = 1 + clamp(s.expectancy * 3, -0.7, 0.8) + clamp((s.wr - 0.5) * 0.6, -0.3, 0.3);
+          if (s.immediateRate >= 0.45) w -= 0.35;
           s.weight = clamp(w, 0.35, W_MAX);
           s.minScoreAdj = clamp(Math.round(-s.expectancy * 20), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
           if (s.expectancy < 0) s.minScoreAdj = clamp(6 + Math.round(-s.expectancy * 20), 4, SCORE_ADJ_MAX);
           else s.minScoreAdj = clamp(Math.round(-s.expectancy * 15), SCORE_ADJ_MIN, 2);
+          if (s.immediateRate >= 0.45) s.minScoreAdj = clamp(s.minScoreAdj + 6, SCORE_ADJ_MIN, SCORE_ADJ_MAX);
+          if (s.immediateRate >= 0.7 && s.expectancy <= 0) { s.disabled = true; s.weight = 0; }
         }
       } else {
         s.weight = 1;
