@@ -70,6 +70,22 @@ export function slotSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: numbe
   return round2(Math.min(size, cap));
 }
 
+/**
+ * Size the next entry as a % of spendable cash (free cash minus rent/fee reserve),
+ * never below minTrade and never more than spendable, so cash cannot go negative.
+ * No concurrent-position cap — keep opening until spendable is below the minimum.
+ */
+export function openSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number): number {
+  const spendable = Math.max(0, freeCashUsd - reserveUsd);
+  if (spendable < p.minTradeUsd) return 0;
+  const pct = Math.max(1, Math.min(100, p.positionPct || 8)) / 100;
+  let size = spendable * pct;
+  if (size < p.minTradeUsd) size = p.minTradeUsd;
+  if (size > spendable) return 0;
+  if (equityUsd > 0) size = Math.min(size, equityUsd * 0.24);
+  return round2(size);
+}
+
 export function lowBalanceReason(portfolioUsd: number, freeCashUsd: number, reserveUsd: number, minTradeUsd: number): string | null {
   if (freeCashUsd <= 0) return 'wallet is empty — deposit SOL to the bot address';
   if (freeCashUsd <= reserveUsd) return `balance too low to cover fees and token-account rent (need ~$${reserveUsd.toFixed(2)} reserved, have $${freeCashUsd.toFixed(2)})`;
@@ -132,7 +148,7 @@ export function entryBlocked(p: RiskParams, g: GateInput): string | null {
   if (g.alreadyHolding) return 'already holding';
   if (g.inCooldown) return 'cooldown after recent exit';
   if (g.pausedUntil && (g.now || Date.now()) < g.pausedUntil) return 'cooldown after consecutive losses';
-  if (g.openPositions >= p.maxPositions) return `max ${p.maxPositions} positions`;
+  // maxPositions is not enforced — entries are limited only by free cash.
   if (g.dayStartEquityUsd > 0) {
     const ddPct = ((g.dayStartEquityUsd - g.equityUsd) / g.dayStartEquityUsd) * 100;
     if (ddPct >= p.dailyLossLimitPct) return `daily loss limit hit (-${ddPct.toFixed(1)}%)`;

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, evaluateExit, activeStop, reserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
+import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, evaluateExit, activeStop, reserveSol, sizeMultiplier, consecutiveLosses, adaptFilters, momentumEntryOk, momentumFade, lowBalanceReason, ATA_RENT_SOL } from '../server/risk.ts';
 
 const P = { positionPct: 8, minTradeUsd: 0.5, maxPositions: 4, hardStopPct: 8, trailingStopPct: 12, maxHoldMin: 120, dailyLossLimitPct: 15 };
 const T0 = 1_000_000;
@@ -20,7 +20,7 @@ test('size capped by free cash minus reserve, 0 when below min trade', () => {
 test('entry gates', () => {
   const g = { openPositions: 0, dayStartEquityUsd: 100, equityUsd: 100, alreadyHolding: false, inCooldown: false };
   assert.equal(entryBlocked(P, g), null);
-  assert.match(entryBlocked(P, { ...g, openPositions: 4 })!, /max 4/);
+  assert.equal(entryBlocked(P, { ...g, openPositions: 40 }), null, 'no max-position cap');
   assert.match(entryBlocked(P, { ...g, equityUsd: 85 })!, /daily loss/);
   assert.equal(entryBlocked(P, { ...g, equityUsd: 85.1 }), null);
   assert.match(entryBlocked(P, { ...g, alreadyHolding: true })!, /already/);
@@ -130,4 +130,26 @@ test('paper $8 book can still size a trade with up to 10 slots and fee reserve',
   const size = slotSizeUsd(P2, 8, 8, reserve, 0);
   assert.ok(size >= P2.minTradeUsd, 'size=' + size);
   assert.equal(lowBalanceReason(8, 8, reserve, P2.minTradeUsd), null);
+});
+
+test('openSizeUsd is a % of free cash, never exceeds spendable, and is not capped at 10 positions', () => {
+  const P2 = { ...P, minTradeUsd: 0.25, positionPct: 8 };
+  const reserve = 0.35;
+  const s = openSizeUsd(P2, 81, 81, reserve);
+  assert.ok(s >= P2.minTradeUsd, 'size=' + s);
+  assert.ok(s <= 81 - reserve);
+  const expected = Math.floor((81 - reserve) * 0.08 * 100) / 100;
+  assert.equal(s, expected);
+  let cash = 81, n = 0, spent = 0;
+  while (n < 500) {
+    const sz = openSizeUsd(P2, 81, cash, reserve);
+    if (!sz) break;
+    cash -= sz;
+    spent += sz;
+    n++;
+  }
+  assert.ok(n > 10, 'keeps opening past 10 while cash remains, n=' + n);
+  assert.ok(spent <= 81 - reserve + 1e-9);
+  assert.equal(openSizeUsd(P2, 8, 0.20, reserve), 0);
+  assert.ok(openSizeUsd(P2, 8, 8, reserve) >= P2.minTradeUsd);
 });

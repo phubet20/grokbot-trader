@@ -4,8 +4,7 @@ import { BotWalletPanel } from './BotWallet';
 import { NotifyPanel } from './NotifyPanel';
 
 const FIELDS: [string, string, number, number, number][] = [
-  ['positionPct', 'Position size (% of portfolio)', 1, 50, 1],
-  ['maxPositions', 'Max open positions', 1, 20, 1],
+  ['positionPct', 'Position size (% of free cash)', 1, 50, 1],
   ['takeProfitPct', 'Take profit (% net after fees/slip)', 0.5, 50, 0.5],
   ['hardStopPct', 'Catastrophic stop (% below entry)', 10, 80, 1],
   ['trailingStopPct', 'Trailing stop (% from top)', 2, 60, 0.5],

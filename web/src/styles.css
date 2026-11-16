@@ -144,7 +144,7 @@ input { font: inherit; color: inherit; }
 .sec-hd b { font-size: 16px; }
 .hscroll { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 6px; margin: 0 -16px; padding-left: 16px; padding-right: 16px; scrollbar-width: none; }
 .hscroll::-webkit-scrollbar { display: none; }
-.agent-card { flex: 0 0 158px; scroll-snap-align: start; background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 10px; display: flex; flex-direction: column; gap: 5px; min-height: 140px; box-shadow: var(--shadow); }
+.agent-card { flex: 0 0 168px; scroll-snap-align: start; background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 10px; display: flex; flex-direction: column; gap: 5px; min-height: 140px; box-shadow: var(--shadow); }
 .ag-hd { display: flex; gap: 8px; align-items: center; } .ag-hd b { font-size: 14px; }
 .ag-ico { width: 26px; height: 26px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; flex: none; }
 .big-num { font-size: 26px; font-weight: 800; letter-spacing: -.5px; }
@@ -223,6 +223,8 @@ code { font-family: var(--mono); font-size: 12px; background: var(--chip); paddi
 
 .scan-status { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; color: var(--muted); justify-content: space-between; }
 .scan-status span { white-space: nowrap; }
+.src-counts { display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 2px; }
+.src-counts span { white-space: nowrap; color: var(--muted); }
 .notify-box .hint { margin-top: 8px; }
 .deposit-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
 .deposit-row input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); }

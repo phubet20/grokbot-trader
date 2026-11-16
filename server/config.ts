@@ -18,7 +18,7 @@ export type Config = {
   startUsd: number;            // paper wallet starting balance (USD), min 2
   positionPct: number;         // % of current portfolio per trade
   minTradeUsd: number;         // never open a trade smaller than this
-  maxPositions: number;        // max concurrent open positions
+  maxPositions: number;        // 0 = unlimited (cash is the only cap)
   takeProfitPct: number;       // paper: close 100% when net PnL after fees/slip reaches this %
   hardStopPct: number;         // exit if price drops this % below entry
   trailingStopPct: number;     // exit if price drops this % from the peak
@@ -51,7 +51,7 @@ export const DEFAULTS: Config = {
   startUsd: 81,
   positionPct: 8,
   minTradeUsd: 0.25,
-  maxPositions: 10,
+  maxPositions: 0,
   takeProfitPct: 3,
   hardStopPct: 35,
   trailingStopPct: 60,
@@ -63,7 +63,7 @@ export const DEFAULTS: Config = {
   maxLiquidityUsd: 50_000_000,
   minHolders: 40,
   minAgeMin: 0,
-  maxAgeHours: 336,
+  maxAgeHours: 0,            // 0 = no age cap (scan new and older tokens)
   minMcapUsd: 1_000,
   maxMcapUsd: 500_000_000,
   maxTopHolderPct: 25,
@@ -104,7 +104,7 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   }
   if (out.startUsd !== undefined) out.startUsd = Math.max(2, out.startUsd);
   if (out.positionPct !== undefined) out.positionPct = Math.min(100, Math.max(1, out.positionPct));
-  if (out.maxPositions !== undefined) out.maxPositions = Math.min(20, Math.max(1, Math.round(out.maxPositions)));
+  if (out.maxPositions !== undefined) out.maxPositions = Math.min(1000, Math.max(0, Math.round(out.maxPositions)));
   if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0, out.takeProfitPct));
   if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(80, Math.max(1, out.hardStopPct));
   if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(80, Math.max(2, out.trailingStopPct));

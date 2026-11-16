@@ -4,17 +4,22 @@
 import type { Candidate, TokenSecurity } from './types.ts';
 import type { MarketSource, Quote, Candle } from './market.ts';
 import { SOL_MINT } from './market.ts';
+import { summarizeSources } from './scan-feeds.ts';
 
 function rng(seed: number) { return () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; }; }
 const NAMES = ['CAT3', 'TRASHCAN', 'STONEFACE', 'FROINK', 'LMAO', 'HOUSECOIN', 'BEER', 'CPU', 'DUBBLE', 'INVERSE', 'FLOAT', 'DOGTHINK', 'GROKBOT', 'SUNSETJET', 'TRENCH', 'CHILLOWEEN', 'CATBOT', 'GATO', 'SLINGFOLIO', 'Alice', 'HODL', 'ARNOLD', 'scamsem', 'COGE', 'SI276'];
 
-type Sim = { mint: string; pool: string; symbol: string; createdAt: number; price: number; liq: number; supply: number; hist: { t: number; p: number; v: number; b: number; s: number }[]; drift: number; bad: boolean };
+type Sim = { mint: string; pool: string; symbol: string; createdAt: number; price: number; liq: number; supply: number; hist: { t: number; p: number; v: number; b: number; s: number }[]; drift: number; bad: boolean; script?: 'tp-pump' };
 
 export class ReplayMarket implements MarketSource {
   name = 'replay';
   calls: Record<string, number> = { replay: 0 };
   errors = 0;
   lastError = '';
+  sourceHits: Record<string, { ok: boolean; n: number; error?: string }> = {};
+  sourceLast: Record<string, { ok: boolean; n: number; error?: string }> = {};
+  sourceTotals: Record<string, number> = {};
+  sourceSummary() { return summarizeSources(this.sourceLast, this.sourceTotals); }
   private r = rng(42);
   private sims: Sim[] = [];
   private solPrice = 170;
@@ -33,6 +38,35 @@ export class ReplayMarket implements MarketSource {
       s.price = p;
       this.sims.push(s);
     });
+    this.addFirstPullbackSim('RECLAIM', this.sims.length);
+    this.addFirstPullbackSim('FIRSTDIP', this.sims.length);
+  }
+
+  /** Deterministic first-pullback setup that then trends up so paper TP can fire. */
+  private addFirstPullbackSim(symbol: string, i: number) {
+    const now = Date.now();
+    const mint = `RepPB${i.toString().padStart(2, '0')}${'x'.repeat(30)}${i}`.slice(0, 44);
+    const createdAt = now - 25 * 60_000;
+    const start = 0.001;
+    const hist: Sim['hist'] = [];
+    let p = start;
+    for (let k = 15; k > 7; k--) {
+      p = start * (1 + 0.01 * (15 - k));
+      hist.push({ t: now - k * 60_000, p, v: 3000, b: 30, s: 12 });
+    }
+    const peak = start * 1.08;
+    for (let k = 7; k > 3; k--) {
+      p = peak * (1 - 0.012 * (8 - k));
+      hist.push({ t: now - k * 60_000, p, v: 2500, b: 18, s: 16 });
+    }
+    const trough = peak * (1 - 0.048);
+    for (let k = 3; k > 0; k--) {
+      p = trough * (1 + 0.015 * (4 - k));
+      hist.push({ t: now - k * 60_000, p, v: 4000, b: 35, s: 12 });
+    }
+    p = trough * 1.05;
+    hist.push({ t: now, p, v: 4000, b: 40, s: 14 });
+    this.sims.push({ mint, pool: 'pool' + mint.slice(3), symbol, createdAt, price: p, liq: 80_000, supply: 1e9, hist, drift: 0.015, bad: false, script: 'tp-pump' });
   }
 
   /** advance the simulation to "now" in 1-minute (scaled) steps */
@@ -43,12 +77,21 @@ export class ReplayMarket implements MarketSource {
       this.lastStep += stepMs;
       const t = this.sims[0].hist[this.sims[0].hist.length - 1].t + 60_000;
       for (const s of this.sims) {
-        let ch = (this.r() - 0.5) * 0.05 + s.drift;
-        if (this.r() < 0.02) ch += 0.15 + this.r() * 0.4;  // pump
-        if (s.bad && this.r() < 0.01) ch -= 0.6;           // rug
-        if (this.r() < 0.05) s.drift = (this.r() - 0.45) * 0.006;
+        let ch: number;
+        let b: number;
+        let sl: number;
+        if (s.script === 'tp-pump') {
+          ch = 0.016;
+          b = 36; sl = 12;
+        } else {
+          ch = (this.r() - 0.5) * 0.05 + s.drift;
+          if (this.r() < 0.02) ch += 0.15 + this.r() * 0.4;  // pump
+          if (s.bad && this.r() < 0.01) ch -= 0.6;           // rug
+          if (this.r() < 0.05) s.drift = (this.r() - 0.45) * 0.006;
+          b = 5 + Math.floor(this.r() * 40 * (ch > 0 ? 1.5 : 0.8));
+          sl = 5 + Math.floor(this.r() * 35 * (ch < 0 ? 1.5 : 0.8));
+        }
         s.price = Math.max(1e-9, s.price * (1 + ch));
-        const b = 5 + Math.floor(this.r() * 40 * (ch > 0 ? 1.5 : 0.8)), sl = 5 + Math.floor(this.r() * 35 * (ch < 0 ? 1.5 : 0.8));
         s.hist.push({ t, p: s.price, v: (b + sl) * (50 + this.r() * 200), b, s: sl });
         if (s.hist.length > 600) s.hist.shift();
       }
@@ -75,7 +118,11 @@ export class ReplayMarket implements MarketSource {
         traders1h: Math.round(sum(60, (x) => x.b + x.s) * 0.5), quoteSymbol: 'SOL', source: 'replay',
       };
     });
-    return { list, scanned: list.length };
+    const n = list.length;
+    this.sourceLast = { replay: { ok: true, n } };
+    this.sourceHits = { ...this.sourceLast };
+    this.sourceTotals.replay = (this.sourceTotals.replay || 0) + n;
+    return { list, scanned: n, sources: this.sourceSummary() };
   }
 
   async security(mint: string): Promise<TokenSecurity | null> {

@@ -9,7 +9,8 @@ import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts'
 import { Store } from './store.ts';
 import { preCheck, securityCheck, isPumpCurve } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
-import { positionSizeUsd, slotSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
+import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
+import { summarizeSources } from './scan-feeds.ts';
 import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
@@ -75,7 +76,7 @@ export class Engine extends EventEmitter {
   cooldown: Record<string, number>;
   pending = new Map<string, Pending>();
   agents = {
-    scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0 },
+    scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0, sources: {} as Record<string, { total: number; last: number; ok: boolean; error?: string }> },
     safety: { checked: 0, rejected: 0, passed: 0, last: '', lastSymbol: '', lastOk: true, calls: 0, reasons: {} as Record<string, number> },
     analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
     risk: { status: 'Guarding', label: '', exits: 0 },
@@ -366,9 +367,15 @@ export class Engine extends EventEmitter {
     }
   }
 
+  private refreshSources() {
+    const m: any = this.m;
+    if (typeof m.sourceSummary === 'function') this.agents.scanner.sources = m.sourceSummary();
+    else this.agents.scanner.sources = summarizeSources(m.sourceLast || m.sourceHits || {}, m.sourceTotals || {});
+  }
   private bumpScanStats(now: number, scanned: number, pools: number) {
     const sc = this.agents.scanner;
     sc.pools = pools; sc.total += scanned; sc.lastScanAt = now; sc.calls++;
+    this.refreshSources();
     this.scanHistory.push({ t: now, n: scanned });
     this.scanHistory = this.scanHistory.filter((x) => now - x.t < 3600_000);
     this.scanTimes.push(now);
@@ -402,7 +409,7 @@ export class Engine extends EventEmitter {
       enteredNew: this.uni.enteredNew,
       enteredTrending: this.uni.enteredTrending,
       watch: this.uni.watch,
-      sources: (this.m as any).sourceHits || {},
+      sources: this.agents.scanner.sources || (this.m as any).sourceHits || {},
       narrative: this.narrative,
     };
   }
@@ -561,13 +568,15 @@ export class Engine extends EventEmitter {
         })
         .slice(0, 20);
       if (!scored.length) return;
-      const full = this.occupied() >= this.cfg.maxPositions;
-      if (full) this.agents.risk.label = `holding ${this.occupied()}/${this.cfg.maxPositions}`;
+      const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
+      if (!openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd)) {
+        this.agents.risk.label = 'holding until cash frees up';
+      }
       const todo = scored.filter((c) => {
         if (this.inFlightChecks.has(c.mint) || this.buying.has(c.mint)) return false;
         const held = this.alreadyHeld(c.mint);
         if (held) return this.canAdd(c, now);
-        if (full) return false;
+        if (!openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd)) return false;
         const blocked = entryBlocked(this.cfg, {
           openPositions: this.occupied(),
           dayStartEquityUsd: this.wallet.dayStartEquity, equityUsd: this.equity(),
@@ -579,8 +588,8 @@ export class Engine extends EventEmitter {
         const why = (c as any)._sig || `score ${c.score} ≥ ${minScore}`;
         if (!this.tuneAllows(why, c.score || 0, minScore, !!(c as any)._sig)) return false;
         return true;
-      }).slice(0, 10);
-      await poolRun(todo, 4, async (c) => {
+      }).slice(0, 20);
+      await poolRun(todo, 6, async (c) => {
         const why = (c as any)._sig || `score ${c.score} ≥ ${minScore}`;
         await this.checkCandidate(c, c.score || 0, why).catch(() => {});
       });
@@ -608,7 +617,7 @@ export class Engine extends EventEmitter {
   private async checkCandidate(c: Candidate, score: number, why: string) {
     const adding = this.alreadyHeld(c.mint);
     if (adding && !this.canAdd(c)) return;
-    if (!adding && (this.alreadyOn(c.mint) || this.occupied() >= this.cfg.maxPositions)) return;
+    if (!adding && this.alreadyOn(c.mint)) return;
     this.inFlightChecks.add(c.mint);
     this.agents.scanner.inFlightChecks = this.inFlightChecks.size;
     this.emit('agents', this.agents);
@@ -632,7 +641,7 @@ export class Engine extends EventEmitter {
           return;
         }
         const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * (this.solPrice || 0);
-        const trialSize = slotSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd, this.occupied());
+        const trialSize = openSizeUsd(this.cfg, this.equity(), this.freeCashUsd(), reserveUsd);
         if (!trialSize) { this.noteReject('risk:no size'); return; }
         // Paper: a quote timeout or API error is unknown, not a hard fail — still buy.
         // Live keeps the reverse-quote check so we don't enter a token we cannot sell.
@@ -648,9 +657,8 @@ export class Engine extends EventEmitter {
         }
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
-        // Buy is async: mark in-flight now, never await the fill here.
-        this.buying.add(c.mint);
-        this.agents.scanner.inFlightBuys = this.buying.size;
+        // Buy is async. openPosition owns the in-flight flag — adding it here
+        // made alreadyOn() return before the fill and left buys stuck.
         void this.openPosition(c, score, why);
       })();
       await withTimeout(work, CHECK_TIMEOUT_MS, `check ${c.symbol} timeout`);
@@ -670,7 +678,8 @@ export class Engine extends EventEmitter {
     const existing = this.positions.find((p) => p.mint === c.mint);
     const adding = !!existing;
     if (adding && !this.canAdd(c)) return;
-    if (!adding && this.occupied() >= this.cfg.maxPositions && !this.buying.has(c.mint)) return;
+    if (!adding && this.alreadyHeld(c.mint)) return;
+    if (this.buying.has(c.mint)) return;
     this.buying.add(c.mint);
     this.agents.scanner.inFlightBuys = this.buying.size;
     try {
@@ -681,8 +690,7 @@ export class Engine extends EventEmitter {
     const reserveUsd = reserveSol(this.cfg.priorityFeeSol) * this.solPrice;
     const low = lowBalanceReason(eq, this.freeCashUsd(), reserveUsd, this.cfg.minTradeUsd);
     if (low) { this.agents.risk.label = low; return; }
-    const openNow = Math.max(0, this.occupied() - (this.buying.has(c.mint) ? 1 : 0));
-    let size = slotSizeUsd(this.cfg, eq, this.freeCashUsd(), reserveUsd, adding ? Math.max(0, openNow - 1) : openNow);
+    let size = openSizeUsd(this.cfg, eq, this.freeCashUsd(), reserveUsd);
     if (adding && existing) {
       const room = Math.max(0, this.maxCoinUsd() - existing.costUsd);
       size = Math.min(size, room);

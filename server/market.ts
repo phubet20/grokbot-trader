@@ -3,6 +3,8 @@
 import type { Candidate, TokenSecurity } from './types.ts';
 import { getPumpFeed, mergePumpOnto, curveQuote, priceUsdFromCurve } from './pump.ts';
 import { fetchMintAuthorities } from './reconcile.ts';
+import { dsScanJobs, gtScanPaths, solMintsFromProfiles, solanaPairs, summarizeSources } from './scan-feeds.ts';
+export { summarizeSources } from './scan-feeds.ts';
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -68,6 +70,12 @@ export class LiveMarket implements MarketSource {
   private pumpApi = new Limiter(4000);
   private gmgn = new Limiter(4000);
   sourceHits: Record<string, { ok: boolean; n: number; error?: string }> = {};
+  sourceLast: Record<string, { ok: boolean; n: number; error?: string }> = {};
+  sourceTotals: Record<string, number> = {};
+
+  sourceSummary() {
+    return summarizeSources(this.sourceLast, this.sourceTotals);
+  }
 
   start() {
     if (this.pumpStarted) return;
@@ -121,7 +129,10 @@ export class LiveMarket implements MarketSource {
 
 
   private markSrc(name: string, ok: boolean, n: number, error?: string) {
-    this.sourceHits[name] = { ok, n, error: ok ? undefined : (error || 'fail') };
+    const row = { ok, n, error: ok ? undefined : (error || 'fail') };
+    this.sourceHits[name] = row;
+    this.sourceLast[name] = row;
+    if (ok && n) this.sourceTotals[name] = (this.sourceTotals[name] || 0) + n;
   }
   private strongVol(c: Candidate) {
     return (c.volume?.m5 || 0) >= 800 || (c.volume?.h1 || 0) >= 5_000 || (c.volume?.h24 || 0) >= 20_000;
@@ -151,19 +162,9 @@ export class LiveMarket implements MarketSource {
     const out = new Map<string, Candidate>();
     let scanned = 0;
     this.scanTick++;
-    const dexes = ['pumpswap', 'pump-fun', 'raydium', 'meteora'];
-    const dex = dexes[this.scanTick % dexes.length];
-    const rot = [
-      `dexes/${dex}/new_pools?page=1`,
-      'trending_pools?page=1&duration=5m',
-      'new_pools?page=2',
-      'trending_pools?page=1&duration=1h',
-      'trending_pools?page=1&duration=6h',
-      'trending_pools?page=1&duration=24h',
-    ];
-    const gtPages = ['new_pools?page=1', rot[this.scanTick % rot.length]];
-    const trendingGt = rot[this.scanTick % rot.length].includes('trending');
-    const addGt = (d: any, universe: 'new' | 'trending' = 'new') => {
+    this.sourceLast = {};
+    const gtPages = gtScanPaths(this.scanTick);
+    const addGt = (d: any, universe: 'new' | 'trending' = 'new', src = 'geckoterminal') => {
       if (!d) return;
       const before = new Set(out.keys());
       scanned += this.ingestGt(d, out);
@@ -171,14 +172,14 @@ export class LiveMarket implements MarketSource {
       for (const [m, c] of out) {
         if (before.has(m)) continue;
         n++;
-        if (universe === 'trending' && this.strongVol(c)) this.tag(c, 'trending');
+        if (universe === 'trending') this.tag(c, 'trending');
         else if (universe === 'new' && !c.universe) c.universe = 'new';
       }
-      this.markSrc('geckoterminal' + (universe === 'trending' ? '-trending' : '-new'), true, n);
+      this.markSrc(src, true, n);
     };
     const addDsPairs = (pairs: any, universe: 'new' | 'trending' = 'new') => {
       const best = new Map<string, any>();
-      for (const p of Array.isArray(pairs) ? pairs : []) {
+      for (const p of solanaPairs(pairs)) {
         scanned++;
         const m = p.baseToken?.address;
         if (!m) continue;
@@ -188,7 +189,7 @@ export class LiveMarket implements MarketSource {
       for (const p of best.values()) {
         const c = mapDs(p);
         if (!c) continue;
-        if (universe === 'trending' && !this.strongVol(c)) continue;
+        // Include small and large caps; do not drop quiet or large-cap pairs.
         if (universe === 'trending') this.tag(c, 'trending');
         if (!out.has(c.mint)) { out.set(c.mint, c); n++; }
         else if (universe === 'trending') this.tag(out.get(c.mint)!, 'trending');
@@ -197,23 +198,29 @@ export class LiveMarket implements MarketSource {
     };
     // Each source has its own limiter/backoff. They run in parallel so a slow
     // or 429'd API does not hold up the others.
-    const gtJobs = gtPages.map((p) => {
-      const sep = p.includes('?') ? '&' : '?';
-      const uni: 'new' | 'trending' = p.includes('trending') ? 'trending' : 'new';
-      return this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${p}${sep}include=base_token,quote_token,dex`, 'geckoterminal', 5000))
-        .then((d) => addGt(d, uni)).catch((e: any) => this.markSrc('geckoterminal', false, 0, e?.message));
+    const gtJobs = gtPages.map((job) => {
+      const sep = job.path.includes('?') ? '&' : '?';
+      return this.gt.run(() => this.get(`https://api.geckoterminal.com/api/v2/networks/solana/${job.path}${sep}include=base_token,quote_token,dex`, 'geckoterminal', 5000))
+        .then((d) => addGt(d, job.universe, job.src)).catch((e: any) => this.markSrc(job.src, false, 0, e?.message));
     });
     const dsJob = (async () => {
-      try {
-        const feed = this.scanTick % 3 === 0 ? 'token-boosts/top/v1' : this.scanTick % 3 === 1 ? 'token-boosts/latest/v1' : 'token-profiles/latest/v1';
-        const prof = await this.ds.run(() => this.get(`https://api.dexscreener.com/${feed}`, 'dexscreener', 5000));
-        const mints = [...new Set<string>((Array.isArray(prof) ? prof : []).filter((x: any) => x.chainId === 'solana').map((x: any) => x.tokenAddress))].slice(0, 30);
-        if (mints.length) {
-          const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
-          const n = addDsPairs(pairs, 'trending');
-          this.markSrc('dexscreener-trending', true, n);
-        } else this.markSrc('dexscreener-trending', true, 0);
-      } catch (e: any) { this.markSrc('dexscreener-trending', false, 0, e?.message); }
+      for (const job of dsScanJobs(this.scanTick)) {
+        try {
+          if (job.kind === 'search') {
+            const d = await this.ds.run(() => this.get(job.url, 'dexscreener', 5000));
+            const n = addDsPairs(d, job.universe);
+            this.markSrc(job.src, true, n);
+            continue;
+          }
+          const prof = await this.ds.run(() => this.get(job.url, 'dexscreener', 5000));
+          const mints = solMintsFromProfiles(prof, 30);
+          if (mints.length) {
+            const pairs = await this.ds.run(() => this.get(`https://api.dexscreener.com/tokens/v1/solana/${mints.join(',')}`, 'dexscreener', 5000));
+            const n = addDsPairs(pairs, job.universe);
+            this.markSrc(job.src, true, n);
+          } else this.markSrc(job.src, true, 0);
+        } catch (e: any) { this.markSrc(job.src, false, 0, e?.message); }
+      }
     })();
     const jupJob = (async () => {
       if (this.scanTick % 3 !== 0) return;
@@ -269,7 +276,7 @@ export class LiveMarket implements MarketSource {
       out.set(p.mint, merged);
     }
     this.markSrc('pumpportal-new', pumpList.length > 0 || !!this.pump.status?.connected, pumpList.length, this.pump.status?.lastError || undefined);
-    return { list: [...out.values()], scanned, sources: { ...this.sourceHits } };
+    return { list: [...out.values()], scanned, sources: this.sourceSummary() };
   }
 
   async pair(mint: string): Promise<Candidate | null> {

@@ -22,9 +22,9 @@ export function preCheck(c: Candidate, cfg: Config, now = Date.now()): SafetyRes
   const tx1h = c.txns.h1b + c.txns.h1s, tx5 = c.txns.m5b + c.txns.m5s;
   if (!pump && ageMin > 30 && tx5 === 0 && tx1h === 0) r.push('no trades');
   if (!pump && c.volume.h1 > c.liquidityUsd * 12 && c.traders1h < 30 && c.liquidityUsd > 0) r.push('wash-trade pattern');
-  if (c.liquidityUsd > cfg.maxLiquidityUsd) r.push('liq too large (not a meme play)');
-  if (c.mcapUsd > cfg.maxMcapUsd) r.push(`mcap $${k(c.mcapUsd)} too large`);
-  if (ageMin > cfg.maxAgeHours * 60) r.push(`age > ${cfg.maxAgeHours}h`);
+  if (cfg.maxLiquidityUsd > 0 && c.liquidityUsd > cfg.maxLiquidityUsd) r.push('liq too large (not a meme play)');
+  if (cfg.maxMcapUsd > 0 && c.mcapUsd > cfg.maxMcapUsd) r.push(`mcap $${k(c.mcapUsd)} too large`);
+  if (cfg.maxAgeHours > 0 && ageMin > cfg.maxAgeHours * 60) r.push(`age > ${cfg.maxAgeHours}h`);
   // honeypot-ish: lots of buys, (almost) no sells
   if (c.txns.h1b >= 30 && c.txns.h1s <= Math.max(1, c.txns.h1b * 0.05)) r.push('honeypot? buys but no sells');
   else if (c.txns.m5b >= 20 && c.txns.m5s <= Math.max(1, c.txns.m5b * 0.05)) r.push('honeypot? buys but no sells');

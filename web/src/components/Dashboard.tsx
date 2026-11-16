@@ -89,6 +89,7 @@ export function AgentCards({ snap, onOpen }: { snap: any; onOpen: (m: string) =>
       <div className="hscroll">
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#f59e0b' }}>🛰</span><div><b>Scanner</b><div className="muted tiny">{compact(a.scanner.perHour)}/h pools</div></div></div>
           <div className="big-num">{compact(a.scanner.total)}</div><div className="muted tiny">pools scanned · {a.scanner.pools} live</div>
+          <SourceCounts sources={a.scanner.sources || snap.scan?.sources} />
           {a.scanner.top && <div className="tiny mono row"><TokenAvatar symbol={a.scanner.top} src={a.scanner.topImage} size={14} /> top: ${a.scanner.top}</div>}</div>
         <div className="agent-card"><div className="ag-hd"><span className="ag-ico" style={{ background: '#ef4444' }}>🛡</span><div><b>Safety</b><div className="muted tiny">{a.safety.lastOk ? 'Guarding' : 'Rejected'}</div></div></div>
           <div className="big-num">{a.safety.rejected}</div><div className="muted tiny">rejected · {a.safety.passed} passed</div>
@@ -130,7 +131,7 @@ export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => 
   if (!pos.length) return null;
   return (
     <div className="section card" data-testid="open-positions">
-      <div className="sec-hd"><b>Open positions</b><span className="muted small">{pos.length}/{snap.config.maxPositions}</span></div>
+      <div className="sec-hd"><b>Open positions</b><span className="muted small">{pos.length} open</span></div>
       {err && <div className="tiny neg" data-testid="close-error">{err}</div>}
       {pos.map((p: any) => (
         <div key={p.id} className="act-row" data-testid={`position-row-${p.symbol}`}>
@@ -229,6 +230,9 @@ export function ScanStatus({ snap }: { snap: any }) {
       <span>{cadence} cadence</span>
       <span>new {sc.newScanned || 0}</span>
       <span>trend {sc.trendingScanned || 0}</span>
+      {Object.entries(sc.sources || {}).map(([name, v]: any) => (
+        <span key={name} title={v.error || `${name} last ${v.last || 0}`}>{srcShort(name)} {compact(v.total || 0)}</span>
+      ))}
       {(sc.watch || 0) > 0 && <span>queue {sc.watch}</span>}
       {sc.narrative?.label && <span title={sc.narrative.note}>meta {sc.narrative.label}</span>}
       {ka?.enabled && <span className="muted" title={ka.officialGuarantee ? 'guaranteed' : 'best-effort keepalive, not officially guaranteed'}>keep {ka.lastOkAt ? `${Math.round((now - ka.lastOkAt) / 60000)}m ago` : 'pending'}</span>}
@@ -298,5 +302,24 @@ export function AutoTunePanel({ snap }: { snap: any }) {
         </table>
       )}
     </section>
+  );
+}
+
+const SRC_SHORT: Record<string, string> = {
+  GeckoTerminal: 'GT', DexScreener: 'DS', PumpPortal: 'Pump', 'pump.fun': 'pump.fun', Jupiter: 'Jup', GMGN: 'GMGN', Replay: 'Replay',
+};
+function srcShort(name: string) { return SRC_SHORT[name] || name; }
+
+function SourceCounts({ sources }: { sources?: Record<string, { total?: number; last?: number; ok?: boolean; error?: string }> }) {
+  const entries = Object.entries(sources || {}).filter(([, v]) => (v?.total || 0) > 0 || (v?.last || 0) > 0);
+  if (!entries.length) return <div className="muted tiny">scanning all Solana venues</div>;
+  return (
+    <div className="src-counts tiny mono" data-testid="scanner-sources">
+      {entries.map(([name, v]) => (
+        <span key={name} className={v.ok === false ? 'neg' : ''} title={v.error || `${name} +${v.last || 0} last scan`}>
+          {srcShort(name)} {compact(v.total || 0)}
+        </span>
+      ))}
+    </div>
   );
 }
