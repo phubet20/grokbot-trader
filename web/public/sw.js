@@ -1,6 +1,15 @@
-// Grok Bot service worker — Web Push + offline shell for the installed PWA.
+// Grok Bot service worker — Web Push only.
+// Do not cache or intercept the app shell / API. A previous cached shell could
+// hang the splash while the free host was waking.
+const VERSION = 'grokbot-sw-v2';
 self.addEventListener('install', (e) => { self.skipWaiting(); });
-self.addEventListener('activate', (e) => { e.waitUntil(self.clients.claim()); });
+self.addEventListener('activate', (e) => {
+  e.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.map((k) => caches.delete(k)));
+    await self.clients.claim();
+  })());
+});
 
 self.addEventListener('push', (event) => {
   let data = {};

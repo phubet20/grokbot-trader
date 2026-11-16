@@ -115,7 +115,7 @@ export function Funds({ snap }: { snap: any }) {
 
       <div className="section card">
         <div className="sec-hd"><b>Deposit</b><span className="chip mono">{paper ? 'PAPER' : snap.mode.toUpperCase()}</span></div>
-        <p className="tiny muted">Send SOL to the bot wallet. This is the only deposit address.</p>
+        <p className="tiny muted">Send SOL or USDC (SPL) to the bot wallet on the <b>Solana</b> network only. ERC-20 / Tron / other-chain USDC will not arrive. FOMO withdrawals as Solana USDC are supported.</p>
         <div className="bot-wallet-row">
           <img className="qr" src={qr} alt="Deposit QR" width={140} height={140} />
           <div className="bot-wallet-meta">
@@ -126,8 +126,15 @@ export function Funds({ snap }: { snap: any }) {
               On-chain: {onchainSol == null ? '…' : `${Number(onchainSol).toFixed(4)} SOL`}
               {funds?.onchainUsd != null && <> · {usd(funds.onchainUsd)}</>}
             </div>
+            <div className="mono small" data-testid="onchain-usdc">
+              USDC: {funds?.onchainUsdc == null ? '…' : `${Number(funds.onchainUsdc).toFixed(2)} USDC`}
+              {funds?.onchainUsdcUsd != null && Number(funds.onchainUsdc) > 0 && <> · {usd(funds.onchainUsdcUsd)}</>}
+            </div>
           </div>
         </div>
+        {paper
+          ? <p className="tiny muted">Paper mode: USDC is shown only. Auto-swap to SOL is disabled until you go live-auto.</p>
+          : <p className="tiny muted">In live-auto, USDC received here is automatically swapped to SOL via Jupiter (a small SOL fee reserve is kept). Withdrawals are SOL to your locked Phantom address; leftover USDC is sent there too.</p>}
         <div className="deposit-box">
           <div className="muted tiny">Deposit from Phantom</div>
           <div className="deposit-row">

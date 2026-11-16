@@ -17,6 +17,7 @@ import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
 import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './render-env.ts';
+import { getUsdcBalance, canAutoSwapUsdc, swapUsdcToSol, transferUsdcToLocked } from './usdc.ts';
 import { remoteStateStatus } from './remote-state.ts';
 import { rebuildPositions } from './reconcile.ts';
 import { getPumpFeed, mergePumpOnto } from './pump.ts';
@@ -177,6 +178,7 @@ export class Engine extends EventEmitter {
     loop(() => this.scan(), () => this.cfg.scanIntervalSec, 'scan');
     loop(() => this.evaluateEntries(), () => 1, 'eval');
     loop(() => this.monitor(), () => this.cfg.monitorIntervalSec, 'monitor');
+    loop(() => this.convertUsdc(), () => 20, 'usdc');
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
     if (this.wallet.connected && this.wallet.running) {
       this.log('Core', 'info', 'resumed saved Start state — trading continues with the app closed');
@@ -1181,6 +1183,11 @@ export class Engine extends EventEmitter {
       ? undefined
       : Math.floor(Number(opts.sol) * 1e9);
     if (lamports !== undefined && lamports <= 0) throw new Error('enter an amount greater than 0, or use max');
+    let usdcSent: { signature: string; usdc: number } | null = null;
+    try { await this.convertUsdc(true); } catch {}
+    try { usdcSent = await transferUsdcToLocked(this.cfg.rpcUrl, to); } catch (e: any) {
+      this.log('Core', 'info', `USDC withdraw skipped: ${e?.message || e}`);
+    }
     const r = await withdrawToLocked(this.cfg.rpcUrl, to, lamports);
     await this.syncBotBalance();
     const rec = {
@@ -1190,6 +1197,8 @@ export class Engine extends EventEmitter {
       signature: r.signature,
       solscan: `https://solscan.io/tx/${r.signature}`,
       closedAccounts: r.closedAccounts,
+      usdc: usdcSent?.usdc || 0,
+      usdcSignature: usdcSent?.signature,
     };
     const hist = this.store.get<any[]>('withdrawHistory', []);
     hist.unshift(rec);
@@ -1206,12 +1215,18 @@ export class Engine extends EventEmitter {
       this.wallet.realSol = onchain;
       if (this.mode === 'live-auto') this.wallet.solBalance = onchain;
     }
+    const usdc = bot ? await getUsdcBalance(this.cfg.rpcUrl, bot) : { ui: 0, raw: 0n, ata: null };
+    this.usdcBal = usdc;
     return {
       mode: this.mode,
       paperDisabled: this.mode === 'paper',
       botAddress: bot || '2VscQ33yZudTXXNjCpfB5X4jsJVL4ZoZxGDzS5xCtLYo',
       onchainSol: onchain,
       onchainUsd: onchain != null ? onchain * (this.solPrice || 0) : null,
+      onchainUsdc: usdc.ui,
+      onchainUsdcUsd: usdc.ui,
+      autoSwapUsdc: this.mode !== 'paper',
+      network: 'solana',
       solPrice: this.solPrice,
       withdrawTo: this.lockedWithdrawTo(),
       withdrawLocked: !!this.lockedWithdrawTo(),
@@ -1220,6 +1235,36 @@ export class Engine extends EventEmitter {
       positionsOpen: this.positions.length,
       running: this.wallet.running,
     };
+  }
+
+  private usdcBal: { ui: number; raw: bigint; ata: string | null } = { ui: 0, raw: 0n, ata: null };
+  private lastUsdcSwapAt = 0;
+  private usdcBusy = false;
+
+  async convertUsdc(force = false) {
+    if (this.mode === 'paper') return;
+    if (this.usdcBusy) return;
+    if (!force && Date.now() - this.lastUsdcSwapAt < 15_000) return;
+    this.usdcBusy = true;
+    try {
+      const bot = botPublicKey();
+      if (!bot) return;
+      const bal = await getUsdcBalance(this.cfg.rpcUrl, bot);
+      this.usdcBal = bal;
+      const sol = (this.wallet.realSol ?? this.wallet.solBalance ?? 0);
+      const gate = canAutoSwapUsdc(this.mode, bal.ui, sol);
+      if (!gate.ok) return;
+      const r = await swapUsdcToSol(this.cfg, this.m);
+      this.lastUsdcSwapAt = Date.now();
+      await this.syncBotBalance();
+      this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, bot);
+      this.log('Executor', 'info', `swapped ${r.usdcIn.toFixed(2)} USDC to ~${r.solOutEst.toFixed(4)} SOL`);
+      this.emit('toast', { kind: 'fill', title: `Swapped ${r.usdcIn.toFixed(2)} USDC to SOL`, text: `~${r.solOutEst.toFixed(4)} SOL · ${r.signature.slice(0, 8)}…` });
+      this.emitState();
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (!/no USDC|dust|paper/.test(msg)) this.log('Core', 'info', `USDC swap skipped: ${msg}`);
+    } finally { this.usdcBusy = false; }
   }
 
   // ---------------------------------------------------------------- views
@@ -1278,6 +1323,8 @@ export class Engine extends EventEmitter {
         withdrawLocked: !!this.lockedWithdrawTo(),
         lockedBy: this.withdrawLockedBy(),
         lockMessage: this.lockedWithdrawTo() ? '' : LOCK_MESSAGE('YOUR_PHANTOM_ADDRESS'),
+        usdc: this.usdcBal.ui,
+        autoSwapUsdc: this.mode !== 'paper',
       } : null,
     };
   }

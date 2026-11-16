@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useLive, api } from './api';
+import { placeholderSnap } from './boot';
 import { Splash } from './components/Splash';
 import { ConnectSheet } from './components/ConnectSheet';
 import { Setup } from './components/Setup';
@@ -14,7 +15,9 @@ import { HomeI, AgentsI, PulseI, UserI, WalletI, BotIcon } from './components/Ic
 type Tab = 'home' | 'funds' | 'agents' | 'activity' | 'account';
 
 export default function App() {
-  const { snap, toasts, setToasts, approvals, setApprovals, online } = useLive();
+  const { snap: liveSnap, toasts, setToasts, approvals, setApprovals, online, waking, live, retry } = useLive();
+  const snap = liveSnap || placeholderSnap();
+  const connecting = !online || waking || !live;
   const q = new URLSearchParams(location.search);
   const [stage, setStage] = useState<'splash' | 'connect' | 'setup' | 'app'>(q.get('skip') ? 'app' : 'splash');
   const [tab, setTab] = useState<Tab>((q.get('tab') as Tab) || 'home');
@@ -26,7 +29,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('theme', theme); document.documentElement.dataset.theme = theme; document.querySelector('meta[name=theme-color]')?.setAttribute('content', theme === 'dark' ? '#000000' : '#ffffff'); }, [theme]);
   useEffect(() => { if (snap?.appName) document.title = snap.appName; }, [snap?.appName]);
   useEffect(() => { if (toasts.some((t) => t.kind === 'profit')) setFire((f) => f + 1); }, [toasts]);
-  useEffect(() => { if (snap && stage === 'app' && !snap.wallet.connected && !q.get('skip')) setStage('connect'); }, [snap, stage]);
+  useEffect(() => { if (live && liveSnap && stage === 'app' && !liveSnap.wallet.connected && !q.get('skip')) setStage('connect'); }, [live, liveSnap, stage]);
   // ?toast=1 replays the latest winning paper trade as a take-profit toast (for demos/screenshots)
   useEffect(() => {
     if (!q.get('toast')) return;
@@ -36,17 +39,29 @@ export default function App() {
       setToasts([{ id: 999, kind: w.pnlUsd > 0 ? 'profit' : 'fill', title: w.pnlUsd > 0 ? `Risk sold ${w.symbol} - locked the gain` : `Risk sold ${w.symbol}`, usd: w.pnlUsd, pct: w.pnlPct, symbol: w.symbol, image: w.image, text: w.reason }]);
     }).catch(() => {});
   }, []);
-  const splashDone = useCallback(() => setStage(snap?.wallet?.connected ? 'app' : 'connect'), [snap]);
+  const splashDone = useCallback(() => {
+    const s = liveSnap || placeholderSnap();
+    // If we already know a book is connected (live or cached), go straight in.
+    // If the server is waking and we have no cache, still enter the main UI
+    // with a connecting banner — never stay on the splash.
+    if (s.wallet?.connected || q.get('skip') || !liveSnap) setStage('app');
+    else setStage('connect');
+  }, [liveSnap]);
 
-  if (stage === 'splash' || !snap) return <Splash appName={snap?.appName || 'Grok Bot'} ready={!!snap} onDone={splashDone} />;
-  if (stage === 'connect') return <div className="app-shell"><Splash appName={snap.appName} ready={false} onDone={() => {}} /><ConnectSheet snap={snap} onStart={() => setStage('setup')} /></div>;
+  if (stage === 'splash') return <Splash appName={snap.appName || 'Grok Bot'} onDone={splashDone} />;
+  if (stage === 'connect') return (
+    <div className="app-shell">
+      {connecting && <ConnectingBanner onRetry={retry} />}
+      <ConnectSheet snap={snap} onStart={() => setStage('setup')} />
+    </div>
+  );
   if (stage === 'setup') return <div className="app-shell"><Setup snap={snap} onDone={() => setStage('app')} /></div>;
 
   const open = (m: string) => setToken(m);
   return (
     <div className="app-shell">
       <div className="screen">
-        {!online && <div className="offline mono tiny">reconnecting to engine…</div>}
+        {connecting && <ConnectingBanner onRetry={retry} />}
         {tab === 'home' && <>
           <Header snap={snap} theme={theme} setTheme={setTheme} onRecap={() => setRecap(true)} />
           <LowBalanceBanner snap={snap} />
@@ -77,6 +92,16 @@ export default function App() {
       <Toasts toasts={toasts} appName={snap.appName} />
       <Confetti fire={fire} />
       <Approvals items={approvals} setItems={setApprovals} />
+    </div>
+  );
+}
+
+
+function ConnectingBanner({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="connecting-banner mono tiny" data-testid="connecting-banner">
+      <span>Connecting… (server waking)</span>
+      <button type="button" onClick={onRetry} data-testid="connecting-retry">Retry</button>
     </div>
   );
 }

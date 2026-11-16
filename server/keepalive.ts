@@ -4,11 +4,12 @@
  *  per month (~24/7 uses ~720–744 hours). Localhost pings do not prevent sleep. */
 export const keepaliveState = {
   url: '',
-  everyMs: 5 * 60_000,
+  everyMs: 4 * 60_000,
   lastOkAt: 0,
   lastStatus: 0,
   lastError: '',
   startedAt: 0,
+  fails: 0,
 };
 
 export function keepaliveSnapshot() {
@@ -31,14 +32,35 @@ export function startKeepalive() {
   if (!url) return;
   keepaliveState.url = url;
   keepaliveState.startedAt = Date.now();
-  const tick = () => fetch(url, { method: 'GET', redirect: 'follow' })
-    .then((r) => {
-      keepaliveState.lastStatus = r.status;
-      if (r.ok) { keepaliveState.lastOkAt = Date.now(); keepaliveState.lastError = ''; }
-      else { keepaliveState.lastError = String(r.status); console.log('keepalive', r.status); }
-    })
-    .catch((e) => { keepaliveState.lastError = e?.message || String(e); console.log('keepalive fail', keepaliveState.lastError); });
-  setTimeout(tick, 15_000);
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const tick = () => {
+    fetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' as RequestCache })
+      .then((r) => {
+        keepaliveState.lastStatus = r.status;
+        if (r.ok) {
+          keepaliveState.lastOkAt = Date.now();
+          keepaliveState.lastError = '';
+          keepaliveState.fails = 0;
+        } else {
+          keepaliveState.lastError = String(r.status);
+          keepaliveState.fails++;
+          console.log('keepalive', r.status);
+          scheduleRetry();
+        }
+      })
+      .catch((e) => {
+        keepaliveState.lastError = e?.message || String(e);
+        keepaliveState.fails++;
+        console.log('keepalive fail', keepaliveState.lastError);
+        scheduleRetry();
+      });
+  };
+  const scheduleRetry = () => {
+    if (retryTimer) return;
+    const wait = Math.min(60_000, 15_000 * Math.max(1, keepaliveState.fails));
+    retryTimer = setTimeout(() => { retryTimer = undefined; tick(); }, wait);
+  };
+  tick();
   setInterval(tick, keepaliveState.everyMs);
-  console.log('  keepalive -> public /healthz every 5 minutes (not officially guaranteed on the free plan)');
+  console.log('  keepalive -> public /healthz every 4 minutes (not officially guaranteed on the free plan)');
 }
