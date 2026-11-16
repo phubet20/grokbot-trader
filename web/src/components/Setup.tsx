@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { BotIcon, PhantomIcon } from './Icons';
 
 const REPOS = [
@@ -47,6 +47,8 @@ function BotFace({ color, ready }: { color: string; ready: boolean }) {
 export function Setup({ snap, onDone }: { snap: any; onDone: () => void }) {
   const [ready, setReady] = useState<Record<string, boolean>>({});
   const [shown, setShown] = useState(1);
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
 
   useEffect(() => {
     const timers: number[] = [];
@@ -60,9 +62,9 @@ export function Setup({ snap, onDone }: { snap: any; onDone: () => void }) {
         timers.push(window.setTimeout(() => setReady((r) => ({ ...r, [a.id]: true })), a.at));
       }
     }
-    timers.push(window.setTimeout(onDone, 2800));
+    timers.push(window.setTimeout(() => doneRef.current(), 2800));
     return () => { for (const t of timers) clearTimeout(t); };
-  }, [onDone]);
+  }, []);
 
   return (
     <div className="setup" data-testid="setup">
