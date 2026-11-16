@@ -544,7 +544,8 @@ export class Engine extends EventEmitter {
       this.rollDay();
       const now = Date.now();
       const adapted = this.riskAdapted();
-      const minScore = adapted.minScore;
+      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
+      const minScore = adapted.minScore + (gov.minScoreAdj || 0);
       const recent = [...this.candidates.values()].filter((c) => now - c.seenAt < 180_000);
       this.uni.watch = 0;
       for (const c of recent) {
@@ -561,6 +562,7 @@ export class Engine extends EventEmitter {
         c.score = clampScore(base + preAdj + adj.adj);
         (c as any)._adjNotes = adj.notes;
         if (adj.why && adj.why !== 'score') (c as any)._sig = (c as any)._sig || adj.why;
+        c.score = clampScore(c.score + this.tuner.patternAdj((c as any)._sig || 'score'));
       }
       const scored = recent
         .filter((c) => {
@@ -569,9 +571,14 @@ export class Engine extends EventEmitter {
           return false;
         })
         .sort((a, b) => {
-          const ap = String((a as any)._sig || '').includes('first pullback') ? 1 : 0;
-          const bp = String((b as any)._sig || '').includes('first pullback') ? 1 : 0;
-          if (ap !== bp) return bp - ap;
+          const fav = (c: typeof a) => {
+            const s = String((c as any)._sig || '').toLowerCase();
+            if (s.includes('first pullback')) return 2;
+            if (s.includes('buy pressure') || s.includes('momentum thrust') || s.includes('momentum burst')) return 1;
+            return 0;
+          };
+          const af = fav(a), bf = fav(b);
+          if (af !== bf) return bf - af;
           return (b.score || 0) - (a.score || 0);
         })
         .slice(0, 20);
@@ -649,7 +656,8 @@ export class Engine extends EventEmitter {
           this.agents.safety.rejected = this.agents.safety.penalties;
           this.noteReject('sec:' + (sr.reasons[0] || sr.label));
         }
-        const minScore = this.riskAdapted().minScore;
+        const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
+        const minScore = this.riskAdapted().minScore + (gov.minScoreAdj || 0);
         if (adjScore < minScore) {
           this.noteReject(`score ${adjScore} < ${minScore} after safety ${sr.adj}`, c.mint);
           return;
@@ -705,7 +713,7 @@ export class Engine extends EventEmitter {
       const room = Math.max(0, this.maxCoinUsd() - existing.costUsd);
       size = Math.min(size, room);
     }
-    if (this.mode === 'paper') size *= this.tuner.sizeMult(why);
+    if (this.mode === 'paper') size *= this.tuner.entrySizeMult(why);
     if (!size) { this.agents.risk.label = 'not enough free cash'; return; }
     const solAmt = size / this.solPrice;
     if (this.mode === 'live-auto') { await this.execLiveAuto('buy', c, { solAmt, score, why }); return; }
@@ -781,7 +789,8 @@ export class Engine extends EventEmitter {
       if (prices[SOL_MINT]) this.solPrice = prices[SOL_MINT];
       const now = Date.now();
       const adapted = this.riskAdapted();
-      const target = this.mode === 'paper' ? (this.cfg.takeProfitPct ?? 0) : 0;
+      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
+      const target = this.mode === 'paper' ? gov.tpPct : 0;
       const tpOpts = {
         extraSlippageBps: this.cfg.extraSlippageBps,
         swapFeeBps: SWAP_FEE_BPS,
@@ -823,6 +832,19 @@ export class Engine extends EventEmitter {
           await this.closePosition(p, 'take_profit', `take profit +${net.toFixed(1)}% net (${how}, target +${target}%)`, 1);
         });
       }
+      if (this.mode === 'paper' && gov.earlyCutSec > 0) {
+        for (const p of [...this.positions]) {
+          if (this.selling.has(p.id)) continue;
+          if (now - p.openedAt < gov.earlyCutSec * 1000) continue;
+          const fresh = this.candidates.get(p.mint);
+          const hist = this.mintHist.get(p.mint) || [];
+          const conf = fresh ? momentumConfirm(fresh, hist, now) : { ok: false, reason: 'no tape' };
+          const fromEntry = p.entryPrice ? (p.lastPrice / p.entryPrice - 1) * 100 : 0;
+          if (!conf.ok && fromEntry < 1) {
+            void this.closePosition(p, 'momentum_fade', `no thrust within ${gov.earlyCutSec}s of entry`, 1);
+          }
+        }
+      }
       if (this.positions.length && now - this.lastPairAt > 3000) {
         this.lastPairAt = now;
         const freshList = await withTimeout((this.m as any).pairs ? (this.m as any).pairs(this.positions.map((p) => p.mint)) : Promise.all(this.positions.map((p) => this.m.pair(p.mint))).then((xs: any[]) => xs.filter(Boolean)), 4000, 'pair refresh timeout').catch(() => [] as any[]);
@@ -838,6 +860,7 @@ export class Engine extends EventEmitter {
         const eq = this.equity();
         this.lastEquity = eq;
         this.store.addEquity(now, eq);
+        this.tuner.observeEquity(eq, now);
         this.emit('equity', { ts: now, usd: eq });
       }
       if (((this.mode === 'live' && this.wallet.type === 'phantom') || this.mode === 'live-auto') && now % 20_000 < this.cfg.monitorIntervalSec * 1000) {
@@ -902,7 +925,7 @@ export class Engine extends EventEmitter {
       if (this.mode === 'paper' && kind === 'take_profit' && this.solPrice > 0) {
         const fillPnl = solBack * this.solPrice - (p.costUsd * frac);
         const markPnl = markBack * this.solPrice - (p.costUsd * frac);
-        const targetUsd = p.costUsd * frac * ((this.cfg.takeProfitPct ?? 3) / 100);
+        const targetUsd = p.costUsd * frac * (this.tuner.takeProfitPct(this.cfg.takeProfitPct ?? 3) / 100);
         if (fillPnl < targetUsd && markPnl >= targetUsd) {
           fillPrice = markPx;
           solBack = markBack;

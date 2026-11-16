@@ -100,3 +100,59 @@ test('betaSample stays in (0,1)', () => {
 });
 
 void EPS;
+
+test('governor tightens when the rolling equity slope stalls, then relaxes on recovery', () => {
+  const t = new AutoTune();
+  const start = 100;
+  const t0 = Date.now() - 8 * 60_000;
+  for (let i = 0; i < 10; i++) t.observeEquity(start - i * 0.8, t0 + i * 50_000);
+  const tight = t.governor(3);
+  assert.equal(tight.mode, 'tight');
+  assert.ok(tight.minScoreAdj >= 8, `score adj ${tight.minScoreAdj}`);
+  assert.ok(tight.tpPct <= 1.8, `tp ${tight.tpPct}`);
+  assert.ok(tight.earlyCutSec >= 20, `cut ${tight.earlyCutSec}`);
+  assert.ok(tight.sizeMult <= 0.85, `size ${tight.sizeMult}`);
+  assert.equal(t.patternAdj('first pullback bounce'), 6);
+  assert.equal(t.patternAdj('score 62 ≥ 50'), -5);
+  assert.ok(t.takeProfitPct(3) <= 1.8);
+
+  const t1 = Date.now() - 7 * 60_000;
+  for (let i = 0; i < 10; i++) t.observeEquity(90 + i * 1.2, t1 + i * 45_000);
+  const relaxed = t.governor(3);
+  assert.equal(relaxed.mode, 'relaxed');
+  assert.equal(relaxed.minScoreAdj, 0);
+  assert.equal(relaxed.tpPct, 3);
+  assert.equal(relaxed.earlyCutSec, 0);
+  assert.equal(t.patternAdj('score 62'), 0);
+});
+
+test('governor shrinks size after losses and grows it after wins', () => {
+  const t = new AutoTune();
+  let eq = 100;
+  const t0 = Date.now() - 6 * 60_000;
+  for (let i = 0; i < 6; i++) {
+    eq += 2;
+    t.record({ reason: 'first pullback bounce', pnlUsd: 2, costUsd: 8, pnlPct: 25, equity: eq, ts: t0 + i * 50_000 });
+  }
+  // Rising trades alone should stay relaxed, with size grown after wins
+  const up = t.governor(3);
+  assert.ok(up.sizeMult > 1, `win size ${up.sizeMult}`);
+  for (let i = 0; i < 6; i++) {
+    eq -= 3;
+    t.record({ reason: 'score 55 ≥ 50', pnlUsd: -3, costUsd: 8, pnlPct: -37, equity: eq, ts: Date.now() - (6 - i) * 40_000 });
+  }
+  const down = t.governor(3);
+  assert.equal(down.mode, 'tight');
+  assert.ok(down.sizeMult <= 0.85, `loss size ${down.sizeMult}`);
+});
+
+test('governor state survives dump/load', () => {
+  const t = new AutoTune();
+  const t0 = Date.now() - 8 * 60_000;
+  for (let i = 0; i < 10; i++) t.observeEquity(100 - i, t0 + i * 50_000);
+  assert.equal(t.governor().mode, 'tight');
+  const t2 = new AutoTune();
+  t2.load(t.dump());
+  assert.equal(t2.governor().mode, 'tight');
+  assert.ok(t2.snapshot().governor.minScoreAdj >= 8);
+});

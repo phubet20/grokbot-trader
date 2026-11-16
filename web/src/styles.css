@@ -233,6 +233,11 @@ code { font-family: var(--mono); font-size: 12px; background: var(--chip); paddi
 .autotune-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .autotune-metrics { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 8px; }
 .autotune-metrics b { color: var(--text); }
+.governor-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
+.gov-badge { font-weight: 700; font-size: 11px; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 999px; }
+.gov-badge.tight { color: #fecaca; background: rgba(239, 68, 68, 0.18); }
+.gov-badge.relaxed { color: #bbf7d0; background: rgba(16, 185, 129, 0.18); }
+
 .tune-table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .tune-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 4px 6px 0; }
 .tune-table td { padding: 5px 6px 5px 0; border-top: 1px solid var(--line); }

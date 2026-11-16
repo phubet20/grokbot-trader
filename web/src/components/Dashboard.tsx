@@ -251,11 +251,22 @@ export function AutoTunePanel({ snap }: { snap: any }) {
   const t = snap.autotune;
   if (!t) return null;
   const rows = t.patterns || [];
+  const g = t.governor || {};
+  const tight = g.mode === 'tight';
   return (
     <section className="card autotune" data-testid="autotune">
       <div className="autotune-head">
         <div className="card-title">Auto-tune</div>
         <div className="mono tiny muted">{t.note}</div>
+      </div>
+      <div className="governor-row" data-testid="governor">
+        <span className={`gov-badge ${tight ? 'tight' : 'relaxed'}`}>{tight ? 'TIGHT' : 'RELAXED'}</span>
+        <span className="mono tiny">slope <b>{(g.slopePctPerMin || 0).toFixed(3)}%/min</b></span>
+        <span className="mono tiny">score +<b>{g.minScoreAdj || 0}</b></span>
+        <span className="mono tiny">TP <b>{(g.tpPct ?? 3).toFixed(1)}%</b></span>
+        <span className="mono tiny">size ×<b>{(g.sizeMult ?? 1).toFixed(2)}</b></span>
+        <span className="mono tiny">cut <b>{g.earlyCutSec ? `${g.earlyCutSec}s` : 'off'}</b></span>
+        <span className="mono tiny muted">{g.note || ''}</span>
       </div>
       <div className="autotune-metrics mono tiny">
         <span>equity score <b>{(t.equityScore || 0).toFixed(2)}</b></span>

@@ -45,6 +45,40 @@ export type PatternStats = {
   immediateRate: number;
 };
 
+export type GovernorMode = 'relaxed' | 'tight';
+
+export type GovernorState = {
+  mode: GovernorMode;
+  slopePctPerMin: number;
+  tradeSlopePct: number;
+  windowTrades: number;
+  windowMin: number;
+  minScoreAdj: number;
+  tpPct: number;
+  sizeMult: number;
+  earlyCutSec: number;
+  favored: PatternKey[];
+  note: string;
+};
+
+export const FAVORED_PATTERNS: PatternKey[] = ['first-pullback', 'momentum-burst'];
+
+export function defaultGovernor(baseTp = 3): GovernorState {
+  return {
+    mode: 'relaxed',
+    slopePctPerMin: 0,
+    tradeSlopePct: 0,
+    windowTrades: 0,
+    windowMin: 8,
+    minScoreAdj: 0,
+    tpPct: baseTp,
+    sizeMult: 1,
+    earlyCutSec: 0,
+    favored: [...FAVORED_PATTERNS],
+    note: 'relaxed — waiting for equity slope',
+  };
+}
+
 export type TuneSnapshot = {
   enabled: boolean;
   patterns: PatternStats[];
@@ -57,6 +91,7 @@ export type TuneSnapshot = {
   minSamples: number;
   updatedAt: number;
   note: string;
+  governor: GovernorState;
 };
 
 type TradeRec = { pattern: PatternKey; pnlUsd: number; costUsd: number; pnlPct: number; equity: number; ts: number; exitKind?: string; exitReason?: string; immediateRed?: boolean };
@@ -124,6 +159,9 @@ export class AutoTune {
   updatedAt = 0;
   private trades: TradeRec[] = [];
   private patterns = new Map<PatternKey, PatternStats>();
+  private eqTicks: { t: number; eq: number }[] = [];
+  private tight = false;
+  private gov: GovernorState = defaultGovernor();
 
   load(raw: any) {
     if (!raw || typeof raw !== 'object') return;
@@ -132,12 +170,15 @@ export class AutoTune {
     this.slope = Number(raw.slope) || 0;
     this.smoothness = Number(raw.smoothness) || 1;
     this.updatedAt = Number(raw.updatedAt) || 0;
+    this.tight = !!raw.tight;
     if (Array.isArray(raw.trades)) this.trades = raw.trades.slice(-400);
+    if (Array.isArray(raw.eqTicks)) this.eqTicks = raw.eqTicks.slice(-300);
     if (Array.isArray(raw.patterns)) {
       for (const p of raw.patterns) {
         if (p && p.key) this.patterns.set(p.key, { ...empty(p.key), ...p });
       }
     }
+    this.refreshGovernor();
   }
 
   dump() {
@@ -149,6 +190,8 @@ export class AutoTune {
       updatedAt: this.updatedAt,
       trades: this.trades.slice(-400),
       patterns: [...this.patterns.values()],
+      tight: this.tight,
+      eqTicks: this.eqTicks.slice(-300),
     };
   }
 
@@ -224,7 +267,82 @@ export class AutoTune {
     }
     this.patterns = map;
     this.tuneExitSensitivity();
+    this.refreshGovernor();
     this.updatedAt = Date.now();
+  }
+
+  /** Track equity even between closes so the governor can see a stall mid-session. */
+  observeEquity(eq: number, ts = Date.now()) {
+    if (!(eq > 0)) return;
+    const last = this.eqTicks[this.eqTicks.length - 1];
+    if (last && ts - last.t < 2000) { last.eq = eq; last.t = ts; }
+    else this.eqTicks.push({ t: ts, eq });
+    this.eqTicks = this.eqTicks.filter((x) => ts - x.t <= 20 * 60_000).slice(-300);
+    this.refreshGovernor();
+  }
+
+  private refreshGovernor(baseTp = 3) {
+    const now = Date.now();
+    const windowMin = 8;
+    const ticks = this.eqTicks.filter((x) => now - x.t <= windowMin * 60_000);
+    let slopePctPerMin = 0;
+    if (ticks.length >= 3) {
+      const dt = (ticks[ticks.length - 1].t - ticks[0].t) / 60_000;
+      const start = ticks[0].eq, end = ticks[ticks.length - 1].eq;
+      if (dt >= 0.4 && start > 0) slopePctPerMin = ((end - start) / start * 100) / dt;
+    }
+    const recent = this.trades.slice(-8);
+    let tradeSlopePct = 0;
+    if (recent.length >= 4 && recent[0].equity > 0)
+      tradeSlopePct = ((recent[recent.length - 1].equity - recent[0].equity) / recent[0].equity) * 100;
+    const haveTicks = ticks.length >= 3;
+    const haveTrades = recent.length >= 4;
+    const stalled = (haveTicks && slopePctPerMin <= 0.02) || (haveTrades && tradeSlopePct <= 0);
+    const recovered = (!haveTicks || slopePctPerMin > 0.05) && (!haveTrades || tradeSlopePct > 0);
+    if (!haveTicks && !haveTrades) this.tight = false;
+    else if (stalled) this.tight = true;
+    else if (recovered) this.tight = false;
+
+    let sizeMult = 1;
+    for (const t of recent) {
+      if (t.pnlUsd > 0) sizeMult = Math.min(1.4, sizeMult * 1.2);
+      else if (t.pnlUsd < 0) sizeMult = Math.max(0.55, sizeMult * 0.7);
+    }
+    if (this.tight) sizeMult = Math.min(sizeMult, 0.85);
+
+    this.gov = {
+      mode: this.tight ? 'tight' : 'relaxed',
+      slopePctPerMin,
+      tradeSlopePct,
+      windowTrades: recent.length,
+      windowMin,
+      minScoreAdj: this.tight ? 8 : 0,
+      tpPct: this.tight ? Math.max(1.2, Math.min(baseTp, 1.8)) : baseTp,
+      sizeMult,
+      earlyCutSec: this.tight ? 25 : 0,
+      favored: [...FAVORED_PATTERNS],
+      note: this.tight
+        ? 'tight — equity stalled; higher score, faster TP, early cut, favor pullback + thrust'
+        : 'relaxed — equity slope ok; default TP and size',
+    };
+  }
+
+  governor(baseTp = 3): GovernorState {
+    this.refreshGovernor(baseTp);
+    return this.gov;
+  }
+
+  takeProfitPct(base: number): number { return this.governor(base).tpPct; }
+
+  patternAdj(why: string): number {
+    if (!this.tight) return 0;
+    const k = classify(why);
+    if (FAVORED_PATTERNS.includes(k)) return 6;
+    return -5;
+  }
+
+  entrySizeMult(why: string): number {
+    return clamp(this.sizeMult(why) * this.governor().sizeMult, 0.45, 1.6);
   }
 
   private tuneExitSensitivity() {
@@ -288,6 +406,7 @@ export class AutoTune {
       note: this.trades.length < this.minSamples
         ? `learning — leaning after 2 closes, full weights at ${this.minSamples} per pattern`
         : 'tuning from rolling expectancy and equity-curve smoothness',
+      governor: this.governor(),
     };
   }
 }
