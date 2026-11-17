@@ -110,6 +110,11 @@ const server = createServer(async (req, res) => {
       if (p === '/api/live/signed') { if (!liveGate().live || liveGate().auto) return json(403, { error: 'live disabled' }); engine.liveSigned(String(b.id), String(b.signature)); return json(200, { ok: true }); }
       if (p === '/api/live/rejected') { engine.liveRejected(String(b.id)); return json(200, { ok: true }); }
       if (p === '/api/withdraw/lock') return json(200, engine.lockWithdraw(String(b.address || ''), String(b.message || ''), String(b.signature || '')));
+      if (p === '/api/withdraw/validate') {
+        const { parseWithdrawDestination } = await import('./withdraw.ts');
+        const r = parseWithdrawDestination(b && (b.to ?? b.address));
+        return r.ok ? json(200, { ok: true, address: r.address }) : json(400, { ok: false, error: r.error, code: r.code });
+      }
       if (p === '/api/withdraw') return json(200, await engine.withdraw(b || {}));
       if (p === '/api/push/subscribe') return json(200, addSubscription(b));
       if (p === '/api/push/unsubscribe') return json(200, removeSubscription(String(b.endpoint || '')));

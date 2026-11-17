@@ -1,6 +1,6 @@
 // Solana USDC (SPL) helpers. FOMO and other wallets can send USDC on Solana
 // to the bot address. Live modes may auto-swap it to SOL. Paper only displays.
-import { Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
+import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
 import { USDC_MINT, SOL_MINT } from './market.ts';
 import { liveGate, type Config } from './config.ts';
 import { botKeypair, botPublicKey, hasBotWallet, redactSecrets } from './wallet.ts';
@@ -122,30 +122,58 @@ function transferIx(source: PublicKey, dest: PublicKey, owner: PublicKey, amount
   });
 }
 
-/** Send remaining USDC to the locked withdraw address. Live only. */
-export async function transferUsdcToLocked(rpcUrl: string, to: string): Promise<{ signature: string; usdc: number } | null> {
+/** Send USDC (all, or a raw amount) to a validated destination. Live only. */
+export async function transferUsdc(
+  rpcUrl: string,
+  to: string,
+  amountRaw?: bigint,
+  opts: { priorityFeeSol?: number } = {},
+): Promise<{ signature: string; usdc: number; attempts: number } | null> {
   if (!hasBotWallet()) return null;
   const kp = botKeypair();
   const bal = await getUsdcBalance(rpcUrl, kp.publicKey.toBase58());
   if (bal.raw <= 0n || !bal.ata) return null;
+  const raw = amountRaw != null && amountRaw > 0n ? (amountRaw < bal.raw ? amountRaw : bal.raw) : bal.raw;
+  if (raw <= 0n) return null;
   const dest = new PublicKey(to);
   const mint = new PublicKey(USDC_MINT);
   const destAta = ataAddress(dest, mint);
   const conn = new Connection(rpcUrl, { commitment: 'confirmed' });
-  const tx = new Transaction();
-  tx.add(createAtaIdempotentIx(kp.publicKey, dest, mint, destAta));
-  tx.add(transferIx(new PublicKey(bal.ata), destAta, kp.publicKey, bal.raw));
-  tx.feePayer = kp.publicKey;
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
-  tx.recentBlockhash = blockhash;
-  tx.sign(kp);
-  try {
-    const signature = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    const conf = await conn.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
-    if (conf.value.err) throw new Error('USDC transfer failed on-chain');
-    return { signature, usdc: bal.ui };
-  } catch (e: any) {
-    console.log('[usdc] transfer: ' + redactSecrets(e?.message || String(e)));
-    throw e;
+  const cuLimit = 60_000;
+  const prioSol = opts.priorityFeeSol ?? 0.0001;
+  const micro = Math.max(1_000, Math.min(1_000_000, Math.floor(prioSol * 1e9 * 1e6 / cuLimit)));
+  let last: Error | null = null;
+  for (let i = 1; i <= 3; i++) {
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+    tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: micro }));
+    tx.add(createAtaIdempotentIx(kp.publicKey, dest, mint, destAta));
+    tx.add(transferIx(new PublicKey(bal.ata), destAta, kp.publicKey, raw));
+    tx.feePayer = kp.publicKey;
+    tx.recentBlockhash = blockhash;
+    tx.sign(kp);
+    try {
+      const signature = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 2, preflightCommitment: 'confirmed' });
+      const conf = await conn.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
+      if (conf.value.err) throw new Error('ถอน USDC ไม่สำเร็จบนโซลานา');
+      return { signature, usdc: Number(raw) / 10 ** USDC_DECIMALS, attempts: i };
+    } catch (e: any) {
+      last = e instanceof Error ? e : new Error(String(e));
+      const msg = last.message || '';
+      if (/block height exceeded|blockhash not found|expired|has expired|429|timeout|ECONNRESET/i.test(msg) && i < 3) {
+        await new Promise((r) => setTimeout(r, 400 * i));
+        continue;
+      }
+      console.log('[usdc] transfer: ' + redactSecrets(msg));
+      throw last;
+    }
   }
+  throw last || new Error('ถอน USDC ไม่สำเร็จ');
+}
+
+/** Back-compat: send all remaining USDC. */
+export async function transferUsdcToLocked(rpcUrl: string, to: string): Promise<{ signature: string; usdc: number } | null> {
+  const r = await transferUsdc(rpcUrl, to);
+  return r ? { signature: r.signature, usdc: r.usdc } : null;
 }

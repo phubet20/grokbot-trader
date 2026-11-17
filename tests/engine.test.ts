@@ -205,7 +205,7 @@ test('paper withdraw is refused', async () => {
   const dirp = mkdtempSync(join(tmpdir(), 'gb-wd-'));
   const e = new Engine({ ...DEFAULTS, scanIntervalSec: 9999, monitorIntervalSec: 9999 }, new ReplayMarket(1), new Store(join(dirp, 't.db')));
   await e.connect({ type: 'paper', startUsd: 10 });
-  await assert.rejects(() => e.withdraw({ max: true }), /disabled in paper/);
+  await assert.rejects(() => e.withdraw({ max: true }), /TEST|paper|โหมด TEST/);
   e.stop();
 });
 

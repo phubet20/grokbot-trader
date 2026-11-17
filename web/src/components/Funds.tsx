@@ -20,20 +20,31 @@ export function Funds({ snap }: { snap: any }) {
   const locked = bw.withdrawTo || null;
   const [funds, setFunds] = useState<any>(null);
   const [solAmt, setSolAmt] = useState('');
+  const [destAddr, setDestAddr] = useState('');
+  const [asset, setAsset] = useState<'SOL' | 'USDC'>('SOL');
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [solscan, setSolscan] = useState('');
   const [depAmt, setDepAmt] = useState('0.05');
   const [msg, setMsg] = useState('');
+  const [msgKind, setMsgKind] = useState<'ok' | 'err' | ''>('');
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const phantom = getPhantom();
 
   async function refresh() {
-    try { setFunds(await api('funds')); } catch { /* keep last */ }
+    try {
+      const f = await api('funds');
+      setFunds(f);
+      setDestAddr((d) => d || f.defaultTo || f.withdrawTo || locked || 'CgrPNY2dMhyB8QmfM8hGyBqLwbvrWdE2X58LZZyGSVye');
+    } catch { /* keep last */ }
   }
   useEffect(() => { void refresh(); const t = setInterval(() => void refresh(), 12_000); return () => clearInterval(t); }, []);
 
   const onchainSol = funds?.onchainSol;
   const qr = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=8&data=${encodeURIComponent(solanaPay(addr))}`;
-  const maxSol = typeof onchainSol === 'number' ? Math.max(0, onchainSol - 0.00001) : 0;
+  const maxSol = typeof funds?.maxSol === 'number' ? Math.max(0, funds.maxSol) : (typeof onchainSol === 'number' ? Math.max(0, onchainSol - (funds?.reserveSol || 0.00002)) : 0);
+  const maxUsdc = typeof funds?.maxUsdc === 'number' ? Math.max(0, funds.maxUsdc) : 0;
+  const defaultTo = funds?.defaultTo || locked || 'CgrPNY2dMhyB8QmfM8hGyBqLwbvrWdE2X58LZZyGSVye';
 
   async function copyAddr() {
     await copyText(addr);
@@ -89,21 +100,45 @@ export function Funds({ snap }: { snap: any }) {
     setBusy(false);
   }
 
-  async function withdraw() {
+  function withdrawAmount(): { amt: number; max: boolean } {
+    const cap = asset === 'USDC' ? maxUsdc : maxSol;
+    const raw = solAmt.trim();
+    if (!raw) return { amt: cap, max: true };
+    const n = Number(raw);
+    return { amt: n, max: false };
+  }
+
+  function openConfirm() {
     if (paper) return;
-    const useMax = !solAmt;
-    const amt = useMax ? maxSol : Number(solAmt);
-    if (!Number.isFinite(amt) || amt <= 0) { setMsg('Enter an amount or use Max'); return; }
-    const to = locked || funds?.withdrawTo;
-    if (!to) { setMsg('Lock a Phantom address before withdrawing'); return; }
-    if (!confirm(`Withdraw ${useMax ? 'all spendable' : amt} SOL to the locked Phantom address ${to}? This cannot be undone.`)) return;
-    setMsg(''); setBusy(true);
+    setMsg(''); setMsgKind('');
+    const to = (destAddr || defaultTo).trim();
+    if (!to) { setMsg('กรุณาวางที่อยู่กระเป๋าปลายทาง'); setMsgKind('err'); return; }
+    const { amt, max } = withdrawAmount();
+    if (!max && (!Number.isFinite(amt) || amt <= 0)) { setMsg('กรุณาใส่จำนวนมากกว่า 0 หรือกด Max'); setMsgKind('err'); return; }
+    setConfirmOpen(true);
+  }
+
+  async function confirmWithdraw() {
+    if (paper) return;
+    const to = (destAddr || defaultTo).trim();
+    const { amt, max } = withdrawAmount();
+    setConfirmOpen(false);
+    setMsg(''); setMsgKind(''); setSolscan(''); setBusy(true);
     try {
-      const r = await api('withdraw', useMax ? { max: true } : { sol: amt }, { timeoutMs: 60000 });
-      setMsg(`Sent ${r.sol} SOL · ${r.signature}`);
+      const body: any = { to, asset, max };
+      if (!max && asset === 'SOL') body.sol = amt;
+      if (!max && asset === 'USDC') body.usdc = amt;
+      const r = await api('withdraw', body, { timeoutMs: 90000 });
+      const qty = asset === 'USDC' ? `${Number(r.usdc).toFixed(2)} USDC` : `${Number(r.sol).toFixed(6)} SOL`;
+      setMsg(`ถอนสำเร็จ ${qty}`);
+      setMsgKind('ok');
+      setSolscan(r.solscan || (r.signature ? `https://solscan.io/tx/${r.signature}` : ''));
       setSolAmt('');
       await refresh();
-    } catch (e: any) { setMsg(e.message || String(e)); }
+    } catch (e: any) {
+      setMsg(`ถอนไม่สำเร็จ: ${e.message || String(e)}`);
+      setMsgKind('err');
+    }
     setBusy(false);
   }
 
@@ -135,7 +170,7 @@ export function Funds({ snap }: { snap: any }) {
         </div>
         {paper
           ? <p className="tiny muted">Paper mode: USDC is shown only. Auto-swap to SOL is disabled until you go live-auto.</p>
-          : <p className="tiny muted">In live-auto, USDC received here is automatically swapped to SOL via Jupiter (gasless when available). Withdrawals are SOL to your locked Phantom address; leftover USDC is sent there too.</p>}
+          : <p className="tiny muted">In live-auto, USDC received here is automatically swapped to SOL via Jupiter (gasless when available). Withdraw SOL or USDC to any Solana address you paste below.</p>}
         {!paper && Number(funds?.onchainUsdc || 0) > 0 && Number(funds?.onchainSol || 0) < 0.01 && (
           <p className="note" data-testid="need-sol-fees">Need ~0.01 SOL for fees</p>
         )}
@@ -152,28 +187,52 @@ export function Funds({ snap }: { snap: any }) {
       </div>
 
       <div className="section card">
-        <div className="sec-hd"><b>Withdraw</b></div>
-        {locked ? (
-          <p className="tiny mono" data-testid="locked-withdraw-to">Locked to {locked} {bw.lockedBy === 'env' ? '(env)' : '(signed)'} — withdrawals can only go here.</p>
-        ) : (
-          <p className="note">Connect Phantom once and sign to lock withdrawals to <b>your</b> address. After a successful lock it is saved on the host. It cannot be changed in the app.</p>
-        )}
+        <div className="sec-hd"><b>ถอนเงิน</b><span className="chip mono">{paper ? 'TEST' : 'LIVE'}</span></div>
         {paper && (
-          <p className="note" data-testid="funds-paper-disabled">Withdraw is disabled in paper mode. It only sends real SOL from the bot wallet to the locked Phantom address after you go live-auto. Deposit and the lock are shown so you can prepare.</p>
+          <p className="note" data-testid="funds-paper-disabled">โหมด TEST ถอนจริงไม่ได้ — สลับเป็น LIVE เพื่อถอน SOL หรือ USDC จากกระเป๋าบอทบนโซลานา</p>
         )}
-        {msg && <p className="tiny" data-testid="funds-msg">{msg}</p>}
+        {!paper && (
+          <p className="tiny muted">วางที่อยู่ Solana ของกระเป๋าที่ต้องการรับเงิน (คัดลอกจากแอปกระเป๋า) แล้วใส่จำนวน กดถอน และยืนยัน ระบบจะโอนจากกระเป๋าบอททันที ค่าเริ่มต้นคือที่อยู่ที่ล็อกไว้ แต่ถอนไปที่อื่นได้ อย่าใส่คีย์ลับหรือวลีกู้คืน</p>
+        )}
+        <label className="field small">
+          <span>ที่อยู่ปลายทาง</span>
+          <input type="text" inputMode="text" autoComplete="off" autoCorrect="off" spellCheck={false} placeholder="Solana address" value={destAddr} onChange={(e) => setDestAddr(e.target.value)} disabled={paper || busy} aria-label="Withdraw destination" data-testid="funds-withdraw-to" className="withdraw-addr" />
+        </label>
         <div className="deposit-row">
-          <input type="number" min="0" step="0.001" placeholder="Amount (SOL)" value={solAmt} onChange={(e) => setSolAmt(e.target.value)} disabled={paper || !locked} aria-label="Withdraw SOL" data-testid="funds-withdraw-sol" />
-          <button type="button" className="pill-btn small-btn ghost" disabled={paper || !locked || busy} onClick={() => setSolAmt(maxSol ? String(Number(maxSol.toFixed(6))) : '')} data-testid="funds-withdraw-max">Max</button>
+          <select value={asset} onChange={(e) => setAsset(e.target.value === 'USDC' ? 'USDC' : 'SOL')} disabled={paper || busy} aria-label="Withdraw asset" data-testid="funds-withdraw-asset">
+            <option value="SOL">SOL</option>
+            <option value="USDC">USDC</option>
+          </select>
+          <input type="number" min="0" step="0.001" placeholder={asset === 'USDC' ? 'จำนวน (USDC)' : 'จำนวน (SOL)'} value={solAmt} onChange={(e) => setSolAmt(e.target.value)} disabled={paper || busy} aria-label="Withdraw amount" data-testid="funds-withdraw-sol" />
+          <button type="button" className="pill-btn small-btn ghost" disabled={paper || busy} onClick={() => setSolAmt(asset === 'USDC' ? String(Number(maxUsdc.toFixed(6))) : (maxSol ? String(Number(maxSol.toFixed(6))) : ''))} data-testid="funds-withdraw-max">Max</button>
         </div>
+        {!paper && asset === 'SOL' && typeof funds?.reserveSol === 'number' && (
+          <p className="tiny muted">Max จะเหลือประมาณ {Number(funds.reserveSol).toFixed(4)} SOL สำหรับค่าธรรมเนียม{((funds.livePositionsOpen || 0) > 0) ? ' และการปิดโพสิชันที่ยังเปิดอยู่' : ''}</p>
+        )}
+        {msg && <p className={`tiny ${msgKind === 'ok' ? 'pos' : msgKind === 'err' ? 'neg' : ''}`} data-testid="funds-msg">{msg}{msgKind === 'ok' && solscan ? <> · <a href={solscan} target="_blank" rel="noreferrer" data-testid="funds-withdraw-solscan">ดูบน Solscan</a></> : null}</p>}
         <div className="btn-row">
-          {!locked && (
-            phantom
-              ? <button className="pill-btn small-btn" disabled={busy || paper} onClick={lock} data-testid="lock-withdraw">Lock withdraw address</button>
-              : <a className="pill-btn small-btn sheet-btn phantom-open" href={phantomBrowseUrl()} data-testid="open-in-phantom-lock"><PhantomIcon size={18} /> Open in Phantom to lock</a>
-          )}
-          <button className="pill-btn small-btn" disabled={paper || !locked || busy} onClick={withdraw} data-testid="funds-withdraw">Withdraw to Phantom</button>
+          <button className="pill-btn small-btn" disabled={paper || busy} onClick={openConfirm} data-testid="funds-withdraw">ถอน</button>
         </div>
+        {locked
+          ? <p className="tiny muted mono" data-testid="locked-withdraw-to">ค่าเริ่มต้น: {locked} {bw.lockedBy === 'env' ? '(env)' : '(signed)'}</p>
+          : (!paper && (phantom
+            ? <button className="pill-btn small-btn ghost" disabled={busy} onClick={lock} data-testid="lock-withdraw">ล็อกที่อยู่ Phantom เป็นค่าเริ่มต้น</button>
+            : <a className="pill-btn small-btn ghost sheet-btn phantom-open" href={phantomBrowseUrl()} data-testid="open-in-phantom-lock"><PhantomIcon size={18} /> Open in Phantom to lock default</a>))}
+        {confirmOpen && (
+          <div className="mode-confirm" data-testid="funds-withdraw-confirm" onClick={() => !busy && setConfirmOpen(false)}>
+            <div className="mode-confirm-card" onClick={(e) => e.stopPropagation()}>
+              <b>ยืนยันการถอน</b>
+              <p className="small">จำนวน <b className="mono">{withdrawAmount().max ? 'ทั้งหมดที่ถอนได้' : withdrawAmount().amt} {asset}</b></p>
+              <p className="small">ไปที่</p>
+              <code className="addr" data-testid="funds-withdraw-confirm-to">{(destAddr || defaultTo).trim()}</code>
+              <p className="tiny muted">ไม่สามารถยกเลิกได้หลังกดยืนยัน ระบบจะโอนจากกระเป๋าบอททันที</p>
+              <div className="btn-row">
+                <button type="button" className="pill-btn small-btn ghost" disabled={busy} onClick={() => setConfirmOpen(false)}>ยกเลิก</button>
+                <button type="button" className="pill-btn small-btn" disabled={busy} onClick={confirmWithdraw} data-testid="funds-withdraw-confirm-go">ยืนยันถอน</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="section card">
@@ -183,7 +242,7 @@ export function Funds({ snap }: { snap: any }) {
         ) : history.map((h: any) => (
           <div key={h.signature || h.ts} className="kv mono small" style={{ marginBottom: 8 }}>
             <span className="muted">{new Date(h.ts).toLocaleString('en-GB', { timeZone: 'Asia/Bangkok' })}</span>
-            <span>{h.sol} SOL → {short(h.to)}</span>
+            <span>{h.asset === 'USDC' || h.usdc ? `${h.usdc} USDC` : `${h.sol} SOL`} → {short(h.to)}</span>
             {h.signature && <a href={h.solscan || `https://solscan.io/tx/${h.signature}`} target="_blank" rel="noreferrer">{short(h.signature)}</a>}
           </div>
         ))}

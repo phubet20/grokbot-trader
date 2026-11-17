@@ -272,3 +272,7 @@ code { font-family: var(--mono); font-size: 12px; background: var(--chip); paddi
 .funds-page .addr { display: block; word-break: break-all; font-size: 11px; margin: 6px 0; }
 .field small input[type="checkbox"] { width: 20px; height: 20px; }
 .tabbar button { flex: 1; }
+
+.withdraw-addr { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; letter-spacing: 0; }
+.mode-confirm-card .addr { display: block; word-break: break-all; font-size: 12px; margin: 0 0 8px; }
+.deposit-row select { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--card); color: inherit; }

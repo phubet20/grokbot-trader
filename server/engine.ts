@@ -13,12 +13,13 @@ import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, exitReserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
 import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, currentlyPumping, SWAP_FEE_BPS, RUNNER_PARTIAL_PCT, type TapeSnap } from './strategy.ts';
-import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked, reclaimEmptyAtas } from './executor.ts';
+import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, reclaimEmptyAtas } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
 import { persistRenderEnv, autoStartEnabled, ensureAutoStartEnv, canPersistRenderEnv } from './render-env.ts';
-import { getUsdcBalance, canAutoSwapUsdc, swapUsdcToSol, transferUsdcToLocked } from './usdc.ts';
+import { getUsdcBalance, canAutoSwapUsdc, swapUsdcToSol, transferUsdc, USDC_DECIMALS } from './usdc.ts';
+import { parseWithdrawDestination, DEFAULT_WITHDRAW_TO, sendSolWithdraw, keepLamportsForWithdraw, previewSolWithdraw, WITHDRAW_ERR, shortAddr } from './withdraw.ts';
 import { remoteStateStatus } from './remote-state.ts';
 import { rebuildPositions } from './reconcile.ts';
 import { getPumpFeed, mergePumpOnto } from './pump.ts';
@@ -1540,38 +1541,77 @@ export class Engine extends EventEmitter {
     });
     return { ok: true, withdrawTo: address, persisted: canPersistRenderEnv() };
   }
-  async withdraw(opts: { sol?: number; max?: boolean } = {}) {
-    if (this.mode === 'paper') throw new Error('Withdraw is disabled in paper mode. It only sends real SOL from the bot wallet to the locked Phantom address in live-auto.');
-    const to = this.lockedWithdrawTo();
-    if (!to) throw new Error('lock a withdraw address first (connect Phantom once and sign) or set WITHDRAW_TO');
-    if ((this.mode === 'paper' ? this.liveHeld : this.positions).length) throw new Error('close open live positions and pause the bot before withdrawing');
-    if (this.pending.size) throw new Error('a swap is still pending');
+  async withdraw(opts: { to?: string; asset?: 'SOL' | 'USDC' | string; sol?: number; usdc?: number; max?: boolean; dryRun?: boolean } = {}) {
+    const parsed = parseWithdrawDestination(opts.to || this.lockedWithdrawTo() || DEFAULT_WITHDRAW_TO);
+    if (!parsed.ok) throw new Error(parsed.error);
+    if (this.mode === 'paper') throw new Error(WITHDRAW_ERR.paper);
+    const asset = String(opts.asset || 'SOL').toUpperCase() === 'USDC' ? 'USDC' : 'SOL';
+    if (asset !== 'SOL' && asset !== 'USDC') throw new Error(WITHDRAW_ERR.asset);
+    const liveOpen = this.positions.length;
+    const keep = keepLamportsForWithdraw({ priorityFeeSol: this.cfg.priorityFeeSol, openLivePositions: liveOpen });
+    const pub = botPublicKey();
+    if (!pub) throw new Error('bot wallet is not configured');
+    if (parsed.address === pub) throw new Error(WITHDRAW_ERR.self);
+
+    if (opts.dryRun) {
+      if (asset === 'USDC') {
+        const bal = await getUsdcBalance(this.cfg.rpcUrl, pub);
+        const raw = opts.max || opts.usdc == null ? bal.raw : BigInt(Math.floor(Number(opts.usdc) * 10 ** USDC_DECIMALS));
+        const send = raw > bal.raw ? bal.raw : raw;
+        return { ok: true, dryRun: true, to: parsed.address, asset, usdc: Number(send) / 10 ** USDC_DECIMALS, sol: 0 };
+      }
+      const lamports = opts.max || opts.sol == null || !Number.isFinite(Number(opts.sol))
+        ? undefined
+        : Math.floor(Number(opts.sol) * 1e9);
+      const prev = await previewSolWithdraw(this.cfg.rpcUrl, pub, lamports, keep);
+      return { ok: true, dryRun: true, to: parsed.address, asset, sol: prev.send / 1e9, keepSol: prev.keep / 1e9, balanceSol: prev.balance / 1e9 };
+    }
+
+    if (this.pending.size) throw new Error('ยังมีรายการสวอปค้างอยู่ กรุณารอให้เสร็จก่อนถอน');
     if (this.wallet.running) this.setRunning(false);
+
+    if (asset === 'USDC') {
+      const raw = opts.max || opts.usdc == null
+        ? undefined
+        : BigInt(Math.floor(Number(opts.usdc) * 10 ** USDC_DECIMALS));
+      if (raw !== undefined && raw <= 0n) throw new Error(WITHDRAW_ERR.amount);
+      const u = await transferUsdc(this.cfg.rpcUrl, parsed.address, raw, { priorityFeeSol: this.cfg.priorityFeeSol });
+      if (!u) throw new Error(WITHDRAW_ERR.noFunds);
+      await this.syncBotBalance();
+      const rec = {
+        ts: Date.now(), asset: 'USDC' as const, sol: 0, usdc: u.usdc, to: parsed.address,
+        signature: u.signature, solscan: `https://solscan.io/tx/${u.signature}`, attempts: u.attempts,
+      };
+      const hist = this.store.get<any[]>('withdrawHistory', []);
+      hist.unshift(rec);
+      this.store.set('withdrawHistory', hist.slice(0, 50));
+      this.log('Core', 'info', `withdrew ${u.usdc.toFixed(2)} USDC to ${shortAddr(parsed.address)}`);
+      this.emitState();
+      return { ok: true, ...rec };
+    }
+
     const lamports = opts.max || opts.sol == null || !Number.isFinite(Number(opts.sol))
       ? undefined
       : Math.floor(Number(opts.sol) * 1e9);
-    if (lamports !== undefined && lamports <= 0) throw new Error('enter an amount greater than 0, or use max');
-    let usdcSent: { signature: string; usdc: number } | null = null;
-    try { await this.convertUsdc(true); } catch {}
-    try { usdcSent = await transferUsdcToLocked(this.cfg.rpcUrl, to); } catch (e: any) {
-      this.log('Core', 'info', `USDC withdraw skipped: ${e?.message || e}`);
+    if (lamports !== undefined && lamports <= 0) throw new Error(WITHDRAW_ERR.amount);
+    let closedAccounts = 0;
+    try { closedAccounts = await reclaimEmptyAtas(this.cfg.rpcUrl); } catch (e: any) {
+      this.log('Core', 'info', `close empty accounts: ${e?.message || e}`);
     }
-    const r = await withdrawToLocked(this.cfg.rpcUrl, to, lamports);
+    const r = await sendSolWithdraw(this.cfg.rpcUrl, parsed.address, lamports, {
+      priorityFeeSol: this.cfg.priorityFeeSol,
+      keepLamports: keep,
+    });
     await this.syncBotBalance();
     const rec = {
-      ts: Date.now(),
-      sol: r.lamports / 1e9,
-      to,
-      signature: r.signature,
-      solscan: `https://solscan.io/tx/${r.signature}`,
-      closedAccounts: r.closedAccounts,
-      usdc: usdcSent?.usdc || 0,
-      usdcSignature: usdcSent?.signature,
+      ts: Date.now(), asset: 'SOL' as const, sol: r.lamports / 1e9, usdc: 0, to: parsed.address,
+      signature: r.signature, solscan: `https://solscan.io/tx/${r.signature}`,
+      closedAccounts, attempts: r.attempts,
     };
     const hist = this.store.get<any[]>('withdrawHistory', []);
     hist.unshift(rec);
     this.store.set('withdrawHistory', hist.slice(0, 50));
-    this.log('Core', 'info', `withdrew ${rec.sol.toFixed(4)} SOL to locked address (closed ${r.closedAccounts} empty token accounts)`);
+    this.log('Core', 'info', `withdrew ${rec.sol.toFixed(4)} SOL to ${shortAddr(parsed.address)}`);
     this.emitState();
     return { ok: true, ...rec };
   }
@@ -1598,12 +1638,17 @@ export class Engine extends EventEmitter {
       autoSwapUsdc: this.mode !== 'paper',
       network: 'solana',
       solPrice: this.solPrice,
-      withdrawTo: this.lockedWithdrawTo(),
+      withdrawTo: this.lockedWithdrawTo() || DEFAULT_WITHDRAW_TO,
+      defaultTo: this.lockedWithdrawTo() || DEFAULT_WITHDRAW_TO,
+      canWithdraw: this.mode !== 'paper',
+      reserveSol: keepLamportsForWithdraw({ priorityFeeSol: this.cfg.priorityFeeSol, openLivePositions: this.mode === 'paper' ? this.liveHeld.length : this.positions.length }) / 1e9,
+      maxSol: Math.max(0, (onchain || 0) - keepLamportsForWithdraw({ priorityFeeSol: this.cfg.priorityFeeSol, openLivePositions: this.mode === 'paper' ? this.liveHeld.length : this.positions.length }) / 1e9),
+      maxUsdc: usdc.ui,
       withdrawLocked: !!this.lockedWithdrawTo(),
       lockedBy: this.withdrawLockedBy(),
       history: this.store.get<any[]>('withdrawHistory', []).slice(0, 50),
       positionsOpen: this.mode === 'paper' ? this.positions.length : this.positions.length,
-      livePositionsOpen: this.liveHeld.length,
+      livePositionsOpen: this.mode === 'paper' ? this.liveHeld.length : this.positions.length,
       running: this.wallet.running,
     };
   }
