@@ -1,12 +1,13 @@
 import { useState } from 'react';
+import { soundEnabled, setSoundEnabled, unlockAudio } from '../sounds';
 import { api, usd, short } from '../api';
 import { BotWalletPanel } from './BotWallet';
 import { NotifyPanel } from './NotifyPanel';
 import { ModeBadge, ModeToggle } from './ModeToggle';
 
 const FIELDS: [string, string, number, number, number][] = [
-  ['positionPct', 'Position size (% of free cash)', 1, 50, 1],
-  ['takeProfitPct', 'Take profit (% net after fees/slip)', 0.5, 50, 0.5],
+  ['positionPct', 'Position size (% of stack)', 1, 50, 1],
+  ['takeProfitPct', 'Take-profit floor (% net; runners trail past this)', 0.5, 50, 0.5],
   ['hardStopPct', 'Catastrophic stop (% below entry)', 10, 80, 1],
   ['redExitSec', 'Sell a red position after (seconds)', 15, 180, 5],
   ['trailingStopPct', 'Trailing stop (% from top)', 2, 60, 0.5],
@@ -21,6 +22,7 @@ const FIELDS: [string, string, number, number, number][] = [
 export function Account({ snap, onRecap, onDisconnected, onConnect }: { snap: any; onRecap: () => void; onDisconnected: () => void; onConnect?: () => void }) {
   const [cfg, setCfg] = useState<any>({ ...snap.config });
   const [msg, setMsg] = useState('');
+  const [soundOn, setSoundOn] = useState(() => soundEnabled());
   const save = async () => { try { await api('config', cfg); setMsg('Saved ✓'); } catch (e: any) { setMsg(e.message); } setTimeout(() => setMsg(''), 2000); };
   const w = snap.wallet;
   return (
@@ -46,6 +48,14 @@ export function Account({ snap, onRecap, onDisconnected, onConnect }: { snap: an
         <p className="tiny muted" data-testid="background-note">{snap.mode === 'paper'
           ? <>The bot trades on the server — you can close or reload the app without resetting the book. Connect / AUTO_START resume a saved book; they do not overwrite it. Only <b>Reset paper book</b> starts a fresh test balance. {snap.background?.remoteState?.configured ? 'Paper state is also saved off-disk so a redeploy can restore it.' : 'To keep the paper book across redeploys, add STATE_GITHUB_TOKEN on the host.'} On the free host, sleep after ~15 min idle is still possible; keepalive is not guaranteed.</>
           : <>Live mode shows only the bot wallet's on-chain SOL and USDC. Paper history is not used. Withdrawals go only to the locked Phantom address. On the free host, sleep after ~15 min idle is still possible; keepalive is not guaranteed.</>}</p>
+      </div>
+      <div className="section card" data-testid="sound-panel">
+        <div className="sec-hd"><b>Sound alerts</b><span className="muted tiny">{soundOn ? 'on' : 'off'}</span></div>
+        <p className="tiny muted">A short trading ping on every buy, and a cash-register ka-ching on every sell (a lower tone when the sell is a loss). Sounds unlock on your first tap (required on iPhone). They play only for the active TEST or LIVE book.</p>
+        <label className="field small">
+          <span>Sound</span>
+          <input type="checkbox" checked={soundOn} data-testid="sound-toggle" onChange={(e) => { const on = e.target.checked; setSoundOn(on); setSoundEnabled(on); if (on) void unlockAudio(); }} />
+        </label>
       </div>
       <NotifyPanel snap={snap} />
       {snap.botWallet?.publicKey && <div className="section card"><BotWalletPanel snap={snap} /></div>}

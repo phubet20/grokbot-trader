@@ -73,9 +73,9 @@ export function defaultGovernor(baseTp = 3): GovernorState {
     minScoreAdj: 0,
     tpPct: baseTp,
     sizeMult: 1,
-    earlyCutSec: 0,
+    earlyCutSec: 25,
     favored: [...FAVORED_PATTERNS],
-    note: 'relaxed — waiting for equity slope',
+    note: 'TP floor on weak hands, runners trail; cut 25s if no thrust',
   };
 }
 
@@ -296,8 +296,8 @@ export class AutoTune {
     let tradeSlopePct = 0;
     if (recent.length >= 4 && recent[0].equity > 0)
       tradeSlopePct = ((recent[recent.length - 1].equity - recent[0].equity) / recent[0].equity) * 100;
-    // Tight mode (score raises, size cuts, faster TP) is retired. Equity slope is
-    // still observed, but trading params stay at the configured defaults.
+    // Tight mode (score raises, size cuts) is retired. The 1.8%-style TP floor
+    // and 25s no-thrust cut stay on as exit defaults — they do not tighten entries.
     this.tight = false;
     this.gov = {
       mode: 'relaxed',
@@ -308,9 +308,9 @@ export class AutoTune {
       minScoreAdj: 0,
       tpPct: baseTp,
       sizeMult: 1,
-      earlyCutSec: 0,
+      earlyCutSec: 25,
       favored: [...FAVORED_PATTERNS],
-      note: 'light adapt only — score nudges capped at ±3; no TIGHT, no size cuts',
+      note: 'TP floor on weak hands, runners trail; cut 25s if no thrust — light adapt only, score nudges ±3',
     };
   }
 
@@ -327,7 +327,13 @@ export class AutoTune {
     return clamp(Math.round(s.expectancy * 10), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
   }
 
-  entrySizeMult(_why: string): number {
+  /** Lean into recent winning patterns after 2 closes; full weights at 3. Bounded. */
+  entrySizeMult(why: string): number {
+    const s = this.patterns.get(classify(why));
+    if (!s || s.n < 2) return 1;
+    if (s.n >= this.minSamples && s.expectancy > 0 && s.wr >= 0.6) return 1.2;
+    if (s.n >= 2 && s.expectancy > 0) return 1.1;
+    if (s.n >= this.minSamples && s.expectancy < 0 && s.wr < 0.4) return 0.85;
     return 1;
   }
 

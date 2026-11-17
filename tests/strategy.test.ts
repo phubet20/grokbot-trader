@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, signalAdjustments, currentlyPumping, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, signalAdjustments, currentlyPumping, momentumBreakdown, liveExit, isStrongRunner, estimatedNetPnlPct, netPnlFromSellQuote, RUNNER_TRAIL_PCT, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -100,6 +100,39 @@ test('liveExit takes profit at +3% net after estimated fees and slippage, 100% c
   const mom = liveExit(pos, 101, undefined, [dump], opts);
   assert.equal(mom.exit, true);
   assert.equal(mom.kind, 'momentum_fade');
+});
+
+test('liveExit does not cap a runner at the TP floor — it scales, then trails', () => {
+  const pos = { entryPrice: 100, qty: 1, costUsd: 100, peakPrice: 100, openedAt: 0 };
+  const opts = { catStopPct: 35, takeProfitPct: 1.8, extraSlippageBps: 0, feeUsd: 0 };
+  // Weak / no tape just above the floor: take the scalp.
+  const weak = liveExit(pos, 104, undefined, [], opts);
+  assert.equal(weak.kind, 'take_profit');
+  assert.equal(weak.partial, false);
+
+  const runner = {
+    priceUsd: 120, liquidityUsd: 25_000,
+    change: { m5: 12, m15: 20, h1: 20, h6: 20, h24: 20 },
+    volume: { m5: 8000, h1: 10_000, h6: 10_000, h24: 10_000 },
+    txns: { m5b: 40, m5s: 8, h1b: 80, h1s: 20 },
+  } as any;
+  const hist: TapeSnap[] = [{ t: 1, px: 120, liq: 25_000, mc: 80_000, m5: 12, m15: 20, h1: 20, vol5: 8000, vol1h: 10_000, b5: 40, s5: 8, b1: 80, s1: 20, tr: 100, age: 1 }];
+  assert.equal(isStrongRunner(pos, 120, runner, hist, { takeProfitPct: 1.8 }), true);
+  const scale = liveExit(pos, 120, runner, hist, opts);
+  assert.equal(scale.kind, 'partial_tp', scale.reason);
+  assert.equal(scale.partial, true);
+
+  const rest = liveExit({ ...pos, partialTaken: true, peakPrice: 120 }, 118, runner, hist, opts);
+  assert.equal(rest.exit, false, 'runner remainder stays open near highs: ' + rest.reason);
+
+  // Extended move, no tape, still near highs: do not full-close at the floor.
+  const moon = liveExit({ ...pos, peakPrice: 900, partialTaken: true }, 890, undefined, [], opts);
+  assert.equal(moon.exit, false, moon.reason);
+
+  const trailPx = 900 * (1 - RUNNER_TRAIL_PCT / 100);
+  const trailed = liveExit({ ...pos, peakPrice: 900, partialTaken: true }, trailPx, undefined, [], opts);
+  assert.equal(trailed.exit, true);
+  assert.equal(trailed.kind, 'trailing_stop');
 });
 
 test('momentum breakdown exits on net sell flow or a lower low after the peak', () => {

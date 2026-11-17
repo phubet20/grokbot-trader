@@ -83,5 +83,12 @@ async function render(url: string, init: RequestInit = {}) {
 
 export function autoStartEnabled(): boolean {
   const v = (process.env.AUTO_START || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  // Explicit off only. Unset defaults to on so a fresh boot/redeploy starts trading immediately.
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+  return true;
+}
+
+/** Force AUTO_START on in-process so health checks and later reads agree. */
+export function ensureAutoStartEnv(): void {
+  process.env.AUTO_START = '1';
 }

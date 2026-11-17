@@ -17,3 +17,5 @@ BOT_WALLET_SECRET.txt
 VAPID_PRIVATE_KEY.txt
 VAPID_PUBLIC_KEY.txt
 VAPID_KEYS.txt
+
+test-results/

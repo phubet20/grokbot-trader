@@ -75,6 +75,21 @@ test('Start/Stop running flag is persisted and restored', async () => {
   assert.equal(e3.wallet.running, true);
 });
 
+test('start() begins trading immediately without a Start tap', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-autostart-'));
+  const cfg = { ...DEFAULTS, startUsd: 10, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const storePath = join(dirp, 't.db');
+  const e = new Engine(cfg, new ReplayMarket(10), new Store(storePath));
+  await e.connect({ type: 'paper', startUsd: 10 });
+  e.setRunning(false);
+  const e2 = new Engine(cfg, new ReplayMarket(10), new Store(storePath));
+  assert.equal(e2.wallet.running, false);
+  await e2.start();
+  assert.equal(e2.wallet.running, true);
+  assert.equal(e2.wallet.connected, true);
+  e2.stop();
+});
+
 test('scan cadence continues while a candidate check hangs', async () => {
   const dirp = mkdtempSync(join(tmpdir(), 'gb-hang-'));
   const cfg = { ...DEFAULTS, startUsd: 10, minScore: 0, minHolders: 0, minAgeMin: 0, minMcapUsd: 0, minLiquidityUsd: 0, cooldownMin: 0, scanIntervalSec: 0.4, monitorIntervalSec: 99 };

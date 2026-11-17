@@ -4,7 +4,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
 import { join, extname, normalize } from 'node:path';
-import { config, updateConfig, liveGate, ROOT } from './config.ts';
+import { config, updateConfig, liveGate, migrateStockDefaults, ROOT } from './config.ts';
 import { redactSecrets, botPublicKey } from './wallet.ts';
 import { LiveMarket } from './market.ts';
 import { ReplayMarket } from './replay.ts';
@@ -23,7 +23,7 @@ async function bootEngine() {
   const restored = await hydrateStore(store);
   attachRemoteSync(store);
   const savedCfg = store.get<any>('config', null);
-  if (savedCfg) updateConfig(savedCfg);
+  if (savedCfg) updateConfig(migrateStockDefaults(savedCfg));
   engine = new Engine(config, market, store);
   for (const ev of ['state', 'agents', 'activity', 'decision', 'equity', 'positions', 'toast', 'approval']) {
     engine.on(ev, (d) => broadcast(ev, d));

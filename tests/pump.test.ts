@@ -92,6 +92,10 @@ test('persistRenderEnv refuses unknown keys and no-ops without an API key', asyn
   process.env.AUTO_START = '1';
   assert.equal(autoStartEnabled(), true);
   delete process.env.AUTO_START;
+  assert.equal(autoStartEnabled(), true, 'unset AUTO_START defaults to on');
+  process.env.AUTO_START = '0';
+  assert.equal(autoStartEnabled(), false);
+  delete process.env.AUTO_START;
 });
 
 test('buildLiveSwapTx falls back to PumpPortal when the quote has no Jupiter raw route', async () => {

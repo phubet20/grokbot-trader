@@ -124,7 +124,7 @@ test('governor no longer tightens score, size, or take-profit when equity stalls
   assert.equal(stalled.mode, 'relaxed');
   assert.equal(stalled.minScoreAdj, 0);
   assert.equal(stalled.tpPct, 3);
-  assert.equal(stalled.earlyCutSec, 0);
+  assert.equal(stalled.earlyCutSec, 25);
   assert.equal(stalled.sizeMult, 1);
   assert.equal(t.takeProfitPct(3), 3);
   const nudge = t.patternAdj('score 55');

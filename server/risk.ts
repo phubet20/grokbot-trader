@@ -44,7 +44,8 @@ export const FEE_RESERVE_SOL = 0.0005;
 function roundUsd(x: number) { return Math.floor(x * 1e6) / 1e6; }
 function round2(x: number) { return Math.floor(x * 100) / 100; }
 
-const TINY_BOOK_USD = 15;
+/** Live books around a dollar cannot do wide 1%-of-stack sizing. */
+const TINY_BOOK_USD = 5;
 
 /**
  * USD size of the next trade.
@@ -94,17 +95,17 @@ export function slotSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: numbe
 }
 
 /**
- * Size the next entry from spendable cash (free cash minus exit reserve).
- * No minimum USD floor. Tiny books use all spendable so the buy exceeds ATA
- * rent; larger books use positionPct and a 24% equity cap. Stops only when
- * spendable is 0 (a trade is mechanically impossible).
+ * Size the next entry as positionPct of the stack (equity), capped at
+ * spendable cash (free cash minus the exit reserve). Last night's book used
+ * ~1% of equity with many concurrent micros. Tiny live books (~$1) cannot
+ * do that — they use all spendable after the cash reserve so a buy can land.
  */
 export function openSizeUsd(p: RiskParams, equityUsd: number, freeCashUsd: number, reserveUsd: number): number {
   const spendable = Math.max(0, freeCashUsd - reserveUsd);
   if (!(spendable > 0)) return 0;
   if (equityUsd > 0 && equityUsd <= TINY_BOOK_USD) return roundUsd(spendable);
-  const pct = Math.max(1, Math.min(100, p.positionPct || 8)) / 100;
-  let size = spendable * pct;
+  const pct = Math.max(1, Math.min(100, p.positionPct || 1)) / 100;
+  let size = equityUsd * pct;
   if (size > spendable) size = spendable;
   if (equityUsd > TINY_BOOK_USD) size = Math.min(size, equityUsd * 0.24);
   return size > 0 ? roundUsd(size) : 0;
@@ -146,10 +147,8 @@ export function adaptFilters(base: { minScore: number; trailingStopPct: number; 
   let trailingStopPct = base.trailingStopPct;
   let hardStopPct = base.hardStopPct;
   let pauseMs = 0;
-  // Light adaptation only: small score nudges, no tighter stops or size cuts.
-  if (consec >= 2) minScore += 2;
-  if (consec >= 3 || (last.length >= 6 && losses >= 5)) minScore += 1;
-  minScore = Math.min(base.minScore + 3, minScore);
+  // Do not raise the entry floor after losses — keep entries flowing and
+  // let pattern weights prefer what has been working.
   return { minScore, trailingStopPct, hardStopPct, pauseMs, consec, sizeMult: 1 };
 }
 

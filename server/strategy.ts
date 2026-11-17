@@ -398,11 +398,12 @@ export function currentlyPumping(c: Candidate, _now = Date.now()): { ok: boolean
   const active = vol5 > 0 || (buys + sells) >= 2 || !!c.curve;
   if (!active) return { ok: false, reason: 'no flow' };
   if (m5 <= -3) return { ok: false, reason: 'dumping' };
-  if (m5 >= 1.2 && net) return { ok: true, reason: `pumping +${m5.toFixed(1)}% 5m` };
-  if (m5 >= 0.4 && r5 >= 0.55) return { ok: true, reason: `pumping buy pressure ${Math.round(r5 * 100)}%` };
-  if (m15 >= 4 && m5 >= 0 && net) return { ok: true, reason: `pumping +${m15.toFixed(0)}% 15m` };
+  if (m5 >= 0.3 && (net || r5 >= 0.5)) return { ok: true, reason: `pumping +${m5.toFixed(1)}% 5m` };
+  if (m5 >= 0 && r5 >= 0.52) return { ok: true, reason: `pumping buy pressure ${Math.round(r5 * 100)}%` };
+  if (m15 >= 2 && m5 >= -1 && net) return { ok: true, reason: `pumping +${m15.toFixed(0)}% 15m` };
   const volAccel = (c.volume?.h1 || 0) > 0 ? (vol5 * 12) / c.volume.h1 : 0;
-  if (volAccel >= 1.2 && m5 >= 0 && net) return { ok: true, reason: 'pumping volume accel' };
+  if (volAccel >= 1.05 && m5 >= 0) return { ok: true, reason: 'pumping volume accel' };
+  if (c.curve && !c.curve.graduated && net && m5 >= 0) return { ok: true, reason: 'pumping curve buy flow' };
   return { ok: false, reason: 'not pumping' };
 }
 
@@ -559,13 +560,51 @@ export function netPnlFromSellQuote(costUsd: number, solReceived: number, feesSo
   return ((proceeds - costUsd) / costUsd) * 100;
 }
 
-/** Paper/live exits: 100% out on take-profit (paper), momentum break, or a wide catastrophic / rug stop. */
+/** Giveback from peak that trails a runner after the TP floor is armed. */
+export const RUNNER_TRAIL_PCT = 12;
+/** First scale-out when a runner prints the TP floor. */
+export const RUNNER_PARTIAL_PCT = 50;
+
+/**
+ * Strong movers keep running past the TP floor: still pumping / holding highs,
+ * or already extended well past the scalp target. Weak / flat prints take the floor.
+ */
+export function isStrongRunner(
+  pos: PosMark,
+  price: number,
+  c: Candidate | undefined,
+  hist: TapeSnap[] = [],
+  opts: { takeProfitPct?: number; now?: number } = {},
+): boolean {
+  if (!(price > 0) || !(pos.entryPrice > 0)) return false;
+  const fromEntry = (price / pos.entryPrice - 1) * 100;
+  const peak = Math.max(pos.peakPrice || 0, price);
+  const fromPeak = peak > 0 ? (1 - price / peak) * 100 : 0;
+  const nearHighs = fromPeak <= RUNNER_TRAIL_PCT;
+  const tp = opts.takeProfitPct ?? 0;
+  const extended = fromEntry >= Math.max(8, (tp > 0 ? tp : 1.8) * 3);
+  const now = opts.now ?? Date.now();
+  if (c) {
+    const s = hist[hist.length - 1] || toSnap(now, c);
+    if (momentumBreakdown(c, s, hist).exit) return false;
+    const pump = currentlyPumping(c, now);
+    const conf = momentumConfirm(c, hist, now);
+    const m5 = c.change?.m5 ?? s.m5 ?? 0;
+    if (!nearHighs) return false;
+    return pump.ok || conf.ok || m5 > 0 || extended;
+  }
+  // No tape: only a clearly extended move holding highs is treated as a runner.
+  return nearHighs && extended;
+}
+
+/** Paper/live exits: TP is a floor for weak hands; runners scale then trail /
+ *  exit on momentum break. Catastrophic / rug stop is the backstop. */
 export function liveExit(
   pos: PosMark & { entryLiq?: number; qty?: number; costUsd?: number },
   price: number,
   c: Candidate | undefined,
   hist: TapeSnap[],
-  opts: { catStopPct?: number; sensitivity?: number; takeProfitPct?: number; extraSlippageBps?: number; feeUsd?: number } = {},
+  opts: { catStopPct?: number; sensitivity?: number; takeProfitPct?: number; extraSlippageBps?: number; feeUsd?: number; runnerTrailPct?: number; now?: number } = {},
 ): { exit: boolean; kind: ExitKind | null; reason: string; partial: boolean; peak: number } {
   const cat = opts.catStopPct ?? 35;
   const peak = Math.max(pos.peakPrice, price);
@@ -576,12 +615,25 @@ export function liveExit(
   if (fromEntry <= -cat)
     return { exit: true, kind: 'hard_stop', reason: `catastrophic stop -${cat}% (${fromEntry.toFixed(1)}%)`, partial: false, peak };
   const tp = opts.takeProfitPct ?? 0;
-  if (tp > 0) {
-    const net = estimatedNetPnlPct(pos, price, { extraSlippageBps: opts.extraSlippageBps, feeUsd: opts.feeUsd });
-    if (net >= tp)
+  const net = estimatedNetPnlPct(pos, price, { extraSlippageBps: opts.extraSlippageBps, feeUsd: opts.feeUsd });
+  const runner = isStrongRunner(pos, price, c, hist, { takeProfitPct: tp, now: opts.now });
+  if (tp > 0 && net >= tp) {
+    if (runner) {
+      if (!pos.partialTaken)
+        return { exit: true, kind: 'partial_tp', reason: `scale ${RUNNER_PARTIAL_PCT}% at +${net.toFixed(1)}% net (runner, floor +${tp}%)`, partial: true, peak };
+      // Remainder rides until a trail or momentum break.
+    } else {
       return { exit: true, kind: 'take_profit', reason: `take profit +${net.toFixed(1)}% net (target +${tp}%)`, partial: false, peak };
+    }
   }
-  const s = hist[hist.length - 1] || (c ? toSnap(Date.now(), c) : undefined);
+  const armed = !!pos.partialTaken || (tp > 0 && (net >= tp || fromEntry >= tp));
+  const trailPct = opts.runnerTrailPct ?? RUNNER_TRAIL_PCT;
+  if (armed && trailPct > 0 && peak > 0) {
+    const trail = peak * (1 - trailPct / 100);
+    if (price <= trail)
+      return { exit: true, kind: 'trailing_stop', reason: `trailing ${fromEntry.toFixed(1)}% (−${((1 - price / peak) * 100).toFixed(1)}% from top)`, partial: false, peak };
+  }
+  const s = hist[hist.length - 1] || (c ? toSnap(opts.now ?? Date.now(), c) : undefined);
   if (s) {
     const br = momentumBreakdown(c, s, hist, { sensitivity: opts.sensitivity });
     if (br.exit) return { exit: true, kind: 'momentum_fade', reason: br.reason, partial: false, peak };

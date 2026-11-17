@@ -9,8 +9,8 @@ test('position size is % of portfolio', () => {
   assert.equal(positionSizeUsd(P, 81, 81, 0.5), 6.48);
   assert.equal(positionSizeUsd(P, 1000, 1000, 0.5), 80);
 });
-test('tiny $10 book uses all spendable, not 8%', () => {
-  assert.equal(positionSizeUsd(P, 10, 10, 0.57), 9.43);
+test('a $10 book is above the tiny-live cutoff, so it uses positionPct of the stack', () => {
+  assert.equal(positionSizeUsd(P, 10, 10, 0.57), 0.8);
 });
 test('size capped by free cash minus reserve; no min-trade floor', () => {
   assert.equal(positionSizeUsd(P, 100, 3, 0.5), 2.5);
@@ -77,7 +77,7 @@ test('tiny $2 and $5 portfolios use all spendable so the buy exceeds ATA rent', 
   const s5 = positionSizeUsd(P2, 5, 5, reserve);
   assert.equal(s5, 4.65);
   const s10 = positionSizeUsd(P2, 10, 10, 0.57);
-  assert.equal(s10, 9.43);
+  assert.equal(s10, 0.8);
 });
 test('anti-martingale grows after wins and shrinks after losses, never martingales', () => {
   assert.equal(sizeMultiplier([]), 1);
@@ -88,12 +88,14 @@ test('anti-martingale grows after wins and shrinks after losses, never martingal
   const afterLoss = sizeMultiplier([2, -1]);
   assert.ok(afterLoss < afterWin);
 });
-test('consecutive loss cooldown and tighter filters (self-correction, not averaging down)', () => {
+test('consecutive losses do not raise the entry floor or cut size (light adapt only)', () => {
   assert.equal(consecutiveLosses([1, -1, -1]), 2);
   const a = adaptFilters({ minScore: 55, trailingStopPct: 6, hardStopPct: 5 }, [-1, -1]);
-  assert.ok(a.minScore > 55);
+  assert.equal(a.minScore, 55);
+  assert.equal(a.sizeMult, 1);
   assert.equal(a.pauseMs, 0);
-  assert.ok(a.trailingStopPct <= 6);
+  assert.equal(a.trailingStopPct, 6);
+  assert.equal(a.hardStopPct, 5);
 });
 test('low balance message when cash cannot cover reserve + min trade', () => {
   assert.ok(lowBalanceReason(2, 0.1, 0.3, 0.25));
@@ -132,14 +134,17 @@ test('paper $8 book can still size a trade with up to 10 slots and fee reserve',
   assert.equal(lowBalanceReason(8, 8, reserve, 0), null);
 });
 
-test('openSizeUsd is a % of free cash, never exceeds spendable, and is not capped at 10 positions', () => {
+test('openSizeUsd is a % of the stack, never exceeds spendable, and is not capped at 10 positions', () => {
   const P2 = { ...P, minTradeUsd: 0.25, positionPct: 8 };
   const reserve = 0.35;
   const s = openSizeUsd(P2, 81, 81, reserve);
   assert.ok(s > 0, 'size=' + s);
   assert.ok(s <= 81 - reserve);
-  const expected = Math.floor((81 - reserve) * 0.08 * 1e6) / 1e6;
+  const expected = Math.floor(81 * 0.08 * 1e6) / 1e6;
   assert.equal(s, expected);
+  // 1% of a $200 stack with $50 cash is $2, not 1% of remaining cash.
+  const onePct = { ...P, minTradeUsd: 0, positionPct: 1 };
+  assert.equal(openSizeUsd(onePct, 200, 50, 0.35), Math.floor(200 * 0.01 * 1e6) / 1e6);
   let cash = 81, n = 0, spent = 0;
   while (n < 500) {
     const sz = openSizeUsd(P2, 81, cash, reserve);
@@ -151,7 +156,7 @@ test('openSizeUsd is a % of free cash, never exceeds spendable, and is not cappe
   assert.ok(n > 10, 'keeps opening past 10 while cash remains, n=' + n);
   assert.ok(spent <= 81 - reserve + 1e-9);
   assert.equal(openSizeUsd(P2, 8, 0.20, reserve), 0);
-  assert.equal(openSizeUsd(P2, 8, 8, reserve), 8 - reserve);
+  assert.equal(openSizeUsd(P2, 8, 8, reserve), Math.floor(8 * 0.08 * 1e6) / 1e6);
 });
 
 test('tiny $2 and $1.73 books use all spendable (no min floor, no 24% cap)', () => {

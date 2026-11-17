@@ -12,12 +12,12 @@ import { preCheck, securityCheck, isPumpCurve, clampScore } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, exitReserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, currentlyPumping, SWAP_FEE_BPS, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, currentlyPumping, SWAP_FEE_BPS, RUNNER_PARTIAL_PCT, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked, reclaimEmptyAtas } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
-import { persistRenderEnv, autoStartEnabled, canPersistRenderEnv } from './render-env.ts';
+import { persistRenderEnv, autoStartEnabled, ensureAutoStartEnv, canPersistRenderEnv } from './render-env.ts';
 import { getUsdcBalance, canAutoSwapUsdc, swapUsdcToSol, transferUsdcToLocked } from './usdc.ts';
 import { remoteStateStatus } from './remote-state.ts';
 import { rebuildPositions } from './reconcile.ts';
@@ -260,47 +260,14 @@ export class Engine extends EventEmitter {
 
 
   async start() {
-    await this.refreshSol();
-    if (autoStartEnabled()) {
-      this.wallet.running = true;
-      this.saveWallet();
-    }
-    // Always refresh the live book if armed, even while TEST is selected, so open
-    // live positions can still be exited on-chain. Never drop the other book.
-    if (liveGate(this.cfg).live && hasBotWallet()) {
-      try {
-        const pub = botPublicKey();
-        if (pub) this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, pub);
-      } catch {}
-      await this.syncBotBalance();
-      if (this.mode !== 'paper') {
-        if (this.wallet.running || autoStartEnabled()) {
-          await this.connect({ type: 'paper' });
-          await this.reconcileOnchain();
-        }
-      } else {
-        await this.reconcileOnchain();
-      }
-    } else if (this.mode === 'live' && this.wallet.connected && (this.wallet.running || autoStartEnabled())) {
-      await this.reconcileOnchain();
-    }
-    if (this.mode === 'paper' && (autoStartEnabled() || this.wallet.running)) {
-      if (this.hasPaperBook() || this.wallet.connected) {
-        this.wallet.connected = true;
-        this.wallet.running = true;
-        this.wallet.type = 'paper';
-        this.saveWallet();
-        this.log('Core', 'info', `TEST book resumed · $${this.equity().toFixed(2)}`);
-      } else {
-        const startUsd = Math.max(2, Number(this.cfg.startUsd) || (this.solPrice || 70));
-        // Default a fresh test book to ~1 SOL when startUsd is still the historical $81 paper default.
-        const paperUsd = this.cfg.startUsd === 81 && this.solPrice ? Math.max(2, this.solPrice) : startUsd;
-        await this.connect({ type: 'paper', startUsd: paperUsd });
-      }
-    }
+    // Force scanning/trading on boot — no Start tap, no warm-up wait.
+    // AUTO_START stays on so a restart or redeploy auto-resumes.
+    ensureAutoStartEnv();
+    this.wallet.running = true;
+    this.saveWallet();
+    void persistRenderEnv({ AUTO_START: '1' });
     this.lossPauseUntil = this.store.getBook(this.book, 'lossPauseUntil', this.store.get('lossPauseUntil', 0));
-    // Independent loops: the next tick is scheduled immediately, so a slow
-    // scan, buy, or sell never delays the cadence of the others.
+    // Start loops immediately so the first scan does not wait on RPC/reconcile.
     const loop = (fn: () => Promise<void>, sec: () => number, name: string) => {
       const tick = () => {
         this.timers.push(setTimeout(tick, Math.max(0.25, sec()) * 1000));
@@ -314,11 +281,52 @@ export class Engine extends EventEmitter {
     loop(() => this.monitor(), () => this.cfg.monitorIntervalSec, 'monitor');
     loop(() => this.convertUsdc(), () => 20, 'usdc');
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
-    if (this.wallet.connected && this.wallet.running) {
-      this.log('Core', 'info', 'resumed saved Start state — trading continues with the app closed');
-      void this.kickoffTrading('resume');
-    } else if (this.wallet.connected) {
-      this.log('Core', 'info', 'bot is paused (saved Stop state); open the app and tap Start to resume');
+    // Connect the book in the background, then enter as soon as any candidate passes.
+    await this.bootSession();
+  }
+
+  /** Connect/resume the active book and kick off the first scan + entries. */
+  private async bootSession() {
+    try {
+      await this.refreshSol();
+      this.wallet.running = true;
+      // Always refresh the live book if armed, even while TEST is selected, so open
+      // live positions can still be exited on-chain. Never drop the other book.
+      if (liveGate(this.cfg).live && hasBotWallet()) {
+        try {
+          const pub = botPublicKey();
+          if (pub) this.usdcBal = await getUsdcBalance(this.cfg.rpcUrl, pub);
+        } catch {}
+        await this.syncBotBalance();
+        if (this.mode !== 'paper') {
+          await this.connect({ type: 'paper' });
+          await this.reconcileOnchain();
+        } else {
+          await this.reconcileOnchain();
+        }
+      } else if (this.mode === 'live' && this.wallet.connected) {
+        await this.reconcileOnchain();
+      }
+      if (this.mode === 'paper') {
+        if (this.hasPaperBook() || this.wallet.connected) {
+          this.wallet.connected = true;
+          this.wallet.running = true;
+          this.wallet.type = 'paper';
+          this.saveWallet();
+          this.log('Core', 'info', `TEST book resumed · $${this.equity().toFixed(2)}`);
+        } else {
+          const startUsd = Math.max(2, Number(this.cfg.startUsd) || (this.solPrice || 70));
+          const paperUsd = this.cfg.startUsd === 81 && this.solPrice ? Math.max(2, this.solPrice) : startUsd;
+          await this.connect({ type: 'paper', startUsd: paperUsd });
+        }
+      }
+      this.wallet.running = true;
+      this.saveWallet();
+      this.log('Core', 'info', 'auto-started — scanning and trading immediately (no Start tap)');
+      if (this.wallet.connected) void this.kickoffTrading('boot');
+    } catch (e: any) {
+      this.log('Core', 'info', `auto-start: ${e?.message || e}`);
+      if (this.wallet.connected && this.wallet.running) void this.kickoffTrading('boot-retry');
     }
   }
   stop() { for (const t of this.timers) clearTimeout(t); this.timers = []; }
@@ -410,9 +418,11 @@ export class Engine extends EventEmitter {
   setRunning(r: boolean) {
     this.wallet.running = r;
     this.saveWallet();
-    this.log('Core', 'info', r ? 'Bot resumed' : 'Bot paused - no new trades');
-    void persistRenderEnv({ AUTO_START: r ? '1' : '0' }).then((res) => {
-      if (res.ok) this.log('Core', 'info', 'Start/Stop saved to host env so it survives a restart');
+    this.log('Core', 'info', r ? 'Bot resumed' : 'Bot paused - no new trades (will auto-resume on restart or when the app reopens)');
+    // Keep AUTO_START on so a restart, redeploy, or app reopen resumes immediately.
+    ensureAutoStartEnv();
+    void persistRenderEnv({ AUTO_START: '1' }).then((res) => {
+      if (res.ok && r) this.log('Core', 'info', 'AUTO_START kept on so trading resumes after a restart');
     });
     this.emitState();
     if (r && this.wallet.connected) {
@@ -518,15 +528,12 @@ export class Engine extends EventEmitter {
       this.log('Core', 'info', `scanning for entries immediately (${reason})`);
       const pump = this.ingestPump().catch(() => {});
       const scan = this.scan().catch(() => {});
-      await Promise.race([
-        Promise.all([pump, scan]),
-        new Promise((r) => setTimeout(r, 4000)),
-      ]);
+      // First entry as soon as any source returns — no warm-up interval.
+      await Promise.race([pump, scan, new Promise((r) => setTimeout(r, 1200))]);
       if (!this.wallet.connected || !this.wallet.running) return;
       await this.evaluateEntries().catch(() => {});
-      if (!this.positions.length && this.wallet.running) {
-        setTimeout(() => { if (this.wallet.running) void this.evaluateEntries(); }, 800);
-      }
+      await Promise.race([Promise.all([pump, scan]), new Promise((r) => setTimeout(r, 4000))]);
+      if (this.wallet.connected && this.wallet.running) await this.evaluateEntries().catch(() => {});
     } finally { this.kickingOff = false; }
   }
 
@@ -822,7 +829,7 @@ export class Engine extends EventEmitter {
       this.rollDay();
       const now = Date.now();
       const adapted = this.riskAdapted();
-      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
+      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 1.8);
       const minScore = adapted.minScore + (gov.minScoreAdj || 0);
       const recent = [...this.candidates.values()].filter((c) => now - c.seenAt < 180_000);
       this.uni.watch = 0;
@@ -948,7 +955,7 @@ export class Engine extends EventEmitter {
           this.agents.safety.rejected = this.agents.safety.penalties;
           this.noteReject('sec:' + (sr.reasons[0] || sr.label));
         }
-        const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
+        const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 1.8);
         const minScore = this.riskAdapted().minScore + (gov.minScoreAdj || 0);
         if (adjScore < minScore) {
           this.noteReject(`score ${adjScore} < ${minScore} after safety ${sr.adj}`, c.mint);
@@ -1032,7 +1039,8 @@ export class Engine extends EventEmitter {
       const room = Math.max(0, this.maxCoinUsd() - existing.costUsd);
       size = Math.min(size, room);
     }
-    if (this.mode === 'paper') size *= this.tuner.entrySizeMult(why);
+    size *= this.tuner.entrySizeMult(why);
+    size = Math.min(size, Math.max(0, this.freeCashUsd() - reserveUsd));
     if (!size) { this.agents.risk.label = 'not enough free cash'; this.logBuyFail(c, 'not enough free cash'); return; }
     const solAmt = size / this.solPrice;
     if (this.mode === 'live-auto') {
@@ -1117,14 +1125,16 @@ export class Engine extends EventEmitter {
       if (prices[SOL_MINT]) this.solPrice = prices[SOL_MINT];
       const now = Date.now();
       const adapted = this.riskAdapted();
-      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
-      const target = this.cfg.takeProfitPct ?? gov.tpPct ?? 3;
+      const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 1.8);
+      // TP is a floor for weak/flat positions. Runners scale then trail.
+      const target = gov.tpPct || this.cfg.takeProfitPct || 1.8;
       const tpOpts = {
         extraSlippageBps: this.cfg.extraSlippageBps,
         swapFeeBps: SWAP_FEE_BPS,
         feeUsd: (BASE_FEE_SOL + this.cfg.priorityFeeSol) * (this.solPrice || 0),
       };
       const tpMarks: { p: Position; markNet: number }[] = [];
+      const partialFrac = RUNNER_PARTIAL_PCT / 100;
       for (const p of [...bag]) {
         if (this.selling.has(p.id)) continue;
         const fresh = this.candidates.get(p.mint);
@@ -1136,17 +1146,16 @@ export class Engine extends EventEmitter {
         if (now - p.openedAt < 45_000 && fromEntry <= -2) p.immediateRed = true;
         p.peakPrice = Math.max(p.peakPrice, px);
         const markNet = estimatedNetPnlPct(p, px, tpOpts);
-        if (target > 0 && markNet >= target) { tpMarks.push({ p, markNet }); continue; }
         const hist = this.mintHist.get(p.mint) || [];
-        const posTarget = target;
-        const d = liveExit({ ...p, peakPrice: p.peakPrice }, px, fresh, hist, {
+        const d = liveExit({ ...p, peakPrice: p.peakPrice, partialTaken: (p as any).partialTaken }, px, fresh, hist, {
           catStopPct: this.cfg.hardStopPct,
           sensitivity: this.isLiveBookPos(p) ? 1 : this.tuner.exitSensitivity,
-          takeProfitPct: posTarget,
+          takeProfitPct: target,
           extraSlippageBps: this.cfg.extraSlippageBps,
           feeUsd: tpOpts.feeUsd,
         });
         if (d.exit && d.kind === 'take_profit') { tpMarks.push({ p, markNet }); continue; }
+        if (d.exit && d.partial) { void this.closePosition(p, d.kind!, d.reason, partialFrac); continue; }
         if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);
       }
       // Prefer a live sell quote, but if it fails or times out, close on the mark-based net.
@@ -1177,7 +1186,6 @@ export class Engine extends EventEmitter {
       }
       if (gov.earlyCutSec > 0) {
         for (const p of [...bag]) {
-          if (this.isLiveBookPos(p)) continue;
           if (this.selling.has(p.id)) continue;
           if (now - p.openedAt < gov.earlyCutSec * 1000) continue;
           const fresh = this.candidates.get(p.mint);

@@ -19,7 +19,7 @@ export type Config = {
   positionPct: number;         // % of current portfolio per trade
   minTradeUsd: number;         // unused as a gate (0); kept for config compat
   maxPositions: number;        // 0 = unlimited (cash is the only cap)
-  takeProfitPct: number;       // paper: close 100% when net PnL after fees/slip reaches this %
+  takeProfitPct: number;       // weak-hand scalp floor (net %); runners trail / momentum-break past this
   hardStopPct: number;         // exit if price drops this % below entry
   trailingStopPct: number;     // exit if price drops this % from the peak
   maxHoldMin: number;          // exit stale positions after N minutes
@@ -51,17 +51,17 @@ export const DEFAULTS: Config = {
   dataSource: 'live',
   port: 8787,
   startUsd: 81,
-  positionPct: 8,
+  positionPct: 1,
   minTradeUsd: 0,
   maxPositions: 0,
-  takeProfitPct: 3,
+  takeProfitPct: 1.8,
   hardStopPct: 35,
   trailingStopPct: 60,
   maxHoldMin: 0,
   redExitSec: 45,
   dailyLossLimitPct: 15,
   cooldownMin: 0.25,
-  minScore: 48,
+  minScore: 40,
   minLiquidityUsd: 800,
   maxLiquidityUsd: 50_000_000,
   minHolders: 40,
@@ -73,7 +73,7 @@ export const DEFAULTS: Config = {
   slippageBps: 400,
   extraSlippageBps: 50,
   priorityFeeSol: 0.0002,
-  scanIntervalSec: 6,
+  scanIntervalSec: 2.5,
   monitorIntervalSec: 1,
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   liveConfirm: '',
@@ -120,9 +120,28 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   return out;
 }
 
+/** Move stock defaults from the pre-restore config to the Nov 17 night
+ *  behavior (1% of stack, 1.8% TP floor, 2.5s scan, looser minScore).
+ *  Only exact previous defaults are rewritten so user edits stay put. */
+export function migrateStockDefaults(file: Partial<Config>): Partial<Config> {
+  const out: Partial<Config> = { ...file };
+  if (out.minScore === 48) out.minScore = 40;
+  if (out.positionPct === 8) out.positionPct = 1;
+  if (out.takeProfitPct === 3) out.takeProfitPct = 1.8;
+  if (out.scanIntervalSec === 6) out.scanIntervalSec = 2.5;
+  return out;
+}
+
 let fileCfg: Partial<Config> = {};
 if (existsSync(CFG_FILE)) {
   try { fileCfg = JSON.parse(readFileSync(CFG_FILE, 'utf8')); } catch { fileCfg = {}; }
+}
+{
+  const migrated = migrateStockDefaults(fileCfg);
+  if (JSON.stringify(migrated) !== JSON.stringify(fileCfg)) {
+    fileCfg = migrated;
+    try { writeFileSync(CFG_FILE, JSON.stringify(fileCfg, null, 2)); } catch { /* volume may be read-only in tests */ }
+  }
 }
 
 // precedence: defaults < config.json < env

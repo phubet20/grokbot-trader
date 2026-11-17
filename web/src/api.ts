@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { loadSnapCache, saveSnapCache, nextBackoffMs, placeholderSnap, healthzUrl } from './boot';
+import { playTradeSound } from './sounds';
 
 export type Snap = any;
 export async function api(path: string, body?: unknown, opts?: { timeoutMs?: number; retries?: number }) {
@@ -82,7 +83,7 @@ export function useLive() {
       on('state', apply);
       on('agents', (d) => setSnap((s: Snap) => (s ? { ...s, agents: d } : s)));
       on('positions', (d) => setSnap((s: Snap) => (s ? { ...s, positions: d } : s)));
-      on('activity', (d) => setSnap((s: Snap) => (s ? { ...s, activity: [d, ...(s.activity || [])].slice(0, 100) } : s)));
+      on('activity', (d) => { playTradeSound(d); setSnap((s: Snap) => (s ? { ...s, activity: [d, ...(s.activity || [])].slice(0, 100) } : s)); });
       on('decision', (d) => setSnap((s: Snap) => (s ? { ...s, decisions: [d, ...(s.decisions || [])].slice(0, 60) } : s)));
       on('equity', (d) => setSnap((s: Snap) => (s ? { ...s, stats: { ...s.stats, equity: d.usd, pnlUsd: d.usd - s.stats.deposit, multiplier: s.stats.deposit ? d.usd / s.stats.deposit : 1, pnlPct: s.stats.deposit ? (d.usd / s.stats.deposit - 1) * 100 : 0 }, lastEquity: d } : s)));
       on('toast', (d) => { const id = tid.current++; setToasts((t) => [...t, { ...d, id }]); setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), d.kind === 'profit' ? 5000 : 3200); });
