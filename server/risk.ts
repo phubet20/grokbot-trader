@@ -146,17 +146,11 @@ export function adaptFilters(base: { minScore: number; trailingStopPct: number; 
   let trailingStopPct = base.trailingStopPct;
   let hardStopPct = base.hardStopPct;
   let pauseMs = 0;
-  if (consec >= 2) {
-    minScore += 8;
-    trailingStopPct = Math.max(3, trailingStopPct - 2);
-    pauseMs = 0;
-  }
-  if (consec >= 3 || (last.length >= 6 && losses >= 5)) {
-    minScore += 5;
-    hardStopPct = Math.max(3, hardStopPct - 1);
-    pauseMs = 0;
-  }
-  return { minScore, trailingStopPct, hardStopPct, pauseMs, consec, sizeMult: sizeMultiplier(recentPnlsChrono) };
+  // Light adaptation only: small score nudges, no tighter stops or size cuts.
+  if (consec >= 2) minScore += 2;
+  if (consec >= 3 || (last.length >= 6 && losses >= 5)) minScore += 1;
+  minScore = Math.min(base.minScore + 3, minScore);
+  return { minScore, trailingStopPct, hardStopPct, pauseMs, consec, sizeMult: 1 };
 }
 
 export type GateInput = {

@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, usd, short } from '../api';
 import { BotIcon, PhantomIcon, CheckI, XI } from './Icons';
-import { BotWalletPanel } from './BotWallet';
 
 export { getPhantom, phantomBrowseUrl } from '../phantom';
 import { getPhantom, phantomBrowseUrl } from '../phantom';
@@ -21,7 +20,8 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   const isLive = snap?.mode === 'live' || isAuto;
   const needPhantomApp = snap?.mode === 'live' && !phantom;
   const [address, setAddress] = useState<string>(snap?.wallet?.address || '');
-  const [startUsd, setStartUsd] = useState<number>(Math.max(2, snap?.config?.startUsd || 81));
+  const initialUsd = Math.max(2, Number(snap?.stats?.equity || snap?.wallet?.depositUsd || snap?.config?.startUsd || 81) || 81);
+  const [startUsd, setStartUsd] = useState<number>(initialUsd);
   const [pv, setPv] = useState<any>(null);
   const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
   const [ready, setReady] = useState(false);
@@ -36,6 +36,8 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
     return () => clearTimeout(t);
   }, [isLive, address, startUsd]);
 
+  const hasBook = !isLive && !!(snap?.wallet?.depositUsd || snap?.wallet?.solBalance || (snap?.positions || []).length || snap?.stats?.closed);
+
   async function connect() {
     if (state !== 'idle') return;
     setErr(''); setState('busy');
@@ -49,7 +51,10 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
         addr = r.publicKey.toString(); setAddress(addr);
         await api('wallet/connect', { type: 'phantom', address: addr }, { timeoutMs: 8000, retries: 1 });
       } else {
-        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd: Math.max(2, startUsd) }, { timeoutMs: 4000, retries: 1 });
+        const amt = Math.max(2, startUsd);
+        const cur = hasBook ? (snap?.stats?.equity || snap?.wallet?.depositUsd || 0) : 0;
+        const changed = hasBook && Math.abs(cur - amt) >= 0.5;
+        await api('wallet/connect', { type: 'paper', address: addr || pv?.address || undefined, startUsd: amt, setBalance: !hasBook || changed }, { timeoutMs: 4000, retries: 1 });
       }
       setState('done');
       setTimeout(() => setReady(true), 150);
@@ -59,10 +64,9 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   const shownAddr = address || pv?.address || '';
   const alreadyOn = !!snap?.wallet?.connected;
   const solPx = pv?.solPrice || snap?.solPrice || snap?.stats?.solPrice || 0;
-  const hasBook = !isLive && !!(snap?.wallet?.depositUsd || snap?.wallet?.solBalance || (snap?.positions || []).length || snap?.stats?.closed);
-  const btnLabel = ready || alreadyOn ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? (isAuto ? 'Starting…' : 'Approving…') : (hasBook ? 'Resume book' : (isAuto ? 'Start bot' : 'Connect'));
+  const btnLabel = ready || alreadyOn ? 'เริ่มใช้งาน' : state === 'done' ? 'Connected ✓' : state === 'busy' ? 'Approving…' : 'Approve';
   const btnTestId = (ready || alreadyOn) ? 'start' : 'connect';
-  const paperUsd = hasBook ? (snap?.stats?.equity || snap?.wallet?.depositUsd || startUsd) : Math.max(2, startUsd);
+  const paperUsd = Math.max(2, startUsd);
   const paperSol = solPx ? paperUsd / solPx : 0;
   const bal = isLive
     ? (pv && (pv.address || address) ? `${usd(pv.usd)} · ${pv.sol.toFixed(2)} SOL` : (pv ? 'open Phantom to read balance' : '…'))
@@ -73,32 +77,30 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
       <div className="sheet">
         <div className="grabber" />
         <div className="sheet-icons"><BotIcon size={46} /><LinkDots state={state} /><PhantomIcon size={46} /></div>
-        <h2>{isAuto ? 'Bot wallet' : 'Connect Phantom'}</h2>
-        <p className="muted">{isAuto ? 'Deposit SOL, lock your withdraw address, then start.' : `${snap?.appName || 'Grok Bot'} wants to connect to your wallet`}</p>
-        {isAuto ? <BotWalletPanel snap={snap} compact /> : <>
+        <h2>Connect Phantom</h2>
+        <p className="muted">{`${snap?.appName || 'Grok Bot'} wants to connect to your wallet`}</p>
         <div className="kv-box mono">
           <div><span className="muted">network</span><span>Solana</span></div>
           <div><span className="muted">wallet</span><span>Phantom{shownAddr ? ' · ' + short(shownAddr) : ''}</span></div>
           <div><span className="muted">balance</span><span data-testid="connect-balance">{bal}</span></div>
           <div><span className="muted">mode</span><span className={isLive ? 'neg' : 'warn'}>{isLive ? 'LIVE · real funds' : 'TEST · simulated fills'}</span></div>
         </div>
-        {!isLive && !hasBook && (
+        {!isLive && (
           <label className="start-usd mono"><span className="muted">test balance (min $2)</span>
-            <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => setStartUsd(Math.max(2, Number(e.target.value) || 2))} /></span>
+            <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => setStartUsd(Math.max(2, Number(e.target.value) || 2))} data-testid="test-balance-input" /></span>
           </label>
         )}
         {!isLive && hasBook && (
-          <p className="note" data-testid="resume-book-note">A paper book is already saved. Connect resumes it — it will not reset. Use Reset paper book in Account to start over.</p>
+          <p className="note" data-testid="resume-book-note">A paper book is already saved. Approve with the same amount to resume it. Changing the test balance starts a fresh TEST book. Live is not touched.</p>
         )}
         {needPhantomApp && (
-          <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Connect. Never enter a seed phrase here.</p>
+          <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Approve. Never enter a seed phrase here.</p>
         )}
         <ul className="checklist">
           <li><CheckI size={15} /> view balance and activity</li>
           <li><CheckI size={15} /> request approval for transactions</li>
           <li className="x"><XI size={15} /> can&apos;t move funds without your approval</li>
         </ul>
-        </>}
         {err && <p className="err" data-testid="connect-error">{err}</p>}
         <div className="sheet-actions">
           {needPhantomApp && !ready && (

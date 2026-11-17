@@ -86,7 +86,7 @@ const server = createServer(async (req, res) => {
     if (p === '/api/funds') return json(200, await engine.fundsView());
     if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
-    if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt });
+    if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt, mode: engine.mode, book: engine.book });
     if (p === '/api/trades') return json(200, store.trades(500, engine.book));
     if (p === '/api/activity') return json(200, store.activity(Number(url.searchParams.get('limit')) || 200, engine.book));
     if (p.startsWith('/api/token/')) return json(200, await engine.tokenDetail(decodeURIComponent(p.slice(11)), url.searchParams.get('tf') || '1m'));
@@ -98,6 +98,7 @@ const server = createServer(async (req, res) => {
       if (p === '/api/wallet/disconnect') { engine.disconnect(); return json(200, { ok: true }); }
       if (p === '/api/bot/run') { engine.setRunning(!!b.running); return json(200, { ok: true }); }
       if (p === '/api/bot/restart') { return json(200, engine.restartTrading()); }
+      if (p === '/api/bot/reset') { return json(200, engine.resetBot()); }
       if (p === '/api/mode') {
         const raw = String(b.mode || '');
         const next = raw === 'paper' || raw === 'test' ? 'paper' : raw === 'live' ? 'live' : 'live-auto';

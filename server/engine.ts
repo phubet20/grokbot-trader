@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { Config } from './config.ts';
 import { liveGate } from './config.ts';
-import { loadPaperPriors, pumpPathBoost, staleExitSec, isStalePosition, type PaperPriors } from './priors.ts';
+import { loadPaperPriors, pumpPathBoost, staleExitSec, isStalePosition, isDeadPosition, DEAD_EXIT_SEC, type PaperPriors } from './priors.ts';
 import type { MarketSource } from './market.ts';
 import { SOL_MINT } from './market.ts';
 import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts';
@@ -12,7 +12,7 @@ import { preCheck, securityCheck, isPumpCurve, clampScore } from './safety.ts';
 import { scoreCandidate } from './analyst.ts';
 import { positionSizeUsd, slotSizeUsd, openSizeUsd, usableSlots, entryBlocked, activeStop, reserveSol, exitReserveSol, fmtPct, adaptFilters, lowBalanceReason, BASE_FEE_SOL, ATA_RENT_SOL } from './risk.ts';
 import { summarizeSources } from './scan-feeds.ts';
-import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, SWAP_FEE_BPS, type TapeSnap } from './strategy.ts';
+import { STRAT_DEFAULTS, toSnap, liveEntryOk, exitReason, sellPressure, entrySignal, dipReclaim, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, momentumConfirm, alreadyPumpedHard, signalAdjustments, currentlyPumping, SWAP_FEE_BPS, type TapeSnap } from './strategy.ts';
 import { PaperExecutor, buildLiveSwapTx, getSolBalance, getSignatureStatus, signAndSendSwap, withdrawToLocked, reclaimEmptyAtas } from './executor.ts';
 import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './wallet.ts';
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
@@ -65,6 +65,18 @@ async function poolRun<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
   }));
 }
 
+
+
+/** Restore a missing deposit baseline so PnL after restart includes open positions. */
+export function depositBaseline(saved: number, equity: number, cash: number, hasRestoredPos: boolean): number {
+  if (saved > 0) {
+    // Saved value that equals cash only (positions were left out) should be repaired.
+    if (hasRestoredPos && equity > cash + 0.05 && Math.abs(saved - cash) <= Math.max(0.15, Math.abs(cash) * 0.02))
+      return equity;
+    return saved;
+  }
+  return equity > 0 ? equity : 0;
+}
 
 export class Engine extends EventEmitter {
   cfg: Config;
@@ -312,7 +324,7 @@ export class Engine extends EventEmitter {
   stop() { for (const t of this.timers) clearTimeout(t); this.timers = []; }
 
   // ---------------------------------------------------------------- wallet
-  async connect(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number }) {
+  async connect(opts: { type: 'paper' | 'phantom'; address?: string; startUsd?: number; setBalance?: boolean }) {
     await this.refreshSol(this.solPrice ? 0 : 400);
     if (!this.solPrice && this.mode === 'paper') this.solPrice = (this.m as any).lastSolPrice || 70;
     if (!this.solPrice) throw new Error('SOL price unavailable - check internet / use DATA_SOURCE=replay');
@@ -327,16 +339,15 @@ export class Engine extends EventEmitter {
     if (auto && hasBotWallet()) {
       const pub = botPublicKey()!;
       const onchain = await getSolBalance(this.cfg.rpcUrl, pub);
-      const onchainUsd = ((onchain ?? 0) * this.solPrice) + (this.usdcBal?.ui || 0);
       const fromPaper = this.wallet.type !== 'bot';
       this.wallet = {
         ...this.wallet,
         connected: true, type: 'bot', address: pub, realSol: onchain,
         solBalance: onchain ?? 0,
-        depositUsd: (!fromPaper && this.wallet.depositUsd > 0) ? this.wallet.depositUsd : onchainUsd,
         startedAt: (!fromPaper && this.wallet.startedAt) ? this.wallet.startedAt : Date.now(),
         running: true,
       };
+      this.repairDepositBaseline();
       this.wallet.dayKey = this.wallet.dayKey || dayKey();
       this.wallet.dayStartEquity = this.wallet.dayStartEquity || this.equity();
       this.store.addEquity(Date.now(), this.equity(), this.book);
@@ -345,8 +356,12 @@ export class Engine extends EventEmitter {
       this.emitState();
       return this.wallet;
     }
+    // Connect sheet "test balance" explicitly starts a fresh TEST book at that amount.
+    if (opts.type === 'paper' && this.mode === 'paper' && opts.setBalance) {
+      this.resetPaperBook();
+    }
     // Paper: never wipe an existing book on Connect / reload / AUTO_START.
-    // Only the explicit "Reset paper book" path may start a fresh test balance.
+    // Only the explicit "Reset paper book" path (or setBalance from Connect) may start a fresh test balance.
     if (opts.type === 'paper' && this.mode === 'paper' && this.hasPaperBook()) {
       this.wallet.connected = true;
       this.wallet.running = true;
@@ -437,6 +452,62 @@ export class Engine extends EventEmitter {
     return { ok: true, running: this.wallet.running, positions: this.positions.length, withdrawLocked: !!locked };
   }
 
+  /** Zero scan/reject/cooldown/display counters and rescan immediately.
+   *  Does not sell or forget positions, the withdraw lock, the wallet, trades, or learning. */
+  resetBot() {
+    const locked = this.lockedWithdrawTo();
+    const liveN = (this.mode === 'paper' ? this.liveHeld : this.positions).length;
+    this.kickingOff = false;
+    this.scanning = false;
+    this.evaluating = false;
+    this.monitoring = false;
+    this.inFlightChecks.clear();
+    this.buying.clear();
+    this.selling.clear();
+    this.reservedSol = 0;
+    this.lastBuyFail.clear();
+    this.rejectSeen.clear();
+    this.cooldown = {};
+    this.lossPauseUntil = 0;
+    this.store.setBook(this.book, 'cooldown', {});
+    this.store.setBook(this.book, 'lossPauseUntil', 0);
+    this.candidates.clear();
+    this.mintHist.clear();
+    this.scanHistory = [];
+    this.scanTimes = [];
+    this.uni = { scannedNew: 0, scannedTrending: 0, enteredNew: 0, enteredTrending: 0, watch: 0 };
+    this.agents = {
+      scanner: { pools: 0, total: 0, lastScanAt: 0, perHour: 0, perMin: 0, cadenceMs: 0, inFlightChecks: 0, inFlightBuys: 0, inFlightSells: 0, top: '' as string, topImage: '' as string | undefined, calls: 0, sources: {} as Record<string, { total: number; last: number; ok: boolean; error?: string }> },
+      safety: { checked: 0, rejected: 0, passed: 0, penalties: 0, last: '', lastSymbol: '', lastOk: true, lastAdj: 0, calls: 0, reasons: {} as Record<string, number> },
+      analyst: { scored: 0, lastScore: 0, lastSymbol: '', lastImage: '' as string | undefined, bull: 0, bear: 0, note: '', calls: 0 },
+      risk: { status: 'Guarding', label: '', exits: 0 },
+      executor: { fills: 0, buys: 0, last: '', failures: 0 },
+    };
+    this.store.setBook(this.book, 'agents', this.agents);
+    this.log('Core', 'info', 'Reset bot — scan counters, rejected/seen caches and cooldowns cleared; rescanning now. Positions, wallet, withdraw lock, trade history and shared learning kept.');
+    this.emitState();
+    if (this.wallet.connected) void this.kickoffTrading('reset-bot');
+    return { ok: true, running: this.wallet.running, positions: this.positions.length, livePositions: liveN, withdrawLocked: !!locked, learningKept: true };
+  }
+
+  /** If deposit was saved as cash-only after a restart, include restored positions. */
+  repairDepositBaseline() {
+    const target = this.mode === 'paper' ? this.wallet : (this.liveWallet || this.wallet);
+    const cash = (this.mode === 'paper' ? this.wallet.solBalance * this.solPrice : ((this.wallet.solBalance || 0) * this.solPrice + (this.usdcBal?.ui || 0)));
+    const bag = this.mode === 'paper' ? this.positions : (this.positions.length ? this.positions : this.liveHeld);
+    const eq = this.mode === 'paper' ? this.equity() : (cash + bag.reduce((a, p) => a + p.qty * (p.lastPrice || p.entryPrice) + (p.rentSol || 0) * this.solPrice, 0));
+    const next = depositBaseline(target.depositUsd || 0, eq, cash, bag.length > 0);
+    if (next > 0 && next !== target.depositUsd) {
+      target.depositUsd = next;
+      if (this.mode !== 'paper' && this.liveWallet) this.liveWallet.depositUsd = next;
+      if (this.mode !== 'paper') this.wallet.depositUsd = next;
+      if (this.mode === 'paper') this.wallet.depositUsd = next;
+    } else if ((target.depositUsd || 0) <= 0 && next > 0) {
+      target.depositUsd = next;
+      if (this.mode !== 'paper') this.wallet.depositUsd = next;
+    }
+  }
+
   /** Immediate scan + entries on Connect/Start — do not wait for the interval loops. */
   private kickingOff = false;
   private async kickoffTrading(reason = 'start') {
@@ -491,6 +562,7 @@ export class Engine extends EventEmitter {
     const empty: Wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
     this.store.setBook('paper', 'wallet', empty);
     this.store.setBook('paper', 'lossPauseUntil', 0);
+    if (this.book === 'paper') this.wallet = empty;
   }
 
   equity() {
@@ -777,21 +849,17 @@ export class Engine extends EventEmitter {
       }
       const scored = recent
         .filter((c) => {
+          const pump = currentlyPumping(c, now);
+          if (!pump.ok) {
+            this.noteReject(pump.reason || 'not pumping', c.mint);
+            return false;
+          }
+          if (!(c as any)._sig) (c as any)._sig = pump.reason;
           if ((c.score || 0) >= minScore) return true;
           this.noteReject(`score ${c.score} < ${minScore}`, c.mint);
           return false;
         })
-        .sort((a, b) => {
-          const fav = (c: typeof a) => {
-            const s = String((c as any)._sig || '').toLowerCase();
-            if (s.includes('first pullback')) return 2;
-            if (s.includes('buy pressure') || s.includes('momentum thrust') || s.includes('momentum burst')) return 1;
-            return 0;
-          };
-          const af = fav(a), bf = fav(b);
-          if (af !== bf) return bf - af;
-          return (b.score || 0) - (a.score || 0);
-        })
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
         .slice(0, 20);
       if (!scored.length) return;
       const reserveUsd = this.exitReserveUsd(true);
@@ -1101,16 +1169,22 @@ export class Engine extends EventEmitter {
           }
         }
       }
-      const staleSec = staleExitSec(this.priors, gov.mode === 'tight');
+      const staleSec = staleExitSec(this.priors);
       for (const p of [...bag]) {
         if (this.selling.has(p.id)) continue;
         const fresh = this.candidates.get(p.mint);
         const hist = this.mintHist.get(p.mint) || [];
+        const vol = { volumeM5: fresh?.volume?.m5, txM5: fresh ? (fresh.txns.m5b + fresh.txns.m5s) : undefined };
         if (isStalePosition({
-          openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now, staleSec, hist,
-          volumeM5: fresh?.volume?.m5, txM5: fresh ? (fresh.txns.m5b + fresh.txns.m5s) : undefined,
+          openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now, staleSec, hist, ...vol,
         })) {
           void this.closePosition(p, 'stale_flat', `stale ${staleSec}s · no price/volume, rotating capital`, 1);
+          continue;
+        }
+        if (isDeadPosition({
+          openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now, deadSec: DEAD_EXIT_SEC, hist, ...vol,
+        })) {
+          void this.closePosition(p, 'stale_flat', `dead ${Math.round(DEAD_EXIT_SEC / 60)}m · down and no volume, rotating capital`, 1);
         }
       }
       if (bag.length && now - this.lastPairAt > 3000) {
@@ -1392,6 +1466,7 @@ export class Engine extends EventEmitter {
       this.liveHeld = r.positions.map((x: Position) => ({ ...x, book: 'live' as const }));
       this.store.setBook('live', 'positions', this.liveHeld);
       if (this.mode !== 'paper') this.positions = this.liveHeld;
+      this.repairDepositBaseline();
       this.persist();
       if (r.added) this.log('Core', 'info', `reconciled ${r.added} on-chain position(s); monitoring resumes`);
     } catch (e: any) {
@@ -1579,6 +1654,7 @@ export class Engine extends EventEmitter {
     const best = trades.reduce((a: any, t) => (!a || t.pnlUsd > a.pnlUsd ? t : a), null);
     const worst = trades.reduce((a: any, t) => (!a || t.pnlUsd < a.pnlUsd ? t : a), null);
     return {
+      mode: this.mode, book: this.book,
       equity: eq, deposit: this.wallet.depositUsd, pnlUsd: eq - this.wallet.depositUsd,
       pnlPct: this.wallet.depositUsd ? (eq / this.wallet.depositUsd - 1) * 100 : 0,
       multiplier: this.wallet.depositUsd ? eq / this.wallet.depositUsd : 1,
@@ -1687,11 +1763,9 @@ export class Engine extends EventEmitter {
   }
 
   private tuneAdjust(why: string, score: number) {
-    if (this.mode !== 'paper') return score;
     const g = this.tuner.allow(why);
-    let s = score;
-    if (!g.ok) s = clampScore(s - 12);
-    else if (g.minScoreAdj) s = clampScore(s - g.minScoreAdj);
+    const nudge = Math.max(-3, Math.min(3, g.minScoreAdj || 0));
+    const s = nudge ? clampScore(score - nudge) : score;
     if (g.exploring) (this.agents.analyst as any).label = `explore ${g.key}`;
     return s;
   }

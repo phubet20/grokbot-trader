@@ -127,6 +127,7 @@ test('patternKey maps SMC pullbacks and autotune penalizes immediate-red pattern
   }
   const s = t.snapshot().patterns.find((p) => p.key === 'ob-pullback')!;
   assert.ok(s.immediateRate >= 0.7);
-  assert.equal(s.disabled, true);
-  assert.equal(s.weight, 0);
+  assert.equal(s.disabled, false);
+  assert.ok(s.weight >= 0.85);
+  assert.ok(s.minScoreAdj <= 3 && s.minScoreAdj >= -3);
 });

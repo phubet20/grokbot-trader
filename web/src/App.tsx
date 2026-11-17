@@ -40,11 +40,9 @@ export default function App() {
     }).catch(() => {});
   }, []);
   const splashDone = useCallback(() => {
-    const s = liveSnap || placeholderSnap();
-    // If we already know a book is connected (live or cached), go straight in.
-    // If the server is waking and we have no cache, still enter the main UI
-    // with a connecting banner — never stay on the splash.
-    if (s.wallet?.connected || q.get('skip') || !liveSnap) setStage('app');
+    // Never stay on the splash. Always show the Connect Phantom sheet unless
+    // the URL skipped it (?skip=1) or opened Night recap directly (?recap=1).
+    if (q.get('skip') || q.get('recap')) setStage('app');
     else setStage('connect');
   }, [liveSnap]);
 
@@ -79,7 +77,7 @@ export default function App() {
         {tab === 'agents' && <div className="page"><div className="page-title"><BotIcon size={28} /> Agents</div><ScanStatus snap={snap} /><AgentCards snap={snap} onOpen={open} /><AutoTunePanel snap={snap} /><AgentsList snap={snap} /><Repos snap={snap} /><Decisions snap={snap} limit={30} /></div>}
         {tab === 'activity' && <div className="page"><div className="page-title"><BotIcon size={28} /> Activity</div><Positions snap={snap} onOpen={open} /><Activity snap={snap} onOpen={open} limit={100} title={false} /></div>}
         {tab === 'funds' && <Funds snap={snap} />}
-        {tab === 'account' && <><div className="page-title" style={{ padding: '16px 16px 0' }}><BotIcon size={28} /> Account</div><Account snap={snap} onRecap={() => setRecap(true)} onDisconnected={() => setStage('connect')} /></>}
+        {tab === 'account' && <><div className="page-title" style={{ padding: '16px 16px 0' }}><BotIcon size={28} /> Account</div><Account snap={snap} onRecap={() => setRecap(true)} onDisconnected={() => setStage('connect')} onConnect={() => setStage('connect')} /></>}
         <div style={{ height: 90 }} />
       </div>
       <nav className="tabbar">

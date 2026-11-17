@@ -47,7 +47,7 @@ export function Recap({ appName, stopPct, onClose }: { appName: string; stopPct:
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="recap" onClick={(e) => e.stopPropagation()}>
-        <div className="row"><BotIcon size={40} /><div><b style={{ fontSize: 20 }}>Night recap</b><div className="muted tiny mono">{r?.since ? `${hhmm(r.since)} → ${hhmm(Date.now())}` : ''} · 3 repos · {r ? Math.round(r.runtimeMin) : 0} min</div></div></div>
+        <div className="row"><BotIcon size={40} /><div><b style={{ fontSize: 20 }}>Night recap</b><div className="muted tiny mono">{r?.since ? `${hhmm(r.since)} → ${hhmm(Date.now())}` : ''} · 3 repos · {r ? Math.round(r.runtimeMin) : 0} min · {r?.mode && r.mode !== 'paper' ? 'LIVE' : 'TEST'}</div></div></div>
         {r && <>
           <div className="muted small mt">put in</div><div className="recap-in">{usd(r.deposit)}</div>
           <div className="muted small">now worth</div>

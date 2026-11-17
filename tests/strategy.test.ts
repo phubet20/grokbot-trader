@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, signalAdjustments, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
+import { entryReason, exitReason, STRAT_DEFAULTS, dipReclaim, firstPullback, alreadyPumpedHard, entrySignal, signalAdjustments, currentlyPumping, momentumBreakdown, liveExit, estimatedNetPnlPct, netPnlFromSellQuote, type TapeSnap, type StratParams } from '../server/strategy.ts';
 
 function snap(over: Partial<TapeSnap> & { t: number; px: number }): TapeSnap {
   return {
@@ -174,10 +174,17 @@ test('firstPullback fires on a modest impulse then a reclaim with buy pressure',
   assert.equal(entrySignal(c, hist, STRAT_DEFAULTS, t0 + 3000).ok, true);
 });
 
-test('already-pumped coins take a penalty, they are not hard-skipped', () => {
+test('already-pumped coins take a penalty only when the move is fading, not while still pumping', () => {
   const t0 = 4_000_000;
-  const pumped = { ...baseCoin, createdAt: t0 - 20 * 60_000, change: { m5: 42, m15: 55, h1: 80, h6: 80, h24: 80 }, priceUsd: 180 } as any;
-  const histP: TapeSnap[] = [snap({ t: t0, px: 100, m5: 42, m15: 55, h1: 80 })];
+  const stillUp = { ...baseCoin, createdAt: t0 - 20 * 60_000, change: { m5: 42, m15: 55, h1: 80, h6: 80, h24: 80 }, priceUsd: 180 } as any;
+  const histUp: TapeSnap[] = [snap({ t: t0, px: 180, m5: 42, m15: 55, h1: 80, b5: 20, s5: 6 })];
+  assert.equal(alreadyPumpedHard(stillUp, histUp, t0), true);
+  const live = signalAdjustments(stillUp, histUp, t0);
+  assert.equal(live.notes.some((n) => n.includes('already pumped')), false, 'live pump should not be penalized: ' + live.notes.join('|'));
+  assert.ok(currentlyPumping(stillUp, t0).ok);
+
+  const pumped = { ...baseCoin, createdAt: t0 - 20 * 60_000, change: { m5: -2, m15: 55, h1: 80, h6: 80, h24: 80 }, priceUsd: 180 } as any;
+  const histP: TapeSnap[] = [snap({ t: t0, px: 100, m5: -2, m15: 55, h1: 80 })];
   assert.equal(alreadyPumpedHard(pumped, histP, t0), true);
   const adj = signalAdjustments(pumped, histP, t0);
   assert.ok(adj.notes.some((n) => n.includes('already pumped')), adj.notes.join('|'));
@@ -214,4 +221,15 @@ test('netPnlFromSellQuote caps fixed fees so a tiny winner stays a winner', () =
   assert.ok(net > 100, 'net=' + net); // proceeds ~$0.80 minus capped ~$0.0026
   const loss = netPnlFromSellQuote(0.26, 0.003, 0.0003, 80);
   assert.ok(loss < 0, 'loss=' + loss);
+});
+
+test('currentlyPumping accepts pumping coins of any age and rejects dumps or flat tape', () => {
+  const t0 = Date.now();
+  const pump = { ...baseCoin, change: { m5: 6, m15: 8, h1: 8, h6: 8, h24: 8 }, txns: { m5b: 14, m5s: 5, h1b: 20, h1s: 10, h24b: 20, h24s: 10 }, volume: { m5: 4000, h1: 5000, h6: 5000, h24: 5000 } } as any;
+  const r = currentlyPumping(pump, t0);
+  assert.equal(r.ok, true, r.reason);
+  const flat = { ...baseCoin, change: { m5: 0, m15: 0, h1: 0, h6: 0, h24: 0 }, txns: { m5b: 0, m5s: 0, h1b: 0, h1s: 0, h24b: 0, h24s: 0 }, volume: { m5: 0, h1: 0, h6: 0, h24: 0 }, curve: undefined, flow: {} } as any;
+  assert.equal(currentlyPumping(flat, t0).ok, false);
+  const dump = { ...baseCoin, change: { m5: -6, m15: 2, h1: 2, h6: 2, h24: 2 }, txns: { m5b: 2, m5s: 12, h1b: 8, h1s: 20, h24b: 8, h24s: 20 } } as any;
+  assert.equal(currentlyPumping(dump, t0).ok, false);
 });

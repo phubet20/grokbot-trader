@@ -8,8 +8,8 @@ const W_MIN = 0;
 const W_MAX = 1.8;
 const SENS_MIN = 0.75;
 const SENS_MAX = 1.35;
-const SCORE_ADJ_MIN = -4;
-const SCORE_ADJ_MAX = 16;
+const SCORE_ADJ_MIN = -3;
+const SCORE_ADJ_MAX = 3;
 
 export type PatternKey =
   | 'fresh-launch'
@@ -236,31 +236,20 @@ export class AutoTune {
       const costSum = this.trades.filter((t) => t.pattern === s.key).reduce((a, t) => a + t.costUsd * Math.max(0, t.weight ?? 1), 0);
       s.expectancy = s.n ? s.sumPnl / Math.max(1e-6, costSum) : 0;
       if (s.n >= this.minSamples) {
-        if (s.expectancy < -0.04 || (s.wr < 0.35 && s.expectancy < 0)) {
-          s.disabled = true;
-          s.weight = 0;
-          s.minScoreAdj = SCORE_ADJ_MAX;
-        } else {
-          s.disabled = false;
-          // Map expectancy to a bounded weight; positive gets more size, negative is down-weighted.
-          let w = 1 + clamp(s.expectancy * 3, -0.7, 0.8) + clamp((s.wr - 0.5) * 0.6, -0.3, 0.3);
-          if (s.immediateRate >= 0.45) w -= 0.35;
-          s.weight = clamp(w, 0.35, W_MAX);
-          s.minScoreAdj = clamp(Math.round(-s.expectancy * 20), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
-          if (s.expectancy < 0) s.minScoreAdj = clamp(6 + Math.round(-s.expectancy * 20), 4, SCORE_ADJ_MAX);
-          else s.minScoreAdj = clamp(Math.round(-s.expectancy * 15), SCORE_ADJ_MIN, 2);
-          if (s.immediateRate >= 0.45) s.minScoreAdj = clamp(s.minScoreAdj + 6, SCORE_ADJ_MIN, SCORE_ADJ_MAX);
-          if (s.immediateRate >= 0.7 && s.expectancy <= 0) { s.disabled = true; s.weight = 0; }
-        }
+        // Light adaptation only: never disable a pattern or raise the floor by more than ±3.
+        s.disabled = false;
+        let w = 1 + clamp(s.expectancy * 1.2, -0.2, 0.25) + clamp((s.wr - 0.5) * 0.3, -0.15, 0.15);
+        if (s.immediateRate >= 0.45) w -= 0.1;
+        s.weight = clamp(w, 0.85, W_MAX);
+        s.minScoreAdj = clamp(Math.round(-s.expectancy * 12), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
+        if (s.immediateRate >= 0.45) s.minScoreAdj = clamp(s.minScoreAdj + 1, SCORE_ADJ_MIN, SCORE_ADJ_MAX);
       } else if (s.n >= 2) {
-        // Lean after 2 closes so a losing pattern is cut without waiting for a full sample.
         s.disabled = false;
         if (s.expectancy < 0 && s.losses >= 2) {
-          s.weight = clamp(0.65 + s.expectancy, 0.4, 1);
-          s.minScoreAdj = clamp(4 + Math.round(-s.expectancy * 15), 2, 10);
-          if (s.immediateRate >= 0.5) s.minScoreAdj = clamp(s.minScoreAdj + 4, 2, 12);
+          s.weight = clamp(0.9 + s.expectancy * 0.3, 0.85, 1);
+          s.minScoreAdj = clamp(Math.round(-s.expectancy * 10), 1, SCORE_ADJ_MAX);
         } else if (s.expectancy > 0 && s.wins >= 2) {
-          s.weight = clamp(1 + s.expectancy * 1.5, 1, 1.3);
+          s.weight = clamp(1 + s.expectancy * 0.8, 1, 1.2);
           s.minScoreAdj = 0;
         } else {
           s.weight = 1;
@@ -307,36 +296,21 @@ export class AutoTune {
     let tradeSlopePct = 0;
     if (recent.length >= 4 && recent[0].equity > 0)
       tradeSlopePct = ((recent[recent.length - 1].equity - recent[0].equity) / recent[0].equity) * 100;
-    const haveTicks = ticks.length >= 3;
-    const haveTrades = recent.length >= 4;
-    // Ignore cash-only SOL/USD drift: tight mode needs real closed trades.
-    const stalled = haveTrades && ((haveTicks && slopePctPerMin <= 0.02) || tradeSlopePct <= 0);
-    const recovered = haveTrades && (!haveTicks || slopePctPerMin > 0.05) && tradeSlopePct > 0;
-    if (!haveTrades) this.tight = false;
-    else if (stalled) this.tight = true;
-    else if (recovered) this.tight = false;
-
-    let sizeMult = 1;
-    for (const t of recent) {
-      if (t.pnlUsd > 0) sizeMult = Math.min(1.4, sizeMult * 1.2);
-      else if (t.pnlUsd < 0) sizeMult = Math.max(0.55, sizeMult * 0.7);
-    }
-    if (this.tight) sizeMult = Math.min(sizeMult, 0.85);
-
+    // Tight mode (score raises, size cuts, faster TP) is retired. Equity slope is
+    // still observed, but trading params stay at the configured defaults.
+    this.tight = false;
     this.gov = {
-      mode: this.tight ? 'tight' : 'relaxed',
+      mode: 'relaxed',
       slopePctPerMin,
       tradeSlopePct,
       windowTrades: recent.length,
       windowMin,
-      minScoreAdj: this.tight ? 8 : 0,
-      tpPct: this.tight ? Math.max(1.2, Math.min(baseTp, 1.8)) : baseTp,
-      sizeMult,
-      earlyCutSec: this.tight ? 25 : 0,
+      minScoreAdj: 0,
+      tpPct: baseTp,
+      sizeMult: 1,
+      earlyCutSec: 0,
       favored: [...FAVORED_PATTERNS],
-      note: this.tight
-        ? 'tight — equity stalled; higher score, faster TP, early cut, favor pullback + thrust'
-        : 'relaxed — equity slope ok; default TP and size',
+      note: 'light adapt only — score nudges capped at ±3; no TIGHT, no size cuts',
     };
   }
 
@@ -348,14 +322,13 @@ export class AutoTune {
   takeProfitPct(base: number): number { return this.governor(base).tpPct; }
 
   patternAdj(why: string): number {
-    if (!this.tight) return 0;
-    const k = classify(why);
-    if (FAVORED_PATTERNS.includes(k)) return 6;
-    return -5;
+    const s = this.patterns.get(classify(why));
+    if (!s || s.n < 2) return 0;
+    return clamp(Math.round(s.expectancy * 10), SCORE_ADJ_MIN, SCORE_ADJ_MAX);
   }
 
-  entrySizeMult(why: string): number {
-    return clamp(this.sizeMult(why) * this.governor().sizeMult, 0.45, 1.6);
+  entrySizeMult(_why: string): number {
+    return 1;
   }
 
   private tuneExitSensitivity() {
@@ -379,23 +352,16 @@ export class AutoTune {
     const key = classify(reason);
     const s = this.patterns.get(key) || empty(key);
     if (s.n < this.minSamples) return { ok: true, key, weight: 1, minScoreAdj: 0, exploring: false };
-    if (s.disabled) {
-      const explore = rnd() < EPS;
-      return { ok: explore, key, weight: explore ? 0.5 : 0, minScoreAdj: s.minScoreAdj, exploring: explore };
-    }
-    // Thompson: P(arm beats a baseline Beta(2,2) dummy)
-    const draw = betaSample(1 + s.wins, 1 + s.losses, rnd);
-    const baseline = betaSample(2, 2, rnd);
+    // Never block a pattern. Score floor nudges stay inside ±3.
     const explore = rnd() < EPS;
-    const ok = explore || draw >= baseline * 0.85 || s.expectancy > 0;
-    return { ok, key, weight: s.weight, minScoreAdj: s.minScoreAdj, exploring: explore && !ok ? true : explore };
+    return { ok: true, key, weight: s.weight || 1, minScoreAdj: clamp(s.minScoreAdj, SCORE_ADJ_MIN, SCORE_ADJ_MAX), exploring: explore };
   }
 
   sizeMult(reason: string): number {
     const key = classify(reason);
     const s = this.patterns.get(key);
     if (!s || s.n < this.minSamples) return 1;
-    return clamp(s.weight, 0.5, 1.5);
+    return 1;
   }
 
   seedFromPriors(events: { pattern: PatternKey | string; pnlUsd: number; costUsd: number; pnlPct: number; weight?: number; exitKind?: string; exitReason?: string; ts?: number }[]) {

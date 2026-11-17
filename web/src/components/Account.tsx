@@ -17,7 +17,7 @@ const FIELDS: [string, string, number, number, number][] = [
   ['slippageBps', 'Slippage tolerance (bps)', 10, 2000, 10],
 ];
 
-export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap: () => void; onDisconnected: () => void }) {
+export function Account({ snap, onRecap, onDisconnected, onConnect }: { snap: any; onRecap: () => void; onDisconnected: () => void; onConnect?: () => void }) {
   const [cfg, setCfg] = useState<any>({ ...snap.config });
   const [msg, setMsg] = useState('');
   const save = async () => { try { await api('config', cfg); setMsg('Saved ✓'); } catch (e: any) { setMsg(e.message); } setTimeout(() => setMsg(''), 2000); };
@@ -39,6 +39,8 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
           <ModeToggle snap={snap} />
           <button className="pill-btn small-btn ghost" data-testid="restart-bot-account" title="Restart loops and rescan now. Does not wipe positions or the withdraw lock." onClick={() => api('bot/restart', {})}>Restart bot / rescan</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
+          <button className="pill-btn small-btn ghost" data-testid="open-connect" onClick={() => onConnect?.()}>Connect / test balance</button>
+          <button className="pill-btn small-btn ghost" data-testid="reset-bot" title="Zero scan counters and rejected caches, then rescan. Does not sell positions, change the wallet, or wipe learning." onClick={async () => { if (confirm('Reset bot? This zeros scanned/rejected counts and cooldowns and starts a fresh scan. Open positions, the wallet, the withdraw lock, trade history, and shared learning are kept.')) { await api('bot/reset', {}); } }}>Reset bot</button>
         </div>
         <p className="tiny muted" data-testid="background-note">{snap.mode === 'paper'
           ? <>The bot trades on the server — you can close or reload the app without resetting the book. Connect / AUTO_START resume a saved book; they do not overwrite it. Only <b>Reset paper book</b> starts a fresh test balance. {snap.background?.remoteState?.configured ? 'Paper state is also saved off-disk so a redeploy can restore it.' : 'To keep the paper book across redeploys, add STATE_GITHUB_TOKEN on the host.'} On the free host, sleep after ~15 min idle is still possible; keepalive is not guaranteed.</>

@@ -98,7 +98,7 @@ input { font: inherit; color: inherit; }
 .ph-pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #ececf0; background: #fff; border-radius: 999px; padding: 4px 10px 4px 4px; font-size: 13px; font-weight: 600; }
 
 /* header + ticker */
-.hdr { display: flex; align-items: center; gap: 8px; padding: 14px 16px 8px; position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); z-index: 5; }
+.hdr { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 14px 16px 8px; position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); z-index: 5; }
 .hdr-title { font-weight: 750; font-size: 20px; letter-spacing: -.3px; white-space: nowrap; }
 .live-pill { white-space: nowrap; }
 .live-pill.test { border-color: #2563eb; color: #1d4ed8; background: #dbeafe; }

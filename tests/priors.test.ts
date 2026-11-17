@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AutoTune } from '../server/autotune.ts';
-import { pathSimilarity, pumpPathBoost, isStalePosition, staleExitSec, type PaperPriors, type PathVec } from '../server/priors.ts';
+import { pathSimilarity, pumpPathBoost, isStalePosition, isDeadPosition, staleExitSec, DEAD_EXIT_SEC, type PaperPriors, type PathVec } from '../server/priors.ts';
 
 const winner: PathVec = { volAccel: 1.8, buyRatio: 0.65, chM5: 10, chM15: 16, buyers: 22 };
 const priors: PaperPriors = {
@@ -36,7 +36,7 @@ test('isStalePosition requires flat price and dead volume after the window', () 
 });
 
 test('stale window tightens when the governor is tight', () => {
-  assert.equal(staleExitSec(priors, true), 90);
+  assert.equal(staleExitSec(priors, true), 120);
   assert.equal(staleExitSec(priors, false), 120);
 });
 
@@ -58,4 +58,20 @@ test('AutoTune seeds weighted priors once and favors realistic winners', () => {
   const n = snap.trades;
   t.seedFromPriors([{ pattern: 'score', pnlUsd: -10, costUsd: 6, pnlPct: -50, weight: 1 }]);
   assert.equal(t.snapshot().trades, n, 'seed only once');
+});
+
+test('isDeadPosition sells losers that went quiet for ~12 minutes', () => {
+  const now = 10_000_000;
+  const down = {
+    openedAt: now - (DEAD_EXIT_SEC + 30) * 1000,
+    entryPrice: 1,
+    lastPrice: 0.92,
+    now,
+    volumeM5: 10,
+    txM5: 1,
+  };
+  assert.equal(isDeadPosition(down), true);
+  assert.equal(isDeadPosition({ ...down, lastPrice: 1.02 }), false);
+  assert.equal(isDeadPosition({ ...down, openedAt: now - 60_000 }), false);
+  assert.equal(isDeadPosition({ ...down, volumeM5: 400, txM5: 20 }), false);
 });

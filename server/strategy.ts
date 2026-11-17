@@ -386,6 +386,26 @@ export function alreadyPumpedHard(c: Candidate, hist: TapeSnap[] = [], now = Dat
   return false;
 }
 
+/** True when the coin is actively pumping right now — any venue, age, or size. */
+export function currentlyPumping(c: Candidate, _now = Date.now()): { ok: boolean; reason: string } {
+  const m5 = c.change?.m5 || 0;
+  const m15 = c.change?.m15 || 0;
+  const buys = c.txns?.m5b || 0;
+  const sells = c.txns?.m5s || 0;
+  const r5 = buys + sells > 0 ? buys / (buys + sells) : 0;
+  const vol5 = c.volume?.m5 || 0;
+  const net = (buys - sells) > 0 || (c.flow?.netBuySol || 0) > 0;
+  const active = vol5 > 0 || (buys + sells) >= 2 || !!c.curve;
+  if (!active) return { ok: false, reason: 'no flow' };
+  if (m5 <= -3) return { ok: false, reason: 'dumping' };
+  if (m5 >= 1.2 && net) return { ok: true, reason: `pumping +${m5.toFixed(1)}% 5m` };
+  if (m5 >= 0.4 && r5 >= 0.55) return { ok: true, reason: `pumping buy pressure ${Math.round(r5 * 100)}%` };
+  if (m15 >= 4 && m5 >= 0 && net) return { ok: true, reason: `pumping +${m15.toFixed(0)}% 15m` };
+  const volAccel = (c.volume?.h1 || 0) > 0 ? (vol5 * 12) / c.volume.h1 : 0;
+  if (volAccel >= 1.2 && m5 >= 0 && net) return { ok: true, reason: 'pumping volume accel' };
+  return { ok: false, reason: 'not pumping' };
+}
+
 /**
  * Primary entry: a new coin's first pullback after a modest impulse, bought as it
  * reclaims or bounces with buy pressure — before a large second-leg pump.
@@ -573,14 +593,17 @@ export function liveExit(
 export function signalAdjustments(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { adj: number; notes: string[]; why: string } {
   const notes: string[] = [];
   let adj = 0;
+  const pump = currentlyPumping(c, now);
+  if (pump.ok) { adj += 10; notes.push(`${pump.reason} +10`); }
   const fp = firstPullback(c, hist, now);
-  if (fp.ok) { adj += 12; notes.push('first pullback +12'); }
-  if (alreadyPumpedHard(c, hist, now)) { adj -= 8; notes.push('already pumped −8'); }
+  if (fp.ok) { adj += 6; notes.push('first pullback +6'); }
+  // Only penalize an exhausted pump (already extended AND fading), not a live move we want to scalp.
+  if (alreadyPumpedHard(c, hist, now) && (c.change?.m5 || 0) <= 0) { adj -= 8; notes.push('already pumped −8'); }
   const conf = momentumConfirm(c, hist, now);
   if (conf.ok) { adj += 8; notes.push('momentum +8'); }
   else if (conf.reason === 'dumping') { adj -= 8; notes.push('dumping −8'); }
   const sig = entrySignal(c, hist, STRAT_DEFAULTS, now);
-  if (sig.ok && !fp.ok) { adj += 6; notes.push(`${sig.reason} +6`); }
-  const why = fp.ok ? fp.reason : sig.ok ? sig.reason : conf.ok ? conf.reason : (notes[0] || 'score');
+  if (sig.ok && !fp.ok && !pump.ok) { adj += 6; notes.push(`${sig.reason} +6`); }
+  const why = pump.ok ? pump.reason : fp.ok ? fp.reason : sig.ok ? sig.reason : conf.ok ? conf.reason : (notes[0] || 'score');
   return { adj, notes, why };
 }

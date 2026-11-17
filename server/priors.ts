@@ -109,12 +109,35 @@ export function pumpPathBoost(c: Candidate, hist: TapeSnap[], priors: PaperPrior
   return { boost, best };
 }
 
-export function staleExitSec(priors: PaperPriors | null, governorTight: boolean): number {
+export function staleExitSec(priors: PaperPriors | null, _governorTight = false): number {
   const d = priors?.staleExit?.defaultSec || DEFAULT_STALE_SEC;
   const lo = priors?.staleExit?.minSec || 90;
   const hi = priors?.staleExit?.maxSec || 180;
-  const raw = governorTight ? Math.min(d, 90) : Math.max(d, 120);
+  const raw = Math.max(d, 120);
   return Math.max(lo, Math.min(hi, raw));
+}
+
+/** Losers with no volume for ~10–15 minutes (default 12 min) — sell and rotate. */
+export const DEAD_EXIT_SEC = 12 * 60;
+export function isDeadPosition(opts: {
+  openedAt: number;
+  entryPrice: number;
+  lastPrice: number;
+  now: number;
+  deadSec?: number;
+  hist?: { t: number; px: number; vol5?: number; b5?: number; s5?: number }[];
+  volumeM5?: number;
+  txM5?: number;
+}): boolean {
+  const need = (opts.deadSec ?? DEAD_EXIT_SEC) * 1000;
+  if (opts.now - opts.openedAt < need) return false;
+  const fromEntry = opts.entryPrice > 0 ? (opts.lastPrice / opts.entryPrice - 1) * 100 : 0;
+  if (fromEntry >= 0) return false;
+  const cutoff = opts.now - need;
+  const window = (opts.hist || []).filter((s) => s.t >= cutoff);
+  const vol = opts.volumeM5 ?? window[window.length - 1]?.vol5 ?? 0;
+  const tx = opts.txM5 ?? ((window[window.length - 1]?.b5 || 0) + (window[window.length - 1]?.s5 || 0));
+  return vol < 80 && tx < 6;
 }
 
 /** Flat price and dead volume for staleSec after entry — rotate the capital. */

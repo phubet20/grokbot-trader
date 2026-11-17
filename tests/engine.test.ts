@@ -9,7 +9,7 @@ process.env.DATA_DIR = dir;
 const { DEFAULTS } = await import('../server/config.ts');
 const { ReplayMarket } = await import('../server/replay.ts');
 const { Store } = await import('../server/store.ts');
-const { Engine } = await import('../server/engine.ts');
+const { Engine, depositBaseline } = await import('../server/engine.ts');
 const { buildLiveSwapTx } = await import('../server/executor.ts');
 
 test('paper engine trades a $10 wallet and keeps accounting consistent', async () => {
@@ -213,5 +213,54 @@ test('restartTrading clears in-flight flags and does not wipe positions or the w
   assert.equal(e.store.trades().length, beforeTrades);
   assert.ok(Math.abs(e.equity() - beforeEq) < 1e-6);
   assert.equal(e.wallet.solBalance > 0, true);
+  e.stop();
+});
+
+test('depositBaseline includes a restored position instead of cash-only', () => {
+  assert.equal(depositBaseline(0, 12, 4, true), 12);
+  assert.equal(depositBaseline(4, 12, 4, true), 12); // cash-only saved value is repaired
+  assert.equal(depositBaseline(10, 12, 4, true), 10); // real "put in" is kept
+  assert.equal(depositBaseline(10, 10, 10, false), 10);
+});
+
+test('Connect setBalance starts a fresh TEST book at the requested amount', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-setbal-'));
+  const cfg = { ...DEFAULTS, startUsd: 81, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const e = new Engine(cfg, new ReplayMarket(10), new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 81 });
+  e.positions.push({ id: 'x', mint: 'M', pool: 'P', symbol: 'X', name: 'X', openedAt: Date.now(), entryPrice: 1, qty: 1, decimals: 6, costUsd: 10, costSol: 0.1, peakPrice: 1, lastPrice: 1, score: 50, rentSol: 0 } as any);
+  await e.connect({ type: 'paper', startUsd: 12, setBalance: true });
+  assert.equal(e.positions.length, 0, 'setBalance starts a fresh book');
+  assert.ok(Math.abs(e.wallet.depositUsd - 12) < 0.05, 'deposit=' + e.wallet.depositUsd);
+  assert.ok(Math.abs(e.equity() - 12) < 0.05, 'equity=' + e.equity());
+  e.stop();
+});
+
+test('resetBot zeros scan counters and cooldowns but keeps positions, wallet, lock, trades, and learning', async () => {
+  const dirp = mkdtempSync(join(tmpdir(), 'gb-resetbot-'));
+  const cfg = { ...DEFAULTS, startUsd: 20, scanIntervalSec: 9999, monitorIntervalSec: 9999 };
+  const e = new Engine(cfg, new ReplayMarket(10), new Store(join(dirp, 't.db')));
+  await e.connect({ type: 'paper', startUsd: 20 });
+  e.positions.push({ id: 'x', mint: 'M', pool: 'P', symbol: 'X', name: 'X', openedAt: Date.now(), entryPrice: 1, qty: 1, decimals: 6, costUsd: 10, costSol: 0.1, peakPrice: 1, lastPrice: 1, score: 50, rentSol: 0 } as any);
+  e.agents.scanner.total = 999;
+  e.agents.scanner.calls = 40;
+  e.agents.safety.rejected = 77;
+  e.agents.safety.penalties = 77;
+  e.agents.executor.buys = 3;
+  (e as any).cooldown = { M: Date.now() + 60_000 };
+  e.store.set('withdrawTo', 'CgrPNY2dMhyB8QmfM8hGyBqLwbvrWdE2X58LZZyGSVye');
+  const beforeEq = e.equity();
+  const r = e.resetBot();
+  assert.equal(r.ok, true);
+  assert.equal(r.learningKept, true);
+  assert.equal(e.positions.length, 1);
+  assert.equal(e.agents.scanner.total, 0);
+  assert.equal(e.agents.scanner.calls, 0);
+  assert.equal(e.agents.safety.rejected, 0);
+  assert.equal(e.agents.executor.buys, 0);
+  assert.deepEqual(e.cooldown, {});
+  assert.equal(e.lockedWithdrawTo(), 'CgrPNY2dMhyB8QmfM8hGyBqLwbvrWdE2X58LZZyGSVye');
+  assert.ok(Math.abs(e.equity() - beforeEq) < 1e-6);
+  assert.equal(e.wallet.connected, true);
   e.stop();
 });
