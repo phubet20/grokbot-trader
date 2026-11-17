@@ -55,6 +55,15 @@ export function withTimeout<T>(p: Promise<T>, ms: number, label = 'timeout'): Pr
   });
 }
 
+/** Keep on-chain errors short so simulation logs cannot flood stdout or hang the UI. */
+export function compactOnchainError(reason: string, max = 180): string {
+  let s = String(reason || '').replace(/\s+/g, ' ').trim();
+  const cut = s.search(/Program logs:|Catch the `SendTransactionError`/i);
+  if (cut > 0) s = s.slice(0, cut).trim();
+  if (s.length > max) s = s.slice(0, max - 1) + '…';
+  return s;
+}
+
 async function poolRun<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   let i = 0;
   const n = Math.max(1, Math.min(limit, items.length));
@@ -1006,12 +1015,13 @@ export class Engine extends EventEmitter {
 
   private logBuyFail(c: { symbol?: string; mint?: string; image?: string }, reason: string) {
     this.agents.executor.failures++;
-    const key = `${c.mint || c.symbol || ''}::${reason}`;
+    const short = compactOnchainError(reason);
+    const key = `${c.mint || c.symbol || ''}::${short}`;
     const now = Date.now();
     if ((this.lastBuyFail.get(key) || 0) + 15_000 > now) return;
     this.lastBuyFail.set(key, now);
-    this.log('Executor', 'reject', `Buy ${c.symbol || 'token'} failed: ${reason}`, { symbol: c.symbol, mint: c.mint, image: c.image });
-    this.decision({ ts: now, side: 'SKIP', symbol: c.symbol, image: c.image, text: `buy failed: ${reason}` });
+    this.log('Executor', 'reject', `Buy ${c.symbol || 'token'} failed: ${short}`, { symbol: c.symbol, mint: c.mint, image: c.image });
+    this.decision({ ts: now, side: 'SKIP', symbol: c.symbol, image: c.image, text: `buy failed: ${short}` });
   }
 
   // ---------------------------------------------------------------- RISK sizing + EXECUTOR buy
@@ -1859,11 +1869,20 @@ export class Engine extends EventEmitter {
 
   // ---------------------------------------------------------------- helpers
   private lastReconcileAt = 0;
+  private reconciling = false;
   async maybeReconcile() {
     if (!liveGate(this.cfg).live) return;
+    if (this.reconciling) return;
     if (Date.now() - this.lastReconcileAt < 8000) return;
     this.lastReconcileAt = Date.now();
-    await this.reconcileOnchain();
+    this.reconciling = true;
+    try {
+      await withTimeout(this.reconcileOnchain(), 8000, 'reconcile timeout');
+    } catch (e: any) {
+      this.log('Core', 'info', `reconcile skipped: ${e?.message || e}`);
+    } finally {
+      this.reconciling = false;
+    }
   }
   private persist() {
     this.store.setBook(this.book, 'positions', this.positions);

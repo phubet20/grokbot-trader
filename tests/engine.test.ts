@@ -9,7 +9,7 @@ process.env.DATA_DIR = dir;
 const { DEFAULTS } = await import('../server/config.ts');
 const { ReplayMarket } = await import('../server/replay.ts');
 const { Store } = await import('../server/store.ts');
-const { Engine, depositBaseline } = await import('../server/engine.ts');
+const { Engine, depositBaseline, compactOnchainError } = await import('../server/engine.ts');
 const { buildLiveSwapTx } = await import('../server/executor.ts');
 
 test('paper engine trades a $10 wallet and keeps accounting consistent', async () => {
@@ -278,4 +278,14 @@ test('resetBot zeros scan counters and cooldowns but keeps positions, wallet, lo
   assert.ok(Math.abs(e.equity() - beforeEq) < 1e-6);
   assert.equal(e.wallet.connected, true);
   e.stop();
+});
+
+
+test('compactOnchainError strips Solana program logs to a short line', () => {
+  const huge = 'Simulation failed. \nMessage: Transaction simulation failed. \nProgram logs:\n' + '  "Program x invoke",\n'.repeat(200) + 'Catch the `SendTransactionError` and call `getLogs()` on it for full details.';
+  const short = compactOnchainError(huge);
+  assert.ok(short.length <= 180);
+  assert.equal(short.includes('Program logs'), false);
+  assert.equal(short.includes('SendTransactionError'), false);
+  assert.match(short, /Simulation failed/);
 });

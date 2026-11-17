@@ -82,7 +82,7 @@ const server = createServer(async (req, res) => {
       req.on('close', () => { clients.delete(res); clearInterval(ka); });
       return;
     }
-    if (p === '/api/state') { await engine.maybeReconcile(); return json(200, engine.snapshot()); }
+    if (p === '/api/state') { void engine.maybeReconcile(); return json(200, engine.snapshot()); }
     if (p === '/api/funds') return json(200, await engine.fundsView());
     if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
