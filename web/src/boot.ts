@@ -3,6 +3,26 @@
 export const SPLASH_MS = 1500;
 export const SNAP_CACHE_KEY = 'grokbot.snap.v3.live';
 export const LAST_MODE_KEY = 'grokbot.lastMode';
+export const CHOSEN_MODE_KEY = 'grokbot.chosenMode';
+export function loadChosenMode(): 'paper' | 'live' | 'live-auto' | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const v = localStorage.getItem(CHOSEN_MODE_KEY);
+    if (v === 'paper' || v === 'live' || v === 'live-auto') return v;
+    const last = localStorage.getItem(LAST_MODE_KEY);
+    if (last === 'paper' || last === 'live') return last === 'live' ? 'live-auto' : 'paper';
+  } catch { /* ignore */ }
+  return null;
+}
+export function saveChosenMode(mode: string) {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const m = mode === 'paper' ? 'paper' : (mode === 'live' ? 'live' : 'live-auto');
+    localStorage.setItem(CHOSEN_MODE_KEY, m);
+    localStorage.setItem(LAST_MODE_KEY, m === 'paper' ? 'paper' : 'live');
+  } catch { /* ignore */ }
+}
+
 export function snapCacheKey(mode?: string) {
   return mode === 'paper' ? 'grokbot.snap.v3.paper' : 'grokbot.snap.v3.live';
 }

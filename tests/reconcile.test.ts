@@ -31,3 +31,13 @@ test('applyOnchainHoldings keeps and resizes on-chain holdings, and appends new 
   assert.ok(kept.some((p) => p.mint === 'MintNew' && p.id === 'recon-MintNew'));
   assert.ok(!kept.some((p) => p.mint === 'MintGone'));
 });
+
+test('applyOnchainHoldings keeps a zero-price incoming holding (price unknown, not dropped)', () => {
+  const current: any[] = [];
+  const holdings = [{ mint: 'UnknownMint111', qty: 12, decimals: 6 }];
+  const incoming = [{ mint: 'UnknownMint111', qty: 12, decimals: 6, id: 'recon-unk', symbol: 'UNK', lastPrice: 0, priceUnknown: true, entryPrice: 0 }];
+  const kept = applyOnchainHoldings(current, holdings, incoming);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].mint, 'UnknownMint111');
+  assert.equal((kept[0] as any).priceUnknown, true);
+});

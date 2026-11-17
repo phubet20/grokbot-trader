@@ -162,6 +162,11 @@ export function Funds({ snap }: { snap: any }) {
               On-chain: {onchainSol == null ? '…' : `${Number(onchainSol).toFixed(4)} SOL`}
               {funds?.onchainUsd != null && <> · {usd(funds.onchainUsd)}</>}
             </div>
+            <div className="mono small" data-testid="onchain-total">
+              Total {usd(funds?.onchainTotalUsd ?? snap.onchainTotalUsd)}
+              {Number(funds?.onchainTokenUsd ?? snap.onchainTokenUsd) > 0 ? ` · tokens ${usd(funds?.onchainTokenUsd ?? snap.onchainTokenUsd)}` : ''}
+              {Number(funds?.onchainTokenUnknown ?? snap.onchainTokenUnknown) > 0 ? ` · ${funds?.onchainTokenUnknown ?? snap.onchainTokenUnknown} price unknown` : ''}
+            </div>
             <div className="mono small" data-testid="onchain-usdc">
               USDC: {funds?.onchainUsdc == null ? '…' : `${Number(funds.onchainUsdc).toFixed(2)} USDC`}
               {funds?.onchainUsdcUsd != null && Number(funds.onchainUsdc) > 0 && <> · {usd(funds.onchainUsdcUsd)}</>}

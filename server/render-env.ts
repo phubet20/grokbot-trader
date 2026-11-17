@@ -1,8 +1,8 @@
 // Persist a tiny allowlist of env vars to Render so they survive free-plan
-// sleeps and redeploys (no disk). Only WITHDRAW_TO and AUTO_START may be written.
+// sleeps and redeploys (no disk). Only WITHDRAW_TO, AUTO_START, and RUNTIME_MODE may be written.
 // Requires RENDER_API_KEY (a Render API key) and RENDER_SERVICE_ID.
 // Never logs the API key or dumps other env values.
-const ALLOW = new Set(['WITHDRAW_TO', 'AUTO_START']);
+const ALLOW = new Set(['WITHDRAW_TO', 'AUTO_START', 'RUNTIME_MODE']);
 
 function apiKey(): string {
   return (process.env.RENDER_API_KEY || '').trim();

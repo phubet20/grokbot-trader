@@ -72,6 +72,7 @@ export type Position = {
   liveManaged?: boolean;
   reconciled?: boolean;
   entryEstimated?: boolean;
+  priceUnknown?: boolean;
   adds?: number;
   entryLiq?: number;
   entryPattern?: string;

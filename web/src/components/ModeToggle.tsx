@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api';
+import { saveChosenMode } from '../boot';
 
 export function ModeBadge({ snap, className = '' }: { snap: any; className?: string }) {
   const live = snap.mode !== 'paper';
@@ -23,21 +24,19 @@ export function ModeToggle({ snap, compact }: { snap: any; compact?: boolean }) 
   const live = snap.mode !== 'paper';
   const canLive = !!snap.canSwitchLive || !!snap.liveArmed;
 
-  async function goTest() {
+  async function applyMode(mode: 'paper' | 'live-auto') {
     setBusy(true); setErr('');
     try {
-      await api('mode', { mode: 'paper' }, { timeoutMs: 20000 });
+      saveChosenMode(mode);
+      const r = await api('mode', { mode }, { timeoutMs: 20000 });
+      const snap = r?.snap || await api('state', undefined, { timeoutMs: 8000 });
+      if (snap) window.dispatchEvent(new CustomEvent('grokbot:snap', { detail: snap }));
+      if (mode !== 'paper') setConfirm(false);
     } catch (e: any) { setErr(e?.message || 'switch failed'); }
     setBusy(false);
   }
-  async function goLive() {
-    setBusy(true); setErr('');
-    try {
-      await api('mode', { mode: 'live-auto' }, { timeoutMs: 20000 });
-      setConfirm(false);
-    } catch (e: any) { setErr(e?.message || 'switch failed'); }
-    setBusy(false);
-  }
+  async function goTest() { await applyMode('paper'); }
+  async function goLive() { await applyMode('live-auto'); }
 
   return (
     <>

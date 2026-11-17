@@ -36,7 +36,7 @@ test('paper and live books do not mix trades, equity, or activity', async () => 
   await e.setRuntimeMode('live-auto');
   const liveStats = e.stats();
   assert.equal(liveStats.closed, 1, 'live sees only the live trade, closed=' + liveStats.closed);
-  assert.equal(store.equity(0, 'live').every((r: any) => r.usd < 10), true);
+  assert.equal(store.equity(0, 'live').some((r: any) => r.usd === 70 || r.usd > 60), false, 'paper $70 equity must not appear on the live book');
   e.stop();
 });
 
@@ -46,6 +46,9 @@ test('switching to TEST keeps live positions managed and opens no live mix in pa
   e.positions.push({ id: 'liv1', mint: 'MintLive11111111111111111111111111111111111', pool: 'p', symbol: 'LIVE', name: 'LIVE', openedAt: Date.now(), entryPrice: 1, qty: 10, decimals: 6, costUsd: 0.5, costSol: 0.007, peakPrice: 1, lastPrice: 1, score: 60, rentSol: 0.002, book: 'live' } as any);
   (e as any).liveHeld = [...e.positions];
   (e as any).saveActiveBook();
+  // Do not let a real on-chain reconcile wipe the planted live row in this isolation test.
+  (e as any).reconcileOnchain = async () => {};
+  (e as any).refreshLiveBook = async () => {};
   const r = await e.setRuntimeMode('paper');
   assert.equal(r.mode, 'paper');
   assert.equal(e.mode, 'paper');

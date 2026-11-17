@@ -18,6 +18,7 @@ import { botPublicKey, hasBotWallet, verifyWithdrawLock, LOCK_MESSAGE } from './
 import { notifyTrade, pushEnabled, subscriberCount } from './push.ts';
 import { keepaliveSnapshot } from './keepalive.ts';
 import { persistRenderEnv, autoStartEnabled, ensureAutoStartEnv, canPersistRenderEnv } from './render-env.ts';
+import { resolveRuntimeMode, pickRuntimeMode, liveBuysAllowed, type RuntimeMode } from './runtime-mode.ts';
 import { getUsdcBalance, canAutoSwapUsdc, swapUsdcToSol, transferUsdc, USDC_DECIMALS } from './usdc.ts';
 import { parseWithdrawDestination, DEFAULT_WITHDRAW_TO, sendSolWithdraw, keepLamportsForWithdraw, previewSolWithdraw, WITHDRAW_ERR, shortAddr } from './withdraw.ts';
 import { remoteStateStatus } from './remote-state.ts';
@@ -142,9 +143,16 @@ export class Engine extends EventEmitter {
   }
 
   lastEquity = 0;
-  private runtimeMode: 'paper' | 'live' | 'live-auto' = 'paper';
+  private runtimeMode: RuntimeMode = 'paper';
   private liveHeld: Position[] = [];
   private liveWallet: Wallet | null = null;
+  private paperHeld: Position[] = [];
+  private paperWal: Wallet | null = null;
+  private paperCooldown: Record<string, number> = {};
+  private snapRev = Date.now();
+  private scannerResetTimer: ReturnType<typeof setInterval> | null = null;
+  /** Set true only by an explicit /api/mode LIVE tap. Never by AUTO_START, boot, or /api/bot/run. */
+  private liveEntriesArmed = false;
 
 
   constructor(cfg: Config, m: MarketSource, store: Store) {
@@ -153,16 +161,24 @@ export class Engine extends EventEmitter {
     this.cfg = cfg; this.m = m; this.store = store;
     this.exec = new PaperExecutor(m, cfg);
     const gate0 = liveGate(cfg);
-    const envMode: 'paper' | 'live' | 'live-auto' = !gate0.live ? 'paper' : (gate0.auto ? 'live-auto' : 'live');
+    const envMode: RuntimeMode = !gate0.live ? 'paper' : (gate0.auto ? 'live-auto' : 'live');
     store.migrateLegacyBooks(envMode === 'paper' ? 'paper' : 'live');
-    const savedMode = store.get<string>('runtimeMode', envMode);
-    this.runtimeMode = savedMode === 'paper' ? 'paper' : (gate0.live ? envMode : 'paper');
+    this.runtimeMode = resolveRuntimeMode({
+      armed: gate0.live,
+      auto: gate0.auto,
+      savedMode: store.get<string>('runtimeMode', ''),
+      envRuntimeMode: process.env.RUNTIME_MODE,
+    });
+    this.liveEntriesArmed = this.runtimeMode !== 'paper' && gate0.live && store.get<boolean>('liveEntriesArmed', this.runtimeMode !== 'paper');
     const emptyWallet: Wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
     this.wallet = store.getBook<Wallet>(this.book, 'wallet', emptyWallet);
     this.positions = store.getBook<Position[]>(this.book, 'positions', []);
     this.cooldown = store.getBook<Record<string, number>>(this.book, 'cooldown', {});
     this.liveHeld = store.getBook<Position[]>('live', 'positions', []);
     this.liveWallet = store.getBook<Wallet | null>('live', 'wallet', null);
+    this.paperHeld = store.getBook<Position[]>('paper', 'positions', this.book === 'paper' ? this.positions : []);
+    this.paperWal = store.getBook<Wallet | null>('paper', 'wallet', this.book === 'paper' ? this.wallet : null);
+    this.paperCooldown = store.getBook<Record<string, number>>('paper', 'cooldown', this.book === 'paper' ? this.cooldown : {});
     const saved = store.get<any>('agents', null);
     if (saved) for (const k of Object.keys(this.agents) as (keyof typeof this.agents)[]) Object.assign(this.agents[k], saved[k] || {});
     this.tuner.load(store.get('autotune', null));
@@ -195,14 +211,47 @@ export class Engine extends EventEmitter {
     return [...this.positions, ...live];
   }
 
+  private persistRuntimeMode(mode: RuntimeMode) {
+    this.store.set('runtimeMode', mode);
+    this.store.set('liveEntriesArmed', this.liveEntriesArmed);
+    process.env.RUNTIME_MODE = mode;
+    void persistRenderEnv({ RUNTIME_MODE: mode });
+  }
+
+  /** True only when the user has explicitly tapped LIVE and has not switched back to TEST. */
+  liveBuysOk() {
+    if (this.m?.name === 'replay') return false;
+    return liveBuysAllowed(this.runtimeMode, this.liveEntriesArmed, liveGate(this.cfg).live) && hasBotWallet();
+  }
+
+  private paperState(): { wallet: Wallet; positions: Position[]; cooldown: Record<string, number> } {
+    if (this.mode === 'paper') return { wallet: this.wallet, positions: this.positions, cooldown: this.cooldown };
+    const emptyWallet: Wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
+    if (!this.paperWal) this.paperWal = this.store.getBook<Wallet | null>('paper', 'wallet', emptyWallet);
+    if (!this.paperHeld) this.paperHeld = this.store.getBook<Position[]>('paper', 'positions', []);
+    if (!this.paperCooldown) this.paperCooldown = this.store.getBook<Record<string, number>>('paper', 'cooldown', {});
+    return { wallet: this.paperWal || emptyWallet, positions: this.paperHeld, cooldown: this.paperCooldown };
+  }
+
+  private savePaperBook() {
+    const st = this.paperState();
+    this.paperWal = st.wallet;
+    this.paperHeld = st.positions;
+    this.paperCooldown = st.cooldown;
+    this.store.setBook('paper', 'wallet', st.wallet);
+    this.store.setBook('paper', 'positions', st.positions);
+    this.store.setBook('paper', 'cooldown', st.cooldown);
+  }
+
   private saveActiveBook() {
     const b = this.book;
     this.store.setBook(b, 'wallet', this.wallet);
     this.store.setBook(b, 'positions', this.positions);
     this.store.setBook(b, 'cooldown', this.cooldown);
     this.store.setBook(b, 'agents', this.agents);
-    if (b === 'live') { this.liveHeld = this.positions; this.liveWallet = this.wallet; }
-    this.store.set('runtimeMode', this.runtimeMode);
+    if (b === 'live') { this.liveHeld = this.positions; this.liveWallet = this.wallet; this.savePaperBook(); }
+    else { this.paperHeld = this.positions; this.paperWal = this.wallet; this.paperCooldown = this.cooldown; }
+    this.persistRuntimeMode(this.runtimeMode);
   }
 
   private loadActiveBook() {
@@ -212,7 +261,11 @@ export class Engine extends EventEmitter {
     this.cooldown = this.store.getBook<Record<string, number>>(this.book, 'cooldown', {});
     this.liveHeld = this.store.getBook<Position[]>('live', 'positions', this.liveHeld || []);
     this.liveWallet = this.store.getBook<Wallet | null>('live', 'wallet', this.liveWallet);
+    this.paperHeld = this.store.getBook<Position[]>('paper', 'positions', this.paperHeld || []);
+    this.paperWal = this.store.getBook<Wallet | null>('paper', 'wallet', this.paperWal);
+    this.paperCooldown = this.store.getBook<Record<string, number>>('paper', 'cooldown', this.paperCooldown || {});
     if (this.book === 'live') this.liveHeld = this.positions;
+    else { this.paperHeld = this.positions; this.paperWal = this.wallet; this.paperCooldown = this.cooldown; }
   }
 
   /** Runtime TEST <-> LIVE switch. Does not change MODE/LIVE_CONFIRM env and does not wipe the other book. */
@@ -230,11 +283,12 @@ export class Engine extends EventEmitter {
         await this.connect({ type: 'paper', startUsd });
       }
       this.emitState();
-      return { ok: true, mode: this.mode, unchanged: true, liveOpen: this.liveHeld.length };
+      return { ok: true, mode: this.mode, unchanged: true, liveOpen: this.liveHeld.length, liveEntriesArmed: this.liveEntriesArmed };
     }
     this.saveActiveBook();
     this.runtimeMode = dest === 'paper' ? 'paper' : dest;
-    this.store.set('runtimeMode', this.runtimeMode);
+    this.liveEntriesArmed = dest !== 'paper';
+    this.persistRuntimeMode(this.runtimeMode);
     this.tuner.resetEquityWindow();
     this.loadActiveBook();
     if (dest === 'paper') {
@@ -250,16 +304,27 @@ export class Engine extends EventEmitter {
       await this.refreshLiveBook().catch(() => {});
       this.log('Core', 'info', `Switched to TEST · paper book is separate. ${this.liveHeld.length} live position(s) stay open and will still exit on-chain; no new live buys until you switch back.`);
     } else {
-      if (liveGate(this.cfg).auto && hasBotWallet()) {
-        await this.connect({ type: 'paper' });
+      if (hasBotWallet()) {
+        try {
+          await this.connect({ type: 'paper' });
+        } catch (e: any) {
+          // Still mark the live book connected so the UI does not bounce back to the TEST Connect sheet.
+          const pub = botPublicKey() || '';
+          this.wallet.connected = true;
+          this.wallet.type = 'bot';
+          if (pub) this.wallet.address = pub;
+          this.wallet.running = true;
+          this.log('Core', 'info', `LIVE connect retry later: ${e?.message || e}`);
+        }
         await this.reconcileOnchain();
+        this.ensurePaperBook();
       }
       this.log('Core', 'info', 'Switched to LIVE · showing on-chain balances only. Paper history is kept and hidden.');
     }
     this.persist();
     this.emitState();
     if (this.wallet.connected && this.wallet.running) void this.kickoffTrading('mode-switch');
-    return { ok: true, mode: this.mode, liveOpen: this.liveHeld.length, paperEquity: dest === 'paper' ? this.equity() : undefined };
+    return { ok: true, mode: this.mode, liveOpen: this.liveHeld.length, liveEntriesArmed: this.liveEntriesArmed, paperEquity: dest === 'paper' ? this.equity() : undefined, snap: this.snapshot() };
   }
 
   private async refreshLiveBook() {
@@ -291,6 +356,12 @@ export class Engine extends EventEmitter {
     loop(() => this.monitor(), () => this.cfg.monitorIntervalSec, 'monitor');
     loop(() => this.convertUsdc(), () => 20, 'usdc');
     this.timers.push(setInterval(() => this.store.prune(), 10 * 60_000));
+    // Auto scanner reset every 5 minutes — same as Reset bot, first fire after 5 min (not at boot).
+    this.scannerResetTimer = setInterval(() => {
+      try { this.resetBot(); }
+      catch (e: any) { this.log('Core', 'info', `auto scan reset: ${e?.message || e}`); }
+    }, 5 * 60_000);
+    this.timers.push(this.scannerResetTimer);
     // Connect the book in the background, then enter as soon as any candidate passes.
     await this.bootSession();
   }
@@ -310,6 +381,7 @@ export class Engine extends EventEmitter {
         await this.syncBotBalance();
         if (this.mode !== 'paper') {
           await this.connect({ type: 'paper' });
+          this.ensurePaperBook();
           await this.reconcileOnchain();
         } else {
           await this.reconcileOnchain();
@@ -833,7 +905,10 @@ export class Engine extends EventEmitter {
   // ---------------------------------------------------------------- concurrent evaluation (does not block scanning)
   async evaluateEntries() {
     if (this.evaluating) return;
-    if (!this.wallet.connected || !this.wallet.running) return;
+    const paper = this.paperState();
+    const running = !!(this.wallet.running || paper.wallet?.running);
+    const connected = !!(this.wallet.connected || paper.wallet?.connected);
+    if (!running || !connected) return;
     this.evaluating = true;
     try {
       this.rollDay();
@@ -979,16 +1054,7 @@ export class Engine extends EventEmitter {
           this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'dumping in first seconds — skip' });
           return;
         }
-        // Only mechanical skip: no route or quote, retry later (no long cooldown).
-        if (this.mode !== 'paper') {
-          const okSell = await this.sellable(c.mint, trialSize / this.solPrice);
-          if (aborted) return;
-          if (!okSell) {
-            this.noteReject(pump ? 'no curve quote' : 'no Jupiter route');
-            this.decision({ ts: Date.now(), side: 'SKIP', symbol: c.symbol, image: c.image, text: 'no route/quote — skip and retry' });
-            return;
-          }
-        }
+        // Route/quote is checked at send time (mechanical). Do not pre-gate live entries slower than paper.
         this.agents.safety.passed++;
         this.log('Safety', 'info', `${sr.label}`, { symbol: c.symbol, mint: c.mint, image: c.image });
         void this.openPosition(c, adjScore, why);
@@ -1024,17 +1090,115 @@ export class Engine extends EventEmitter {
     this.decision({ ts: now, side: 'SKIP', symbol: c.symbol, image: c.image, text: `buy failed: ${short}` });
   }
 
+
+  /** Paper-book fill used as the shared signal, including when the UI is LIVE. */
+  private async fillPaperMirror(c: Candidate, score: number, why: string, _solHint: number, _adding: boolean, _existing: Position | undefined, gen: number) {
+    const st = this.paperState();
+    if (!st.wallet?.connected) { this.ensurePaperBook(); }
+    const wallet = this.paperState().wallet;
+    const positions = this.paperState().positions;
+    if (!wallet.connected) return;
+    const existing = positions.find((p) => p.mint === c.mint);
+    const adding = !!existing;
+    if (adding && !this.canAddOn(positions, c)) return;
+    if (!this.solPrice) return;
+    const eq = this.equityOf(wallet, positions);
+    const reserveUsd = exitReserveSol(this.cfg.priorityFeeSol, positions.length, true) * this.solPrice;
+    const freeCash = Math.max(0, (wallet.solBalance - 0) * this.solPrice);
+    let size = openSizeUsd(this.cfg, eq, freeCash, reserveUsd);
+    if (adding && existing) size = Math.min(size, Math.max(0, this.maxCoinUsdOf(eq) - existing.costUsd));
+    size *= this.tuner.entrySizeMult(why);
+    size = Math.min(size, Math.max(0, freeCash - reserveUsd));
+    if (!size) return;
+    const solAmt = size / this.solPrice;
+    const needSol = solAmt + BASE_FEE_SOL + this.cfg.priorityFeeSol + (adding ? 0 : ATA_RENT_SOL);
+    if (wallet.solBalance < needSol) return;
+    const f = await this.exec.buy(c.mint, solAmt, this.solPrice);
+    if (!f || !f.ok) return;
+    if (gen !== this.bookGen) return;
+    const held = positions.find((p) => p.mint === c.mint) || existing;
+    const costSol = f.solSpent + f.feesSol;
+    const debit = costSol + (held ? 0 : f.rentSol);
+    if (wallet.solBalance < debit) return;
+    wallet.solBalance -= debit;
+    const addUsd = costSol * this.solPrice;
+    if (held) {
+      const newQty = held.qty + f.tokens;
+      held.entryPrice = (held.entryPrice * held.qty + f.fillPrice * f.tokens) / Math.max(1e-12, newQty);
+      held.qty = newQty;
+      held.costUsd += addUsd;
+      held.costSol += costSol;
+      held.lastPrice = f.fillPrice;
+      held.peakPrice = Math.max(held.peakPrice, f.fillPrice);
+      held.adds = (held.adds || 0) + 1;
+      (held as any).origCost = ((held as any).origCost ?? (held.costUsd - addUsd)) + addUsd;
+    } else {
+      const pos: Position = {
+        id: randomUUID(), mint: c.mint, pool: c.pool, symbol: c.symbol, name: c.name, image: c.image, openedAt: Date.now(),
+        entryPrice: f.fillPrice, qty: f.tokens, decimals: f.decimals, costUsd: addUsd, costSol,
+        peakPrice: f.fillPrice, lastPrice: f.fillPrice, score, rentSol: f.rentSol, adds: 0, entryLiq: c.liquidityUsd,
+        book: 'paper', entryPattern: patternKey(why), maePct: 0, immediateRed: false,
+        entryFeatures: { score, m5: c.change.m5 || 0, m15: c.change.m15 || 0, liq: c.liquidityUsd, netBuy: c.flow?.netBuySol || 0, ageMin: c.createdAt ? (Date.now() - c.createdAt) / 60000 : 0 },
+      } as Position;
+      (pos as any).origCost = pos.costUsd; (pos as any).partialTaken = false; (pos as any).breakeven = false;
+      positions.push(pos);
+    }
+    this.paperWal = wallet;
+    this.paperHeld = positions;
+    this.savePaperBook();
+    this.agents.executor.fills++; this.agents.executor.buys++; this.agents.executor.last = `PAPER ${c.symbol}`;
+    this.decision({ ts: Date.now(), side: 'BUY', symbol: c.symbol, image: c.image, text: `paper ${why} · $${addUsd.toFixed(2)}`, usd: addUsd, book: 'paper' } as any);
+  }
+
+  private equityOf(wallet: Wallet, positions: Position[]) {
+    const pos = positions.reduce((a, p) => a + p.qty * (p.lastPrice || p.entryPrice) + (p.rentSol || 0) * this.solPrice, 0);
+    return wallet.solBalance * this.solPrice + pos;
+  }
+  private maxCoinUsdOf(eq: number) { return eq * 0.24; }
+  private canAddOn(positions: Position[], c: Candidate, now = Date.now()) {
+    const pos = positions.find((p) => p.mint === c.mint);
+    if (!pos) return false;
+    if ((pos.adds || 0) >= 2) return false;
+    if (pos.costUsd >= this.maxCoinUsdOf(this.equityOf(this.paperState().wallet, positions)) * 0.98) return false;
+    if ((this.paperState().cooldown[c.mint] || 0) > now) return false;
+    const hist = this.mintHist.get(c.mint) || [];
+    const dip = dipReclaim(hist.length ? hist : [toSnap(now, c)]);
+    return dip.ok;
+  }
+  private ensurePaperBook() {
+    const emptyWallet: Wallet = { connected: false, type: 'paper', address: '', realSol: null, solBalance: 0, depositUsd: 0, startedAt: 0, running: false, dayKey: '', dayStartEquity: 0 };
+    const w = this.store.getBook<Wallet | null>('paper', 'wallet', this.paperWal);
+    const positions = this.store.getBook<Position[]>('paper', 'positions', this.paperHeld || []);
+    if (w && (w.depositUsd || w.solBalance || positions.length)) {
+      w.connected = true;
+      w.type = 'paper';
+      if (this.wallet.running) w.running = true;
+      this.paperWal = w;
+      this.paperHeld = positions;
+      this.savePaperBook();
+      return;
+    }
+    if (!this.solPrice) return;
+    const startUsd = Math.max(2, Number(this.cfg.startUsd) || this.solPrice || 70);
+    this.paperWal = {
+      ...emptyWallet,
+      connected: true, type: 'paper', address: this.previewAddr || fakeAddr(),
+      solBalance: startUsd / this.solPrice, depositUsd: startUsd, startedAt: Date.now(),
+      running: !!this.wallet.running, dayKey: dayKey(), dayStartEquity: startUsd,
+    };
+    this.paperHeld = [];
+    this.savePaperBook();
+  }
+
   // ---------------------------------------------------------------- RISK sizing + EXECUTOR buy
   async openPosition(c: Candidate, score: number, why: string) {
+
     const gen = this.bookGen;
     const existing = this.positions.find((p) => p.mint === c.mint);
     const adding = !!existing;
     if (adding && !this.canAdd(c)) return;
     if (!adding && this.alreadyHeld(c.mint)) return;
     if (this.buying.has(c.mint)) return;
-    // Live: one in-flight buy at a time and reserve the SOL first so a second
-    // all-in attempt cannot race and spam "insufficient lamports".
-    if (this.mode !== 'paper' && this.buying.size >= 1) return;
     this.buying.add(c.mint);
     this.agents.scanner.inFlightBuys = this.buying.size;
     try {
@@ -1054,16 +1218,24 @@ export class Engine extends EventEmitter {
     size = Math.min(size, Math.max(0, this.freeCashUsd() - reserveUsd));
     if (!size) { this.agents.risk.label = 'not enough free cash'; this.logBuyFail(c, 'not enough free cash'); return; }
     const solAmt = size / this.solPrice;
-    if (this.mode === 'live-auto') {
+    const wantLive = this.liveBuysOk();
+    // Always fill the paper book first (shared signal). Live mirrors at the same moment only when armed.
+    if (this.mode !== 'paper') {
+      await this.fillPaperMirror(c, score, why, solAmt, adding, existing, gen);
+    }
+    if (wantLive) {
       const needSol = solAmt + BASE_FEE_SOL + this.cfg.priorityFeeSol + (adding ? 0 : ATA_RENT_SOL);
       if (this.wallet.solBalance - this.reservedSol < needSol) { this.logBuyFail(c, 'not enough free cash for fees'); return; }
       this.reservedSol += needSol;
-      try { await this.execLiveAuto('buy', c, { solAmt, score, why }); }
-      finally { this.reservedSol = Math.max(0, this.reservedSol - needSol); }
+      try {
+        if (this.mode === 'live') await this.requestLive('buy', c, { solAmt, score, why });
+        else await this.execLiveAuto('buy', c, { solAmt, score, why });
+      } finally { this.reservedSol = Math.max(0, this.reservedSol - needSol); }
       await this.syncBotBalance().catch(() => {});
-      return;
+      if (this.mode !== 'paper') return;
+    } else if (this.mode !== 'paper') {
+      return; // UI is LIVE but not armed — should not happen; don't fall through into live wallet as paper.
     }
-    if (this.mode === 'live') { await this.requestLive('buy', c, { solAmt, score, why }); return; }
 
     const needSol = solAmt + BASE_FEE_SOL + this.cfg.priorityFeeSol + (adding ? 0 : ATA_RENT_SOL);
     if (this.wallet.solBalance - this.reservedSol < needSol) { this.agents.risk.label = 'not enough free cash'; return; }
@@ -1149,8 +1321,9 @@ export class Engine extends EventEmitter {
       for (const p of [...bag]) {
         if (this.selling.has(p.id)) continue;
         const fresh = this.candidates.get(p.mint);
-        const px = prices[p.mint] || fresh?.priceUsd || p.lastPrice;
-        if (!px) continue;
+        const px = prices[p.mint] || fresh?.priceUsd || 0;
+        if (!(px > 0)) { p.priceUnknown = true; continue; }
+        p.priceUnknown = false;
         p.lastPrice = px;
         const fromEntry = (px / p.entryPrice - 1) * 100;
         p.maePct = Math.min(p.maePct ?? 0, fromEntry);
@@ -1198,6 +1371,7 @@ export class Engine extends EventEmitter {
       if (gov.earlyCutSec > 0) {
         for (const p of [...bag]) {
           if (this.selling.has(p.id)) continue;
+          if (p.priceUnknown || !(p.lastPrice > 0) || !(p.entryPrice > 0)) continue;
           if (now - p.openedAt < gov.earlyCutSec * 1000) continue;
           const fresh = this.candidates.get(p.mint);
           const hist = this.mintHist.get(p.mint) || [];
@@ -1213,6 +1387,7 @@ export class Engine extends EventEmitter {
       const dep = this.wallet.depositUsd || 0;
       for (const p of [...bag]) {
         if (this.selling.has(p.id)) continue;
+        if (p.priceUnknown || !(p.lastPrice > 0) || !(p.entryPrice > 0)) continue;
         if (isQuickRedExit({
           openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now,
           redExitSec: redSec, equity: eqNow, deposit: dep,
@@ -1225,6 +1400,7 @@ export class Engine extends EventEmitter {
       const staleSec = staleExitSec(this.priors);
       for (const p of [...bag]) {
         if (this.selling.has(p.id)) continue;
+        if (p.priceUnknown || !(p.lastPrice > 0) || !(p.entryPrice > 0)) continue;
         const fresh = this.candidates.get(p.mint);
         const hist = this.mintHist.get(p.mint) || [];
         const vol = { volumeM5: fresh?.volume?.m5, txM5: fresh ? (fresh.txns.m5b + fresh.txns.m5s) : undefined };
@@ -1322,7 +1498,7 @@ export class Engine extends EventEmitter {
     this.agents.scanner.inFlightSells = this.selling.size;
     try {
     const frac = Math.min(1, Math.max(0.05, fraction));
-    if (this.isLiveBookPos(p) || this.mode === 'live-auto') { await this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac }); return { ok: true }; }
+    if (this.isLiveBookPos(p) || (this.mode !== 'paper' && p.book !== 'paper')) { await this.execLiveAuto('sell', p as any, { position: p, kind, reason, fraction: frac }); void this.mirrorCloseOtherBook(p, kind, reason, frac); return { ok: true }; }
     if (this.mode === 'live') { await this.requestLive('sell', p as any, { position: p, kind, reason, fraction: frac }); return { ok: true, pending: true }; }
     const qty = p.qty * frac;
     const f = await this.exec.sell(p.mint, qty, p.decimals, this.solPrice);
@@ -1372,6 +1548,7 @@ export class Engine extends EventEmitter {
       this.log('Risk', 'sell', `Partial ${p.symbol} ${reason}`, { symbol: p.symbol, mint: p.mint, image: p.image, usd: solBack * this.solPrice, pct: (fillPrice / p.entryPrice - 1) * 100, text2: reason } as any);
       this.persist();
       this.emitState();
+      void this.mirrorCloseOtherBook(p, kind, reason, frac);
       return { ok: true };
     }
     this.wallet.solBalance += solBack + p.rentSol;
@@ -1379,10 +1556,32 @@ export class Engine extends EventEmitter {
     const cost = (p as any).origCost ?? p.costUsd;
     p.costUsd = cost;
     this.finishClose(p, fillPrice, proceeds, kind, reason + note);
+    void this.mirrorCloseOtherBook(p, kind, reason, frac);
     return { ok: true };
     } finally {
       this.selling.delete(p.id);
       this.agents.scanner.inFlightSells = this.selling.size;
+    }
+  }
+
+  private closingMirror = false;
+  /** Same-moment exit on the other book. Live sells of held tokens are allowed even when new live buys are not armed. */
+  private async mirrorCloseOtherBook(p: Position, kind: string, reason: string, fraction: number) {
+    if (this.closingMirror) return;
+    this.closingMirror = true;
+    try {
+      if (this.isLiveBookPos(p) || p.book === 'live') {
+        const st = this.paperState();
+        const pp = st.positions.find((x) => x.mint === p.mint);
+        if (pp && !this.selling.has(pp.id)) await this.closePosition(pp, kind, reason, fraction);
+        return;
+      }
+      const livePos = (this.mode === 'paper' ? this.liveHeld : this.positions).find((x) => x.mint === p.mint && x.id !== p.id);
+      if (livePos) await this.execLiveAuto('sell', livePos as any, { position: livePos, kind, reason, fraction });
+    } catch (e: any) {
+      this.log('Core', 'info', `mirror close skipped: ${e?.message || e}`);
+    } finally {
+      this.closingMirror = false;
     }
   }
 
@@ -1484,6 +1683,15 @@ export class Engine extends EventEmitter {
   /** LIVE AUTO: bot wallet signs and sends. Never logs the secret. */
   private async execLiveAuto(side: 'buy' | 'sell', c: any, meta: any) {
     if (!hasBotWallet()) { this.log('Core', 'info', 'live-auto needs BOT_WALLET_SECRET'); return; }
+    // New live buys require an explicit LIVE tap. Sells of already-held tokens stay allowed so TEST can still exit on-chain.
+    if (this.m?.name === 'replay') {
+      if (side === 'buy') this.logBuyFail(c, 'replay market does not send live swaps');
+      return;
+    }
+    if (side === 'buy' && !this.liveBuysOk()) {
+      this.logBuyFail(c, 'live buys are not armed (TEST mode or no LIVE tap)');
+      return;
+    }
     const pub = botPublicKey()!;
     try {
       const args = side === 'buy'
@@ -1503,25 +1711,28 @@ export class Engine extends EventEmitter {
   }
 
   async reconcileOnchain() {
-    if (this.mode === 'paper') return;
-    const owner = this.mode === 'live-auto' ? botPublicKey() : this.wallet.address;
+    const owner = botPublicKey() || (this.mode !== 'paper' ? this.wallet.address : '');
     if (!owner) return;
     try {
+      const current = this.mode === 'paper' ? this.liveHeld : this.positions;
       const r = await rebuildPositions({
         rpcUrl: this.cfg.rpcUrl, owner, solPrice: this.solPrice,
-        current: this.mode === 'paper' ? this.liveHeld : this.positions,
+        current,
         priceOf: async (mint) => {
           const px = await this.m.prices([mint]);
           return px[mint] || this.candidates.get(mint)?.priceUsd || 0;
         },
         metaOf: (mint) => this.candidates.get(mint),
       });
-      this.liveHeld = r.positions.map((x: Position) => ({ ...x, book: 'live' as const }));
+      this.liveHeld = r.positions.map((x: Position) => ({ ...x, book: 'live' as const, liveManaged: true }));
       this.store.setBook('live', 'positions', this.liveHeld);
       if (this.mode !== 'paper') this.positions = this.liveHeld;
+      if (this.liveWallet) this.store.setBook('live', 'wallet', this.liveWallet);
       this.repairDepositBaseline();
       this.persist();
       if (r.added) this.log('Core', 'info', `reconciled ${r.added} on-chain position(s); monitoring resumes`);
+      this.emit('positions', this.positionsView());
+      this.emitState();
     } catch (e: any) {
       this.log('Core', 'info', `reconcile skipped: ${e?.message || e}`);
     }
@@ -1645,6 +1856,7 @@ export class Engine extends EventEmitter {
       onchainUsd: onchain != null ? onchain * (this.solPrice || 0) : null,
       onchainUsdc: usdc.ui,
       onchainUsdcUsd: usdc.ui,
+      ...(() => { const s = this.onchainSummary(); return { onchainTokenUsd: s.onchainTokenUsd, onchainTokenUnknown: s.onchainTokenUnknown, onchainTotalUsd: (onchain != null ? onchain * (this.solPrice || 0) : 0) + usdc.ui + s.onchainTokenUsd }; })(),
       autoSwapUsdc: this.mode !== 'paper',
       network: 'solana',
       solPrice: this.solPrice,
@@ -1727,14 +1939,41 @@ export class Engine extends EventEmitter {
     const k = dayKey();
     if (this.wallet.dayKey !== k) { this.wallet.dayKey = k; this.wallet.dayStartEquity = this.equity(); if (this.solPrice) this.solDayOpen = this.solPrice; this.saveWallet(); }
   }
+  onchainSummary() {
+    const bag = this.mode === 'paper' ? this.liveHeld : this.positions;
+    let tokenUsd = 0, unknown = 0;
+    for (const pos of bag) {
+      if (pos.priceUnknown || !(pos.lastPrice > 0)) unknown++;
+      else tokenUsd += pos.qty * pos.lastPrice;
+    }
+    const sol = this.mode === 'paper'
+      ? (this.liveWallet?.realSol ?? this.liveWallet?.solBalance ?? null)
+      : (this.wallet.realSol ?? this.wallet.solBalance ?? null);
+    const usdc = this.usdcBal?.ui || 0;
+    const solUsd = (sol || 0) * (this.solPrice || 0);
+    return {
+      onchainSol: sol,
+      onchainSolUsd: sol != null ? solUsd : null,
+      onchainTokenUsd: tokenUsd,
+      onchainTokenUnknown: unknown,
+      onchainUsdc: usdc,
+      onchainUsdcUsd: usdc,
+      onchainTotalUsd: solUsd + usdc + tokenUsd,
+    };
+  }
   positionsView() {
-    const paper = this.mode === 'paper' ? this.positions : [];
-    const primary = this.mode === 'paper' ? paper : this.positions;
-    const view = (p: Position, live: boolean) => ({
-      ...p, book: live ? 'live' as const : (p.book || this.book), liveManaged: live,
-      valueUsd: p.qty * p.lastPrice, pnlPct: p.entryPrice ? (p.lastPrice / p.entryPrice - 1) * 100 : 0,
-      stop: activeStop(this.cfg, p),
-    });
+    const paper = this.mode === 'paper' ? this.positions : this.paperHeld;
+    const primary = this.mode === 'paper' ? this.positions : this.positions;
+    const view = (p: Position, live: boolean) => {
+      const unknown = !!p.priceUnknown || !(p.lastPrice > 0);
+      return {
+        ...p, book: live ? 'live' as const : (p.book || this.book), liveManaged: live,
+        priceUnknown: unknown,
+        valueUsd: unknown ? null : p.qty * p.lastPrice,
+        pnlPct: unknown || !p.entryPrice ? null : (p.lastPrice / p.entryPrice - 1) * 100,
+        stop: activeStop(this.cfg, p),
+      };
+    };
     const out = primary.map((p) => view(p, this.isLiveBookPos(p)));
     if (this.mode === 'paper') {
       const ids = new Set(out.map((p) => p.id));
@@ -1773,8 +2012,10 @@ export class Engine extends EventEmitter {
     const low = this.wallet.connected ? lowBalanceReason(this.equity(), this.cashUsd(), reserveUsd, this.cfg.minTradeUsd, this.usdcBal?.ui || 0) : null;
     const adapted = this.riskAdapted();
     const botPub = botPublicKey();
+    const onchain = this.onchainSummary();
     return {
-      appName: this.cfg.appName, mode: this.mode,
+      appName: this.cfg.appName, mode: this.mode, rev: ++this.snapRev,
+      liveEntriesArmed: this.liveEntriesArmed,
       modeReason: this.mode === 'paper'
         ? (gate.live
           ? `TEST mode — paper book only. Live is armed; ${this.liveHeld.length} live position(s) stay open and still exit on-chain. No new live buys until you switch back.`
@@ -1808,9 +2049,10 @@ export class Engine extends EventEmitter {
         lockedBy: this.withdrawLockedBy(),
         lockMessage: this.lockedWithdrawTo() ? '' : LOCK_MESSAGE('YOUR_PHANTOM_ADDRESS'),
         usdc: this.usdcBal.ui,
-        onchainSol: this.wallet.realSol ?? this.wallet.solBalance,
+        onchainSol: onchain.onchainSol ?? this.liveWallet?.realSol ?? this.wallet.realSol ?? this.wallet.solBalance,
         autoSwapUsdc: this.mode !== 'paper',
       } : null,
+      ...onchain,
     };
   }
   equitySeries(range: string) {

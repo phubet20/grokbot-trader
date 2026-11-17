@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useLive, api } from './api';
 import { placeholderSnap } from './boot';
 import { Splash } from './components/Splash';
@@ -29,13 +29,12 @@ export default function App() {
   useEffect(() => { localStorage.setItem('theme', theme); document.documentElement.dataset.theme = theme; document.querySelector('meta[name=theme-color]')?.setAttribute('content', theme === 'dark' ? '#000000' : '#ffffff'); }, [theme]);
   useEffect(() => { if (snap?.appName) document.title = snap.appName; }, [snap?.appName]);
   useEffect(() => { if (toasts.some((t) => t.kind === 'profit')) setFire((f) => f + 1); }, [toasts]);
-  const autoResumed = useRef(false);
   useEffect(() => {
-    if (autoResumed.current || !live || !liveSnap) return;
-    autoResumed.current = true;
-    if (!liveSnap.wallet?.running) api('bot/run', { running: true }).catch(() => {});
-  }, [live, liveSnap]);
-  useEffect(() => { if (live && liveSnap && stage === 'app' && !liveSnap.wallet.connected && !q.get('skip')) setStage('connect'); }, [live, liveSnap, stage]);
+    // Never auto-start, auto-arm LIVE, or change mode just because the app opened or polled.
+    if (!live || !liveSnap || stage !== 'app' || q.get('skip')) return;
+    if (liveSnap.mode !== 'paper' && (liveSnap.botWallet?.publicKey || liveSnap.wallet?.connected)) return;
+    if (!liveSnap.wallet?.connected) setStage('connect');
+  }, [live, liveSnap, stage]);
   // ?toast=1 replays the latest winning paper trade as a take-profit toast (for demos/screenshots)
   useEffect(() => {
     if (!q.get('toast')) return;

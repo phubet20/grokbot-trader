@@ -87,10 +87,17 @@ export async function rebuildPositions(opts: {
   for (const h of holdings) {
     if (have.has(h.mint)) continue;
     const px = await opts.priceOf(h.mint).catch(() => 0);
-    if (!(px > 0)) { skipped++; continue; }
-    const hist = await estimateEntryFromHistory(opts.rpcUrl, h.ata, opts.solPrice);
-    const entry = hist?.entryPrice || px;
-    const estimated = !hist || hist.estimated || !!(hist && Math.abs(hist.entryPrice - px) / px > 5);
+    const priceUnknown = !(px > 0);
+    // Always keep the holding, even when the price feed 429s or returns 0.
+    let hist: { entryPrice: number; openedAt: number; estimated: boolean } | null = null;
+    try {
+      hist = await Promise.race([
+        estimateEntryFromHistory(opts.rpcUrl, h.ata, opts.solPrice),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+      ]);
+    } catch { hist = null; }
+    const entry = (hist?.entryPrice && hist.entryPrice > 0) ? hist.entryPrice : (px > 0 ? px : 0);
+    const estimated = !hist || hist.estimated || !!(hist && px > 0 && Math.abs(hist.entryPrice - px) / px > 5);
     const meta = opts.metaOf?.(h.mint) || {};
     const pos: Reconciled = {
       id: 'recon-' + h.mint.slice(0, 16),
@@ -98,10 +105,11 @@ export async function rebuildPositions(opts: {
       name: meta.name || meta.symbol || 'on-chain', image: meta.image,
       openedAt: hist?.openedAt || Date.now(),
       entryPrice: entry, qty: h.qty, decimals: h.decimals,
-      costUsd: entry * h.qty, costSol: opts.solPrice > 0 ? (entry * h.qty) / opts.solPrice : 0,
-      peakPrice: Math.max(entry, px), lastPrice: px, score: 0, rentSol: 0.002,
-      reconciled: true, entryEstimated: !hist || estimated,
+      costUsd: entry > 0 ? entry * h.qty : 0, costSol: (entry > 0 && opts.solPrice > 0) ? (entry * h.qty) / opts.solPrice : 0,
+      peakPrice: Math.max(entry, px || 0), lastPrice: px || 0, score: 0, rentSol: 0.002,
+      reconciled: true, entryEstimated: !hist || estimated, priceUnknown,
     };
+    if (priceUnknown) skipped++; // counted as priced-unknown, not dropped
     incoming.push(pos);
     have.add(h.mint);
     added++;

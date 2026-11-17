@@ -84,7 +84,7 @@ const server = createServer(async (req, res) => {
     }
     if (p === '/api/state') { void engine.maybeReconcile(); return json(200, engine.snapshot()); }
     if (p === '/api/funds') return json(200, await engine.fundsView());
-    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
+    if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo(), liveEntriesArmed: !!(engine as any).liveEntriesArmed });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
     if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt, mode: engine.mode, book: engine.book });
     if (p === '/api/trades') return json(200, store.trades(500, engine.book));
@@ -102,7 +102,8 @@ const server = createServer(async (req, res) => {
       if (p === '/api/mode') {
         const raw = String(b.mode || '');
         const next = raw === 'paper' || raw === 'test' ? 'paper' : raw === 'live' ? 'live' : 'live-auto';
-        return json(200, await engine.setRuntimeMode(next));
+        const r = await engine.setRuntimeMode(next);
+        return json(200, { ...r, snap: r.snap || engine.snapshot() });
       }
       if (p === '/api/config') { updateConfig(b); engine.emitState(); return json(200, { ...config, liveConfirm: undefined }); }
       if (p === '/api/reset') { engine.reset(); return json(200, { ok: true }); }

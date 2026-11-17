@@ -38,14 +38,19 @@ export function useLive() {
   const [live, setLive] = useState(false);
   const tid = useRef(1);
   const retry = useRef<() => void>(() => {});
+  const lastRev = useRef(0);
   useEffect(() => {
     let es: EventSource | null = null;
     let stop = false;
     let backoff = 0;
     let esTimer: ReturnType<typeof setTimeout> | undefined;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
-    const apply = (d: Snap) => {
+    const apply = (d: Snap, opts?: { fromUser?: boolean }) => {
       if (!d || typeof d !== 'object') return;
+      if (typeof d.rev === 'number') {
+        if (!opts?.fromUser && d.rev < lastRev.current) return; // stale poll must not bounce LIVE back to TEST
+        lastRev.current = d.rev;
+      }
       setSnap(d);
       saveSnapCache(d);
       setOnline(true);
@@ -53,6 +58,11 @@ export function useLive() {
       setLive(true);
       backoff = 0;
     };
+    const onUserSnap = (ev: Event) => {
+      const d = (ev as CustomEvent).detail;
+      if (d) apply(d, { fromUser: true });
+    };
+    window.addEventListener('grokbot:snap', onUserSnap);
     const wakeServer = () => {
       const url = healthzUrl();
       if (!url) return;
@@ -102,7 +112,7 @@ export function useLive() {
     pullState();
     connectEs();
     pollTimer = setInterval(() => { if (stop) return; pullState(); wakeServer(); }, 4000);
-    return () => { stop = true; es?.close(); if (esTimer) clearTimeout(esTimer); if (pollTimer) clearInterval(pollTimer); };
+    return () => { stop = true; es?.close(); if (esTimer) clearTimeout(esTimer); if (pollTimer) clearInterval(pollTimer); window.removeEventListener('grokbot:snap', onUserSnap); };
   }, []);
   return { snap, setSnap, toasts, setToasts, approvals, setApprovals, online, waking, live, retry: () => retry.current() };
 }

@@ -56,12 +56,12 @@ export function Balance({ snap }: { snap: any }) {
         <span className="mult mono">{s.multiplier.toFixed(2)}×</span>
       </div>
       <div className="mono small bal-line"><span className={s.pnlUsd >= 0 ? 'pos' : 'neg'}>{sUsd(s.pnlUsd)} ({pct(s.pnlPct, 2)}) · {s.wins}W {s.losses}L</span><span className="muted">{hhmm(Date.now())}</span></div>
-      {snap.mode !== 'paper' && (
-        <div className="mono small muted" data-testid="onchain-breakdown">
-          {(s.solBalance ?? snap.wallet?.solBalance ?? 0).toFixed(4)} SOL
-          {typeof s.usdc === 'number' ? ` · ${Number(s.usdc).toFixed(2)} USDC` : ''}
-        </div>
-      )}
+      <div className="mono small muted" data-testid="onchain-total">
+        On-chain {usd(snap.onchainTotalUsd)} · {(snap.onchainSol ?? snap.botWallet?.onchainSol ?? snap.liveOverlay?.sol ?? 0).toFixed?.(4) ?? Number(snap.onchainSol || 0).toFixed(4)} SOL
+        {Number(snap.onchainTokenUsd) > 0 ? ` + ${usd(snap.onchainTokenUsd)} tokens` : ''}
+        {Number(snap.onchainUsdc) > 0 ? ` + ${Number(snap.onchainUsdc).toFixed(2)} USDC` : ''}
+        {Number(snap.onchainTokenUnknown) > 0 ? ` · ${snap.onchainTokenUnknown} price unknown` : ''}
+      </div>
     </div>
   );
 }
@@ -184,7 +184,7 @@ export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => 
           <button type="button" className="act-main" onClick={() => onOpen(p.mint)}>
             <TokenAvatar src={p.image} symbol={p.symbol} size={30} />
             <div className="act-mid"><b>{p.symbol}</b>{(p.liveManaged || p.book === 'live') && snap.mode === 'paper' ? <span className="live-tag" data-testid="live-position-tag">LIVE</span> : null}<div className="muted tiny">{p.liveManaged || p.book === 'live' && snap.mode === 'paper' ? 'on-chain · still managed' : p.stop?.kind === 'trailing' ? 'trailing' : 'stop'}{p.stop?.level && p.entryPrice ? ` at ${((p.stop.level / p.entryPrice - 1) * 100).toFixed(1)}%` : ''} · {hm(p.openedAt)}</div></div>
-            <div className="act-right"><b>{usd(p.valueUsd)}</b><div className={`tiny ${p.pnlPct >= 0 ? 'pos' : 'neg'}`}>{pct(p.pnlPct)}</div></div>
+            <div className="act-right">{p.priceUnknown ? <b data-testid="price-unknown">price unknown</b> : <><b>{usd(p.valueUsd)}</b><div className={`tiny ${p.pnlPct >= 0 ? 'pos' : 'neg'}`}>{pct(p.pnlPct)}</div></>}</div>
           </button>
           <button type="button" className="close-pos" data-testid={`close-${p.symbol}`} disabled={!!closing} onClick={(e) => closeOne(p, e)}>
             {closing === p.id ? 'Closing…' : 'Close'}
