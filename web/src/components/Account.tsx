@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, usd, short } from '../api';
 import { BotWalletPanel } from './BotWallet';
 import { NotifyPanel } from './NotifyPanel';
+import { ModeBadge, ModeToggle } from './ModeToggle';
 
 const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of free cash)', 1, 50, 1],
@@ -24,7 +25,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
   return (
     <div className="page">
       <div className="section card">
-        <div className="sec-hd"><b>Wallet</b><span className={`chip mono ${snap.mode === 'live' ? 'chip-live' : 'chip-test'}`}>{snap.mode === 'live' ? 'LIVE' : 'TEST MODE'}</span></div>
+        <div className="sec-hd"><b>Wallet</b><ModeBadge snap={snap} /></div>
         <div className="kv mono small"><span className="muted">type</span><span>{w.type}</span></div>
         <div className="kv mono small"><span className="muted">address</span><span>{short(w.address)}</span></div>
         <div className="kv mono small"><span className="muted">cash</span><span>{w.solBalance.toFixed(4)} SOL · {usd(snap.stats.cashUsd)}{snap.mode !== 'paper' && typeof snap.stats.usdc === 'number' ? ` · ${Number(snap.stats.usdc).toFixed(2)} USDC` : ''}</span></div>
@@ -35,6 +36,7 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
         {snap.lowBalance && <p className="note neg" data-testid="low-balance">{snap.lowBalance}</p>}
         <div className="btn-row">
           <button className="pill-btn small-btn" data-testid="bot-toggle" onClick={() => api('bot/run', { running: !w.running })}>{w.running ? 'Stop bot' : 'Start bot'}</button>
+          <ModeToggle snap={snap} />
           <button className="pill-btn small-btn ghost" data-testid="restart-bot-account" title="Restart loops and rescan now. Does not wipe positions or the withdraw lock." onClick={() => api('bot/restart', {})}>Restart bot / rescan</button>
           <button className="pill-btn small-btn ghost" onClick={onRecap}>Night recap</button>
         </div>
@@ -61,11 +63,11 @@ export function Account({ snap, onRecap, onDisconnected }: { snap: any; onRecap:
       </div>
       <div className="section card">
         <div className="sec-hd"><b>{snap.mode === 'paper' ? 'Go live (later)' : 'Live status'}</b></div>
-        <p className="small muted">{snap.mode === 'live-auto' ? 'LIVE AUTO is on: the bot wallet signs swaps. Withdrawals go only to the locked Phantom address. The app never shows or asks for a private key.' : snap.mode === 'live' ? 'LIVE (Phantom): every swap still needs your approval in Phantom. No private keys are stored.' : 'Real trading is locked unless the owner sets MODE=live or MODE=live-auto plus LIVE_CONFIRM and restarts.'}</p>
+        <p className="small muted">{snap.mode === 'live-auto' ? 'LIVE is on: the bot wallet signs real swaps. Withdrawals go only to the locked Phantom address. Switch to TEST anytime to practice with a separate paper book — open live positions stay managed on-chain.' : snap.mode === 'live' ? 'LIVE (Phantom): every swap still needs your approval in Phantom. No private keys are stored.' : (snap.liveArmed || snap.canSwitchLive) ? 'TEST mode: paper balances, trades, and the equity curve are separate from live. Open live positions stay open and still exit on-chain. Use Switch to LIVE (confirm) when you want real-money entries again.' : 'Real trading is locked unless the owner sets MODE=live or MODE=live-auto plus LIVE_CONFIRM on the host.'}</p>
       </div>
       {snap.mode === 'paper' && <div className="section card">
         <div className="sec-hd"><b>Reset paper book</b></div>
-        <p className="tiny muted">This is the only way to wipe paper positions, trades, equity, and learning. Leaving the app, reloading, or tapping Connect will not reset.</p>
+        <p className="tiny muted">Resets the TEST book only (virtual balance, paper positions, paper trades, paper chart). Live positions, live history, the withdraw lock, and shared learning are not touched. Default fresh balance is about 1 SOL at the current price (or the amount you set on Connect).</p>
         <div className="btn-row">
           <button className="pill-btn small-btn ghost" data-testid="reset-paper-book" onClick={async () => { if (confirm('Reset the paper book? This deletes all paper positions, trades, equity and learning. This cannot be undone.')) { await api('paper/reset', {}); onDisconnected(); } }}>Reset paper book</button>
           <button className="pill-btn small-btn ghost" onClick={async () => { await api('wallet/disconnect', {}); onDisconnected(); }}>Disconnect</button>

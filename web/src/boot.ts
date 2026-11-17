@@ -1,7 +1,11 @@
 /** Splash and boot helpers. The splash never waits on the network. */
 
 export const SPLASH_MS = 1500;
-export const SNAP_CACHE_KEY = 'grokbot.snap.v2';
+export const SNAP_CACHE_KEY = 'grokbot.snap.v3.live';
+export const LAST_MODE_KEY = 'grokbot.lastMode';
+export function snapCacheKey(mode?: string) {
+  return mode === 'paper' ? 'grokbot.snap.v3.paper' : 'grokbot.snap.v3.live';
+}
 
 export function splashProgress(elapsedMs: number, durationMs = SPLASH_MS): number {
   return Math.min(1, Math.max(0, elapsedMs / durationMs));
@@ -15,7 +19,8 @@ export function splashShouldFinish(elapsedMs: number, tapped: boolean, durationM
 export function loadSnapCache(): any | null {
   try {
     if (typeof localStorage === 'undefined') return null;
-    const raw = localStorage.getItem(SNAP_CACHE_KEY);
+    const last = localStorage.getItem(LAST_MODE_KEY) || undefined;
+    const raw = localStorage.getItem(snapCacheKey(last));
     if (!raw) return null;
     const snap = JSON.parse(raw);
     return snap && typeof snap === 'object' ? snap : null;
@@ -43,7 +48,9 @@ export function saveSnapCache(snap: any) {
       scan: snap.scan,
       cachedAt: Date.now(),
     };
-    localStorage.setItem(SNAP_CACHE_KEY, JSON.stringify(slim));
+    const mode = snap.mode === 'paper' ? 'paper' : 'live';
+    localStorage.setItem(LAST_MODE_KEY, mode);
+    localStorage.setItem(snapCacheKey(mode), JSON.stringify(slim));
   } catch { /* quota / private mode */ }
 }
 

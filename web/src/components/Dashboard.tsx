@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, usd, pct, hm, hhmm, sUsd, compact } from '../api';
 import { LineChart } from './Charts';
+import { ModeBadge, ModeToggle } from './ModeToggle';
 import { BotIcon, TokenAvatar, BellI, SunI, MoonI, WalletI } from './Icons';
 
 const RANGES = ['LIVE', '1H', '4H', '1D', '1W', 'ALL'];
@@ -19,7 +20,8 @@ export function Header({ snap, theme, setTheme, onRecap }: any) {
       <div style={{ flex: 1 }} />
       <button className="icon-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="theme">{theme === 'dark' ? <SunI size={19} /> : <MoonI size={19} />}</button>
       <button className="icon-btn" onClick={onRecap} aria-label="recap"><BellI size={19} /></button>
-      <span className={`live-pill ${snap.wallet.running ? '' : 'off'} ${snap.mode === 'paper' ? 'test' : 'real'}`} title={snap.modeReason}><i />{!snap.wallet.running ? 'Paused' : snap.mode === 'live-auto' ? 'Live auto' : snap.mode === 'live' ? 'Live $' : 'Live · test'}</span>
+      <ModeBadge snap={snap} />
+      <ModeToggle snap={snap} compact />
       <button className="pill-btn small-btn ghost" data-testid="restart-bot" title="Restart loops and rescan now. Does not wipe positions or the withdraw lock." onClick={() => api('bot/restart', {})}>Restart / rescan</button>
     </div>
   );
@@ -139,7 +141,10 @@ export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => 
   };
   const closeAll = async () => {
     if (closing || closingAll) return;
-    if (!window.confirm(`Sell all ${pos.length} open position${pos.length === 1 ? '' : 's'} now? Each coin is sold. In paper this uses simulated fills; in live/live-auto it sends real swaps.`)) return;
+    const n = (snap.mode === 'paper' ? pos.filter((x: any) => x.book !== 'live' && !x.liveManaged) : pos).length;
+    if (!window.confirm(snap.mode === 'paper'
+      ? `Sell all ${n} TEST position${n === 1 ? '' : 's'} now? LIVE positions stay open and keep being managed on-chain.`
+      : `Sell all ${n} open position${n === 1 ? '' : 's'} now? This sends real swaps.`)) return;
     setClosingAll(true);
     setErr('');
     setAllResults(null);
@@ -178,7 +183,7 @@ export function Positions({ snap, onOpen }: { snap: any; onOpen: (m: string) => 
         <div key={p.id} className="act-row" data-testid={`position-row-${p.symbol}`}>
           <button type="button" className="act-main" onClick={() => onOpen(p.mint)}>
             <TokenAvatar src={p.image} symbol={p.symbol} size={30} />
-            <div className="act-mid"><b>{p.symbol}</b><div className="muted tiny">{p.stop?.kind === 'trailing' ? 'trailing' : 'stop'} at {((p.stop.level / p.entryPrice - 1) * 100).toFixed(1)}% · {hm(p.openedAt)}</div></div>
+            <div className="act-mid"><b>{p.symbol}</b>{(p.liveManaged || p.book === 'live') && snap.mode === 'paper' ? <span className="live-tag" data-testid="live-position-tag">LIVE</span> : null}<div className="muted tiny">{p.liveManaged || p.book === 'live' && snap.mode === 'paper' ? 'on-chain · still managed' : p.stop?.kind === 'trailing' ? 'trailing' : 'stop'}{p.stop?.level && p.entryPrice ? ` at ${((p.stop.level / p.entryPrice - 1) * 100).toFixed(1)}%` : ''} · {hm(p.openedAt)}</div></div>
             <div className="act-right"><b>{usd(p.valueUsd)}</b><div className={`tiny ${p.pnlPct >= 0 ? 'pos' : 'neg'}`}>{pct(p.pnlPct)}</div></div>
           </button>
           <button type="button" className="close-pos" data-testid={`close-${p.symbol}`} disabled={!!closing} onClick={(e) => closeOne(p, e)}>

@@ -87,8 +87,8 @@ const server = createServer(async (req, res) => {
     if (p === '/api/health') return json(200, { ok: true, mode: engine.mode, dataSource: market.name, solPrice: engine.solPrice, calls: market.calls, errors: market.errors, lastError: market.lastError, running: engine.wallet.running, connected: engine.wallet.connected, keepalive: keepaliveSnapshot(), push: { enabled: pushEnabled(), subscribers: subscriberCount() }, scan: engine.scanStatus(), pump: (market as any).pumpStatus ? (market as any).pumpStatus() : undefined, autoStart: process.env.AUTO_START || '0', withdrawLocked: !!engine.lockedWithdrawTo() });
     if (p === '/api/equity') return json(200, engine.equitySeries(url.searchParams.get('range') || 'ALL'));
     if (p === '/api/recap') return json(200, { ...engine.stats(), repos: 3, agents: 5, since: engine.wallet.startedAt });
-    if (p === '/api/trades') return json(200, store.trades(500));
-    if (p === '/api/activity') return json(200, store.activity(Number(url.searchParams.get('limit')) || 200));
+    if (p === '/api/trades') return json(200, store.trades(500, engine.book));
+    if (p === '/api/activity') return json(200, store.activity(Number(url.searchParams.get('limit')) || 200, engine.book));
     if (p.startsWith('/api/token/')) return json(200, await engine.tokenDetail(decodeURIComponent(p.slice(11)), url.searchParams.get('tf') || '1m'));
     if (p === '/api/push/vapid') return json(200, { enabled: pushEnabled(), publicKey: vapidPublicKey() || '', subscribers: subscriberCount() });
     if (req.method === 'POST') {
@@ -98,6 +98,11 @@ const server = createServer(async (req, res) => {
       if (p === '/api/wallet/disconnect') { engine.disconnect(); return json(200, { ok: true }); }
       if (p === '/api/bot/run') { engine.setRunning(!!b.running); return json(200, { ok: true }); }
       if (p === '/api/bot/restart') { return json(200, engine.restartTrading()); }
+      if (p === '/api/mode') {
+        const raw = String(b.mode || '');
+        const next = raw === 'paper' || raw === 'test' ? 'paper' : raw === 'live' ? 'live' : 'live-auto';
+        return json(200, await engine.setRuntimeMode(next));
+      }
       if (p === '/api/config') { updateConfig(b); engine.emitState(); return json(200, { ...config, liveConfirm: undefined }); }
       if (p === '/api/reset') { engine.reset(); return json(200, { ok: true }); }
       if (p === '/api/paper/reset') { engine.reset(); return json(200, { ok: true }); }

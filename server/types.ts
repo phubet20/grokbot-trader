@@ -68,6 +68,8 @@ export type Position = {
   lastPrice: number;
   score: number;
   rentSol: number;         // token-account rent locked while open
+  book?: 'paper' | 'live';
+  liveManaged?: boolean;
   reconciled?: boolean;
   entryEstimated?: boolean;
   adds?: number;

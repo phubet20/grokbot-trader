@@ -278,6 +278,11 @@ export class AutoTune {
     this.updatedAt = Date.now();
   }
 
+  /** Drop mark-to-market ticks on a mode switch so paper and live equity are not mixed. */
+  resetEquityWindow() {
+    this.eqTicks = [];
+  }
+
   /** Track equity even between closes so the governor can see a stall mid-session. */
   observeEquity(eq: number, ts = Date.now()) {
     if (!(eq > 0)) return;

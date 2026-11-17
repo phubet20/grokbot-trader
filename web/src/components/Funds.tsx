@@ -114,6 +114,7 @@ export function Funds({ snap }: { snap: any }) {
       <div className="page-title"><WalletI size={28} /> Funds</div>
 
       <div className="section card">
+        {paper && <p className="note">TEST book is virtual and separate from the on-chain bot wallet below. Live positions, if any, stay on-chain and are still managed.</p>}
         <div className="sec-hd"><b>Deposit</b><span className="chip mono">{paper ? 'PAPER' : snap.mode.toUpperCase()}</span></div>
         <p className="tiny muted">Send SOL or USDC (SPL) to the bot wallet on the <b>Solana</b> network only. ERC-20 / Tron / other-chain USDC will not arrive. FOMO withdrawals as Solana USDC are supported.</p>
         <div className="bot-wallet-row">
