@@ -8,6 +8,7 @@ const FIELDS: [string, string, number, number, number][] = [
   ['positionPct', 'Position size (% of free cash)', 1, 50, 1],
   ['takeProfitPct', 'Take profit (% net after fees/slip)', 0.5, 50, 0.5],
   ['hardStopPct', 'Catastrophic stop (% below entry)', 10, 80, 1],
+  ['redExitSec', 'Sell a red position after (seconds)', 15, 180, 5],
   ['trailingStopPct', 'Trailing stop (% from top)', 2, 60, 0.5],
   ['dailyLossLimitPct', 'Daily loss limit (%)', 1, 100, 1],
   ['maxHoldMin', 'Max hold (minutes)', 5, 1440, 5],

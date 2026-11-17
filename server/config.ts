@@ -23,6 +23,7 @@ export type Config = {
   hardStopPct: number;         // exit if price drops this % below entry
   trailingStopPct: number;     // exit if price drops this % from the peak
   maxHoldMin: number;          // exit stale positions after N minutes
+  redExitSec: number;          // sell a red position after this many seconds (TEST and LIVE)
   dailyLossLimitPct: number;   // pause new buys after losing this % of day-start equity
   cooldownMin: number;         // don't re-buy the same token for N minutes after exit
   minScore: number;            // analyst score needed to buy (0-100)
@@ -57,6 +58,7 @@ export const DEFAULTS: Config = {
   hardStopPct: 35,
   trailingStopPct: 60,
   maxHoldMin: 0,
+  redExitSec: 45,
   dailyLossLimitPct: 15,
   cooldownMin: 0.25,
   minScore: 48,
@@ -111,6 +113,7 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   if (out.maxPositions !== undefined) out.maxPositions = Math.min(1000, Math.max(0, Math.round(out.maxPositions)));
   if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0, out.takeProfitPct));
   if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(80, Math.max(1, out.hardStopPct));
+  if (out.redExitSec !== undefined) out.redExitSec = Math.min(180, Math.max(15, Math.round(out.redExitSec)));
   if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(80, Math.max(2, out.trailingStopPct));
   if (out.mode !== undefined && out.mode !== 'live' && out.mode !== 'live-auto') out.mode = 'paper';
   if (out.dataSource !== undefined && out.dataSource !== 'replay') out.dataSource = 'live';

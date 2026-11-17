@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AutoTune } from '../server/autotune.ts';
-import { pathSimilarity, pumpPathBoost, isStalePosition, isDeadPosition, staleExitSec, DEAD_EXIT_SEC, type PaperPriors, type PathVec } from '../server/priors.ts';
+import { pathSimilarity, pumpPathBoost, pumpPotential, isQuickRedExit, isStalePosition, isDeadPosition, staleExitSec, DEAD_EXIT_SEC, type PaperPriors, type PathVec } from '../server/priors.ts';
 
 const winner: PathVec = { volAccel: 1.8, buyRatio: 0.65, chM5: 10, chM15: 16, buyers: 22 };
 const priors: PaperPriors = {
@@ -74,4 +74,29 @@ test('isDeadPosition sells losers that went quiet for ~12 minutes', () => {
   assert.equal(isDeadPosition({ ...down, lastPrice: 1.02 }), false);
   assert.equal(isDeadPosition({ ...down, openedAt: now - 60_000 }), false);
   assert.equal(isDeadPosition({ ...down, volumeM5: 400, txM5: 20 }), false);
+});
+
+test('isQuickRedExit sells a red position after the hold window, sooner if it is dragging the book', () => {
+  const now = 8_000_000;
+  const red = { openedAt: now - 50_000, entryPrice: 1, lastPrice: 0.98, now, redExitSec: 45 };
+  assert.equal(isQuickRedExit(red), true);
+  assert.equal(isQuickRedExit({ ...red, lastPrice: 1.01 }), false);
+  assert.equal(isQuickRedExit({ ...red, openedAt: now - 20_000 }), false);
+  const drag = isQuickRedExit({ ...red, openedAt: now - 30_000, lastPrice: 0.97, equity: 90, deposit: 100, redExitSec: 45 });
+  assert.equal(drag, true);
+});
+
+test('pumpPotential ranks stronger volume+path tapes into higher x10/x100/x1000 tiers', () => {
+  const weak: any = { change: { m5: 1.5, m15: 2, h1: 2 }, volume: { m5: 200, h1: 2000 }, txns: { m5b: 6, m5s: 5 }, flow: { netBuySol: 0.1 } };
+  const mid: any = { change: { m5: 5, m15: 8, h1: 8 }, volume: { m5: 4000, h1: 18000 }, txns: { m5b: 20, m5s: 8 }, flow: { netBuySol: 0.8 } };
+  const strong: any = {
+    change: { m5: 8, m15: 14, h1: 14 }, volume: { m5: 12000, h1: 20000 }, txns: { m5b: 40, m5s: 10 },
+    flow: { netBuySol: 2 }, curve: { progress: 0.3, vSol: 40, vTokens: 1, graduated: false },
+  };
+  const a = pumpPotential(weak, [], priors);
+  const b = pumpPotential(mid, [], priors);
+  const c = pumpPotential(strong, [], { ...priors, winnerPaths: [{ volAccel: 7.2, buyRatio: 0.8, chM5: 8, chM15: 14, buyers: 40 }] });
+  assert.ok(b.score >= a.score, `mid ${b.score} vs weak ${a.score}`);
+  assert.ok(c.tier >= 10, `strong tier ${c.tier}`);
+  assert.ok([0, 10, 100, 1000].includes(c.tier));
 });

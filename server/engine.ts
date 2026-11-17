@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { Config } from './config.ts';
 import { liveGate } from './config.ts';
-import { loadPaperPriors, pumpPathBoost, staleExitSec, isStalePosition, isDeadPosition, DEAD_EXIT_SEC, type PaperPriors } from './priors.ts';
+import { loadPaperPriors, pumpPathBoost, pumpPotential, isQuickRedExit, staleExitSec, isStalePosition, isDeadPosition, DEAD_EXIT_SEC, type PaperPriors } from './priors.ts';
 import type { MarketSource } from './market.ts';
 import { SOL_MINT } from './market.ts';
 import type { Candidate, Position, ClosedTrade, ActivityItem } from './types.ts';
@@ -846,6 +846,13 @@ export class Engine extends EventEmitter {
           c.score = clampScore(c.score + path.boost);
           (c as any)._pathBoost = path.boost;
         }
+        const pot = pumpPotential(c, hist, this.priors);
+        (c as any)._tier = pot.tier;
+        (c as any)._potential = pot.score;
+        if (pot.tier) {
+          c.score = clampScore(c.score + (pot.tier === 1000 ? 6 : pot.tier === 100 ? 4 : 2));
+          (c as any)._sig = (c as any)._sig || pot.reason;
+        }
       }
       const scored = recent
         .filter((c) => {
@@ -859,7 +866,13 @@ export class Engine extends EventEmitter {
           this.noteReject(`score ${c.score} < ${minScore}`, c.mint);
           return false;
         })
-        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .sort((a, b) => {
+          const ta = Number((a as any)._tier || 0), tb = Number((b as any)._tier || 0);
+          if (tb !== ta) return tb - ta;
+          const pa = Number((a as any)._potential || 0), pb = Number((b as any)._potential || 0);
+          if (pb !== pa) return pb - pa;
+          return (b.score || 0) - (a.score || 0);
+        })
         .slice(0, 20);
       if (!scored.length) return;
       const reserveUsd = this.exitReserveUsd(true);
@@ -1105,7 +1118,7 @@ export class Engine extends EventEmitter {
       const now = Date.now();
       const adapted = this.riskAdapted();
       const gov = this.tuner.governor(this.cfg.takeProfitPct ?? 3);
-      const target = this.mode === 'paper' ? gov.tpPct : 0;
+      const target = this.cfg.takeProfitPct ?? gov.tpPct ?? 3;
       const tpOpts = {
         extraSlippageBps: this.cfg.extraSlippageBps,
         swapFeeBps: SWAP_FEE_BPS,
@@ -1125,7 +1138,7 @@ export class Engine extends EventEmitter {
         const markNet = estimatedNetPnlPct(p, px, tpOpts);
         if (target > 0 && markNet >= target) { tpMarks.push({ p, markNet }); continue; }
         const hist = this.mintHist.get(p.mint) || [];
-        const posTarget = this.isLiveBookPos(p) ? 0 : target;
+        const posTarget = target;
         const d = liveExit({ ...p, peakPrice: p.peakPrice }, px, fresh, hist, {
           catStopPct: this.cfg.hardStopPct,
           sensitivity: this.isLiveBookPos(p) ? 1 : this.tuner.exitSensitivity,
@@ -1141,6 +1154,13 @@ export class Engine extends EventEmitter {
         await poolRun(tpMarks, 3, async ({ p, markNet }) => {
           if (this.selling.has(p.id)) return;
           const quoted = await this.quotedNetPnlPct(p);
+          // Live always attempts the on-chain sell once the target is reached.
+          if (this.isLiveBookPos(p)) {
+            const net = (quoted != null && quoted >= target) ? quoted : markNet;
+            if (net < target) return;
+            await this.closePosition(p, 'take_profit', `take profit +${net.toFixed(1)}% net (target +${target}%)`, 1);
+            return;
+          }
           const realistic = this.cfg.realisticPaper !== false;
           if (realistic) {
             // Only close when a real sell quote is in profit. No mark fallback.
@@ -1167,6 +1187,20 @@ export class Engine extends EventEmitter {
           if (!conf.ok && fromEntry < 1) {
             void this.closePosition(p, 'momentum_fade', `no thrust within ${gov.earlyCutSec}s of entry`, 1);
           }
+        }
+      }
+      const redSec = this.cfg.redExitSec || 45;
+      const eqNow = this.equity();
+      const dep = this.wallet.depositUsd || 0;
+      for (const p of [...bag]) {
+        if (this.selling.has(p.id)) continue;
+        if (isQuickRedExit({
+          openedAt: p.openedAt, entryPrice: p.entryPrice, lastPrice: p.lastPrice, now,
+          redExitSec: redSec, equity: eqNow, deposit: dep,
+        })) {
+          const fromEntry = p.entryPrice ? (p.lastPrice / p.entryPrice - 1) * 100 : 0;
+          const held = Math.round((now - p.openedAt) / 1000);
+          void this.closePosition(p, 'time_stop', `red ${held}s · ${fromEntry.toFixed(1)}%, rotating into stronger pumps`, 1);
         }
       }
       const staleSec = staleExitSec(this.priors);

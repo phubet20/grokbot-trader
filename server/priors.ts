@@ -109,6 +109,52 @@ export function pumpPathBoost(c: Candidate, hist: TapeSnap[], priors: PaperPrior
   return { boost, best };
 }
 
+/** Rank how close a tape is to a 10x / 100x / 1000x pre-pump path. Higher tier first. */
+export type PumpTier = 0 | 10 | 100 | 1000;
+export function pumpPotential(c: Candidate, hist: TapeSnap[], priors: PaperPriors | null): { tier: PumpTier; score: number; best: number; reason: string } {
+  const path = pumpPathBoost(c, hist, priors);
+  const m5 = c.change?.m5 || 0;
+  const m15 = c.change?.m15 || 0;
+  const buys = c.txns?.m5b || 0, sells = c.txns?.m5s || 0;
+  const r5 = buys + sells > 0 ? buys / (buys + sells) : 0;
+  const vol5 = c.volume?.m5 || 0;
+  const volAccel = (c.volume?.h1 || 0) > 0 ? (vol5 * 12) / c.volume.h1 : (vol5 > 0 ? 1.2 : 0);
+  const net = (buys - sells) > 0 || (c.flow?.netBuySol || 0) > 0;
+  let power = 0;
+  if (path.best >= 0.9) power += 3;
+  else if (path.best >= 0.82) power += 2;
+  else if (path.best >= 0.72) power += 1;
+  if (volAccel >= 2.5 && r5 >= 0.62 && m5 >= 3 && net) power += 3;
+  else if (volAccel >= 1.6 && r5 >= 0.58 && m5 >= 2 && net) power += 2;
+  else if (m5 >= 1.2 && net) power += 1;
+  if (c.curve && !c.curve.graduated && (c.flow?.netBuySol || 0) > 0 && m5 >= 0) power += 1;
+  if (m15 >= 8 && m5 >= m15 * 0.4 && net) power += 1;
+  const tier: PumpTier = power >= 6 ? 1000 : power >= 4 ? 100 : power >= 2 ? 10 : 0;
+  const score = path.boost + power * 3 + Math.max(0, m5) * 0.15 + path.best * 4;
+  const label = tier ? `x${tier} path` : 'pump path';
+  return { tier, score, best: path.best, reason: label };
+}
+
+/** Any red position held past redExitSec. Dragging the book red exits a bit sooner. */
+export function isQuickRedExit(opts: {
+  openedAt: number;
+  entryPrice: number;
+  lastPrice: number;
+  now: number;
+  redExitSec: number;
+  equity?: number;
+  deposit?: number;
+}): boolean {
+  if (!(opts.entryPrice > 0) || !(opts.lastPrice > 0)) return false;
+  const fromEntry = (opts.lastPrice / opts.entryPrice - 1) * 100;
+  if (fromEntry >= 0) return false;
+  const held = (opts.now - opts.openedAt) / 1000;
+  const drag = (opts.deposit || 0) > 0 && (opts.equity || 0) < opts.deposit! && fromEntry <= -0.5;
+  const need = drag ? Math.max(20, opts.redExitSec * 0.6) : opts.redExitSec;
+  return held >= need;
+}
+
+
 export function staleExitSec(priors: PaperPriors | null, _governorTight = false): number {
   const d = priors?.staleExit?.defaultSec || DEFAULT_STALE_SEC;
   const lo = priors?.staleExit?.minSec || 90;

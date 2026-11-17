@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, usd, short } from '../api';
 import { BotIcon, PhantomIcon, CheckI, XI } from './Icons';
 
@@ -22,6 +22,7 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   const [address, setAddress] = useState<string>(snap?.wallet?.address || '');
   const initialUsd = Math.max(2, Number(snap?.stats?.equity || snap?.wallet?.depositUsd || snap?.config?.startUsd || 81) || 81);
   const [startUsd, setStartUsd] = useState<number>(initialUsd);
+  const editedUsd = useRef(false);
   const [pv, setPv] = useState<any>(null);
   const [state, setState] = useState<'idle' | 'busy' | 'done'>('idle');
   const [ready, setReady] = useState(false);
@@ -29,6 +30,12 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
   const [browse, setBrowse] = useState('');
 
   useEffect(() => { setBrowse(phantomBrowseUrl()); }, []);
+
+  useEffect(() => {
+    if (editedUsd.current || isLive) return;
+    const cur = Number(snap?.stats?.equity || snap?.wallet?.depositUsd || 0);
+    if (cur >= 2) setStartUsd(Math.max(2, Math.round(cur)));
+  }, [isLive, snap?.stats?.equity, snap?.wallet?.depositUsd]);
 
   useEffect(() => {
     const type = isLive ? 'phantom' : 'paper';
@@ -87,11 +94,11 @@ export function ConnectSheet({ snap, onStart }: { snap: any; onStart: () => void
         </div>
         {!isLive && (
           <label className="start-usd mono"><span className="muted">test balance (min $2)</span>
-            <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => setStartUsd(Math.max(2, Number(e.target.value) || 2))} data-testid="test-balance-input" /></span>
+            <span className="usd-input">$<input type="number" min={2} step={1} value={startUsd} onChange={(e) => { editedUsd.current = true; setStartUsd(Math.max(2, Number(e.target.value) || 2)); }} data-testid="test-balance-input" /></span>
           </label>
         )}
         {!isLive && hasBook && (
-          <p className="note" data-testid="resume-book-note">A paper book is already saved. Approve with the same amount to resume it. Changing the test balance starts a fresh TEST book. Live is not touched.</p>
+          <p className="note" data-testid="resume-book-note">Test balance is prefilled with the current TEST book. Leave it unchanged to resume, or type a new amount and Approve to start a fresh TEST book at that balance. Live is not touched.</p>
         )}
         {needPhantomApp && (
           <p className="note">Tap <b>Open in Phantom</b> to continue in the Phantom app, then Approve. Never enter a seed phrase here.</p>
