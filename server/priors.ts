@@ -140,10 +140,10 @@ export function isQuickRedExit(opts: {
 }
 
 export function staleExitSec(priors: PaperPriors | null, _governorTight = false): number {
-  // Tight defaults: small books must rotate capital out of flat coins quickly.
-  const d = priors?.staleExit?.defaultSec || DEFAULT_STALE_SEC;
-  const lo = priors?.staleExit?.minSec || 45;
-  const hi = priors?.staleExit?.maxSec || 90;
+  // Hard-cap for small-book scalp: never wait more than 90s on a flat coin.
+  const d = Math.min(90, priors?.staleExit?.defaultSec || DEFAULT_STALE_SEC);
+  const lo = 45;
+  const hi = 90;
   const raw = Math.max(d, 50);
   return Math.max(lo, Math.min(hi, raw));
 }
