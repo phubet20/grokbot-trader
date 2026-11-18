@@ -11,13 +11,13 @@ const root = new URL('..', import.meta.url).pathname;
 const part1Path = join(root, 'server/strategy-part1.ts');
 const part2Path = join(root, 'server/strategy-part2.ts');
 const stratPath = join(root, 'server/strategy.ts');
-const payloadPath = join(root, 'scripts/strategy-payload.json');
-if ((!existsSync(part1Path) || !existsSync(part2Path)) && existsSync(payloadPath)) {
-  const { part1, part2 } = JSON.parse(readFileSync(payloadPath, 'utf8'));
+const p1Payload = join(root, 'scripts/strategy-payload-part1.txt');
+const p2Payload = join(root, 'scripts/strategy-payload-part2.txt');
+if ((!existsSync(part1Path) || !existsSync(part2Path)) && existsSync(p1Payload) && existsSync(p2Payload)) {
   const dec = (b64) => inflateSync(Buffer.from(b64, 'base64')).toString('utf8');
   mkdirSync(join(root, 'server'), { recursive: true });
-  writeFileSync(part1Path, dec(part1));
-  writeFileSync(part2Path, dec(part2));
+  writeFileSync(part1Path, dec(readFileSync(p1Payload, 'utf8').trim()));
+  writeFileSync(part2Path, dec(readFileSync(p2Payload, 'utf8').trim()));
   writeFileSync(stratPath, `// Higher-selectivity entries and structured exits.\n// Risk numbers stay consistent with server/config.ts DEFAULTS.\nexport * from './strategy-part1.ts';\nexport * from './strategy-part2.ts';\n`);
   console.log('[strategy] restored modules with stable defaults (hard 7% / trail 10% / TP 2.5%)');
 }
