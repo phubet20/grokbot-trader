@@ -106,7 +106,6 @@ export function useLive() {
       esTimer = setTimeout(() => { wakeServer(); pullState(); connectEs(); }, backoff);
     };
     retry.current = () => { backoff = 0; wakeServer(); pullState(); connectEs(); };
-    // Immediate wake + first fetch; do not block the UI on this.
     setWaking(!loadSnapCache());
     wakeServer();
     pullState();
@@ -117,8 +116,25 @@ export function useLive() {
   return { snap, setSnap, toasts, setToasts, approvals, setApprovals, online, waking, live, retry: () => retry.current() };
 }
 
-export const usd = (x: number | undefined | null, d = 2) => x === undefined || x === null || !Number.isFinite(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
-export const sUsd = (x: number) => (x >= 0 ? '+' : '-') + '$' + Math.abs(x).toFixed(2);
+function moneyDigits(a: number) {
+  if (!(a > 0)) return 2;
+  if (a < 0.01) return 4;
+  if (a < 1) return 3;
+  return 2;
+}
+
+export const usd = (x: number | undefined | null, d?: number) => {
+  if (x === undefined || x === null || !Number.isFinite(x)) return '—';
+  const dig = d ?? moneyDigits(Math.abs(x));
+  return (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: dig, maximumFractionDigits: dig });
+};
+/** Signed USD for PnL pills — never collapse small wins to +$0.00 */
+export const sUsd = (x: number) => {
+  if (!Number.isFinite(x)) return '+$0.00';
+  const a = Math.abs(x);
+  const d = moneyDigits(a);
+  return (x >= 0 ? '+' : '-') + '$' + a.toFixed(d);
+};
 export const pct = (x: number | undefined | null, d = 1) => x === undefined || x === null || !Number.isFinite(x) ? '—' : (x >= 0 ? '+' : '') + x.toFixed(d) + '%';
 export const compact = (x: number | undefined | null) => {
   if (x === undefined || x === null || !Number.isFinite(x)) return '—';
