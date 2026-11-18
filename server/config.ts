@@ -1,5 +1,6 @@
 // Central configuration. Single source of truth for all risk and runtime params.
 // MODE is "paper" unless explicitly changed AND confirmed (see liveGate()).
+// Paper and live-auto use the SAME entry/exit profile — paper is the dry-run of live.
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -15,18 +16,18 @@ export type Config = {
   mode: 'paper' | 'live' | 'live-auto';
   dataSource: 'live' | 'replay';
   port: number;
-  startUsd: number;            // paper wallet starting balance (USD), min 2
-  positionPct: number;         // % of current portfolio per trade
-  minTradeUsd: number;         // unused as a gate (0); kept for config compat
-  maxPositions: number;        // 0 = unlimited (cash is the only cap)
-  takeProfitPct: number;       // take-profit floor (net %)
-  hardStopPct: number;         // exit if price drops this % below entry
-  trailingStopPct: number;     // exit if price drops this % from the peak
-  maxHoldMin: number;          // exit stale positions after N minutes (0 = disabled)
-  redExitSec: number;          // sell a red position after this many seconds
-  dailyLossLimitPct: number;   // pause new buys after losing this % of day-start equity
-  cooldownMin: number;         // don't re-buy the same token for N minutes after exit
-  minScore: number;            // analyst score needed to buy (0-100)
+  startUsd: number;
+  positionPct: number;
+  minTradeUsd: number;
+  maxPositions: number;
+  takeProfitPct: number;
+  hardStopPct: number;
+  trailingStopPct: number;
+  maxHoldMin: number;
+  redExitSec: number;
+  dailyLossLimitPct: number;
+  cooldownMin: number;
+  minScore: number;
   minLiquidityUsd: number;
   maxLiquidityUsd: number;
   minHolders: number;
@@ -35,22 +36,20 @@ export type Config = {
   minMcapUsd: number;
   maxMcapUsd: number;
   maxTopHolderPct: number;
-  slippageBps: number;         // slippage tolerance passed to Jupiter
-  extraSlippageBps: number;    // extra pessimistic slippage applied to paper fills
-  priorityFeeSol: number;      // per-tx priority fee assumption
+  slippageBps: number;
+  extraSlippageBps: number;
+  priorityFeeSol: number;
   scanIntervalSec: number;
   monitorIntervalSec: number;
   rpcUrl: string;
-  liveConfirm: string;         // must equal LIVE_CONFIRM_PHRASE for live mode
-  realisticPaper: boolean;     // paper TP/close settles on the real sell quote (default)
+  liveConfirm: string;
+  realisticPaper: boolean;
 };
 
 /**
- * Stable defaults (Nov 2026 cleanup).
- * - positionPct 5%: meaningful size without over-concentration
- * - hardStop 7% / trailing 10%: tight enough to limit damage, not so tight that noise stops us out
- * - takeProfit 2.5%: realistic scalp target for meme volatility
- * - maxHoldMin 30: prevent zombie positions
+ * Momentum-scalp defaults (Nov 2026).
+ * Same profile for paper and live-auto: short holds, tight stops, only coins
+ * that are already moving. Tuned for small books that cannot sit in dead coins.
  */
 export const DEFAULTS: Config = {
   appName: 'Grok Bot',
@@ -58,29 +57,29 @@ export const DEFAULTS: Config = {
   dataSource: 'live',
   port: 8787,
   startUsd: 81,
-  positionPct: 5,
+  positionPct: 8,
   minTradeUsd: 0,
   maxPositions: 0,
-  takeProfitPct: 2.5,
-  hardStopPct: 7,
-  trailingStopPct: 10,
-  maxHoldMin: 30,
-  redExitSec: 60,
+  takeProfitPct: 2,
+  hardStopPct: 6,
+  trailingStopPct: 7,
+  maxHoldMin: 8,
+  redExitSec: 35,
   dailyLossLimitPct: 12,
   cooldownMin: 1,
-  minScore: 42,
-  minLiquidityUsd: 1200,
+  minScore: 50,
+  minLiquidityUsd: 3000,
   maxLiquidityUsd: 50_000_000,
-  minHolders: 40,
+  minHolders: 50,
   minAgeMin: 1,
-  maxAgeHours: 48,
-  minMcapUsd: 2_000,
-  maxMcapUsd: 50_000_000,
-  maxTopHolderPct: 22,
+  maxAgeHours: 24,
+  minMcapUsd: 5_000,
+  maxMcapUsd: 30_000_000,
+  maxTopHolderPct: 20,
   slippageBps: 400,
   extraSlippageBps: 50,
   priorityFeeSol: 0.0002,
-  scanIntervalSec: 3,
+  scanIntervalSec: 2,
   monitorIntervalSec: 1,
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   liveConfirm: '',
@@ -123,32 +122,27 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0.5, out.takeProfitPct));
   if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(25, Math.max(3, out.hardStopPct));
   if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(30, Math.max(3, out.trailingStopPct));
-  if (out.redExitSec !== undefined) out.redExitSec = Math.min(180, Math.max(20, Math.round(out.redExitSec)));
+  if (out.redExitSec !== undefined) out.redExitSec = Math.min(180, Math.max(15, Math.round(out.redExitSec)));
   if (out.maxHoldMin !== undefined) out.maxHoldMin = Math.min(120, Math.max(0, Math.round(out.maxHoldMin)));
   if (out.mode !== undefined && out.mode !== 'live' && out.mode !== 'live-auto') out.mode = 'paper';
   if (out.dataSource !== undefined && out.dataSource !== 'replay') out.dataSource = 'live';
   return out;
 }
 
-/**
- * One-time migration: force old conflicting defaults to the new stable set.
- * Only rewrites values that match known-bad previous defaults so user custom
- * settings are preserved.
- */
 export function migrateStockDefaults(file: Partial<Config>): Partial<Config> {
   const out: Partial<Config> = { ...file };
-  // Old ultra-loose stops → new tight defaults
-  if (out.hardStopPct === 35 || out.hardStopPct === 8) out.hardStopPct = DEFAULTS.hardStopPct;
-  if (out.trailingStopPct === 60 || out.trailingStopPct === 12) out.trailingStopPct = DEFAULTS.trailingStopPct;
-  // Old micro-size or 8% → 5%
-  if (out.positionPct === 1 || out.positionPct === 8) out.positionPct = DEFAULTS.positionPct;
-  // Old TP values
-  if (out.takeProfitPct === 1.8 || out.takeProfitPct === 3) out.takeProfitPct = DEFAULTS.takeProfitPct;
-  // Old scan / score
-  if (out.scanIntervalSec === 2.5 || out.scanIntervalSec === 6) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
-  if (out.minScore === 40 || out.minScore === 48) out.minScore = DEFAULTS.minScore;
-  // Ensure time stop is enabled
-  if (out.maxHoldMin === 0) out.maxHoldMin = DEFAULTS.maxHoldMin;
+  if (out.hardStopPct === 35 || out.hardStopPct === 8 || out.hardStopPct === 7) out.hardStopPct = DEFAULTS.hardStopPct;
+  if (out.trailingStopPct === 60 || out.trailingStopPct === 12 || out.trailingStopPct === 10) out.trailingStopPct = DEFAULTS.trailingStopPct;
+  if (out.positionPct === 1 || out.positionPct === 5) out.positionPct = DEFAULTS.positionPct;
+  if (out.takeProfitPct === 1.8 || out.takeProfitPct === 3 || out.takeProfitPct === 2.5) out.takeProfitPct = DEFAULTS.takeProfitPct;
+  if (out.scanIntervalSec === 2.5 || out.scanIntervalSec === 6 || out.scanIntervalSec === 3) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
+  if (out.minScore === 40 || out.minScore === 48 || out.minScore === 42) out.minScore = DEFAULTS.minScore;
+  if (out.maxHoldMin === 0 || out.maxHoldMin === 30) out.maxHoldMin = DEFAULTS.maxHoldMin;
+  if (out.redExitSec === 60 || out.redExitSec === 45) out.redExitSec = DEFAULTS.redExitSec;
+  if (out.minLiquidityUsd === 1200) out.minLiquidityUsd = DEFAULTS.minLiquidityUsd;
+  if (out.minHolders === 40) out.minHolders = DEFAULTS.minHolders;
+  if (out.maxAgeHours === 48) out.maxAgeHours = DEFAULTS.maxAgeHours;
+  if (out.minMcapUsd === 2000) out.minMcapUsd = DEFAULTS.minMcapUsd;
   return out;
 }
 
@@ -164,13 +158,10 @@ if (existsSync(CFG_FILE)) {
   }
 }
 
-// precedence: defaults < config.json < env
 export const config: Config = { ...DEFAULTS, ...sanitize(fileCfg), ...sanitize(fromEnv()) } as Config;
 
 export function updateConfig(patch: Partial<Config>): Config {
   const clean = sanitize(patch);
-  // mode/liveConfirm can never be changed from the HTTP API - only by editing
-  // data/config.json or env + restart (explicit, deliberate action).
   delete (clean as any).mode;
   delete (clean as any).liveConfirm;
   delete (clean as any).port;
@@ -181,7 +172,6 @@ export function updateConfig(patch: Partial<Config>): Config {
   return config;
 }
 
-/** Live trading needs mode=live or live-auto AND the exact confirmation phrase. */
 export function liveGate(c: Config = config): { live: boolean; auto: boolean; reason: string } {
   if (c.mode !== 'live' && c.mode !== 'live-auto')
     return { live: false, auto: false, reason: 'MODE=paper (default). Simulated fills only.' };
