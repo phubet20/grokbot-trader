@@ -41,10 +41,10 @@ and survives restarts.
 
 | agent | logic | data |
 |---|---|---|
-| **SCANNER** | every ~6 s pulls brand-new + trending Solana pools (PumpSwap / pump.fun / Raydium / Meteora) and backs off on 429s | GeckoTerminal, DexScreener, Jupiter recent (public) |
+| **SCANNER** | every ~3 s pulls brand-new + trending Solana pools (PumpSwap / pump.fun / Raydium / Meteora) and backs off on 429s | GeckoTerminal, DexScreener, Jupiter recent (public) |
 | **SAFETY** | rejects: thin liquidity, too young/old, tiny/huge mcap, non-SOL/USDC quote, honeypot pattern (buys but no sells), wash-trading pattern, liq/mcap < 3%, active **mint or freeze authority**, few holders, top-holder concentration, RugCheck "danger" risks. Missing data = reject | RugCheck (public) |
 | **ANALYST** | score 0-100: momentum (5m/15m/1h, blow-off penalty), buy pressure, volume/liquidity, liquidity depth, unique traders. Buys only if the score clears the adaptive floor and 5-minute momentum confirms | pool stats |
-| **RISK** | default size = **8 % of current portfolio**; if that is below the min trade on a **$2–$5** book it uses all spendable SOL minus a fee/rent reserve. One position at a time. Tight hard stop **-5 %**, trailing **6 % from the top**, time stop 20 min, daily loss limit 15 %. After wins size grows slightly (anti-martingale); after losses it shrinks and may pause new entries. Exits immediately when momentum fades. | Jupiter price API (~1 s) |
+| **RISK** | default size = **5 % of current portfolio**; tiny books (≤ $5) use all spendable SOL minus fee/rent reserve. Hard stop **-7 %**, trailing **10 % from the top**, time stop 30 min, daily loss limit 12 %. After wins size grows slightly (anti-martingale); after losses it shrinks. Exits when momentum fades. | Jupiter price API (~1 s) |
 | **EXECUTOR** | TEST: fill at the real **Jupiter quote** (price impact included) − extra slippage − fees; token-account rent is locked while open and reclaimed on sell. LIVE (Phantom): unsigned Jupiter swap that **you approve**. LIVE AUTO: the bot wallet signs and sends (priority fee, dynamic slippage, confirm + retry). Withdrawals go only to a locked destination. | Jupiter quote/swap API |
 
 The paper wallet holds SOL (like a real Phantom wallet), so the $ balance also moves with the SOL price.
@@ -86,13 +86,12 @@ If it sleeps, open the app (or `/healthz`) to wake it, then Start bot again if i
 * **Results will not look like the videos.** The videos show animated, cherry-picked profits ($81 → $2,745).
   Real meme-coin trading loses money most of the time; in our live-data test the first trades were losses.
 * Paper fills use real quotes but can't model MEV/sandwiching, failed or delayed transactions, sudden rugs
-  between price checks, or exact on-chain slippage. Stops are checked every 4 s, so on fast dumps the exit can
-  be well below -8 % (we saw -13 %…-18 %).
+  between price checks, or exact on-chain slippage. Stops are checked every ~1 s, so on fast dumps the exit can
+  still be worse than the hard-stop level.
 * On a $2–$10 book, fees and ATA rent (≈0.002 SOL, refunded on close) are a large share of each trade.
   Fund a little extra SOL so the reserve is covered. Equity is SOL + open positions (not USDC).
 * Live auto signs for real: a bug, a stolen secret, or a bad route can lose the whole bot-wallet balance.
   The withdraw lock only protects withdrawals, not trades. Paper results will look better than live.
-* Stops are checked about every 1 s, but a fast dump can still fill worse than the hard-stop level.
 * Public APIs have rate limits; if they fail the bot simply skips that cycle (errors are shown in Account).
 * The "repos" panel and `git clone` loading text are cosmetic (as in the video); call counters are real.
 * Not financial advice.
@@ -125,11 +124,11 @@ npm start      # เปิด http://127.0.0.1:8787
 * `npm run replay` — โหมดออฟไลน์ ใช้ตลาดจำลอง (กรณีเชื่อม API สาธารณะไม่ได้)
 * ตั้งค่าได้ในแท็บ **Account** หรือไฟล์ `.env` ข้อมูลทั้งหมดเก็บใน `data/` ปิดเปิดใหม่ก็ไม่หาย
 
-## กลยุทธ์
+## กลยุทธ์ (ค่าเสถียร Nov 2026)
 
-* ขนาดไม้เริ่มต้น = **8% ของพอร์ต** ถ้า 8% เล็กกว่าขั้นต่ำของไม้ บนทุน **$2–$5** จะใช้เงินที่ใช้ได้ทั้งหมดหักค่าธรรมเนียม/ค่าเช่าบัญชี
-* ถือทีละ 1 เหรียญ, ตัดขาดทุน **-5%**, trailing **6% จากจุดสูงสุด**, ถือไม่เกิน 20 นาที, ขาดทุนต่อวันเกิน 15% หยุดซื้อใหม่
-* กำไรแล้วค่อยขยายขนาดไม้ (ไม่ถัวเฉลี่ย/ไม่มาร์ติงเกล) ขาดทุนติดกันจะย่อขนาดและพักเข้าไม้ใหม่ หมดแรงขายทันทีแล้วหมุนไปตัวใหม่
+* ขนาดไม้เริ่มต้น = **5% ของพอร์ต** (ทุนเล็ก ≤ $5 จะใช้เงินที่ใช้ได้ทั้งหมดหักค่าธรรมเนียม/ค่าเช่าบัญชี)
+* ตัดขาดทุน **-7%**, trailing **10% จากจุดสูงสุด**, ถือไม่เกิน 30 นาที, ขาดทุนต่อวันเกิน 12% หยุดซื้อใหม่
+* กำไรแล้วค่อยขยายขนาดไม้ (ไม่ถัวเฉลี่ย/ไม่มาร์ติงเกล) ขาดทุนติดกันจะย่อขนาด
 * คัดเหรียญเปิดใหม่เร็ว, ตรวจความปลอดภัย (mint/freeze, สภาพคล่อง, ผู้ถือ, Jupiter ขายกลับได้) แล้วเข้าเมื่อโมเมนตัมยืนยัน
 
 ## การเปลี่ยนเป็นเงินจริง (ทำเมื่อคุณสั่งเท่านั้น)
@@ -145,9 +144,7 @@ npm start      # เปิด http://127.0.0.1:8787
 ## ข้อจำกัด (ตรงไปตรงมา)
 
 * **ผลจริงจะไม่เหมือนในคลิป** คลิปเป็นภาพจำลองที่เลือกเฉพาะช่วงกำไร เหรียญมีมส่วนใหญ่ขาดทุน
-  ในการทดสอบกับตลาดจริงของเรา ไม้แรกๆ ก็ขาดทุน
 * การจำลองใช้ราคาเสนอจริงจาก Jupiter แต่จำลอง MEV, ธุรกรรมล้มเหลว หรือการเทขายฉับพลันไม่ได้ทั้งหมด
-  ตอนราคาร่วงเร็ว จุดตัดขาดทุนอาจหลุดไปที่ -13% ถึง -18%
 * ทุน $2–$10 ค่าธรรมเนียมและค่าเช่าบัญชีโทเคนจะกินสัดส่วนสูง เติม SOL เผื่อค่าธรรมเนียมด้วย
 * โหมด live-auto ใช้เงินจริงทันทีหากเติมกระเป๋าบอท ผลในโหมดทดสอบจะดีกว่าของจริง
 * ไม่ใช่คำแนะนำการลงทุน
