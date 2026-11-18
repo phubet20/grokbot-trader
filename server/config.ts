@@ -1,5 +1,5 @@
-// Central configuration. Everything has a safe default. MODE is "paper" unless
-// explicitly changed AND confirmed (see liveGate()).
+// Central configuration. Single source of truth for all risk and runtime params.
+// MODE is "paper" unless explicitly changed AND confirmed (see liveGate()).
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -19,11 +19,11 @@ export type Config = {
   positionPct: number;         // % of current portfolio per trade
   minTradeUsd: number;         // unused as a gate (0); kept for config compat
   maxPositions: number;        // 0 = unlimited (cash is the only cap)
-  takeProfitPct: number;       // weak-hand scalp floor (net %); runners trail / momentum-break past this
+  takeProfitPct: number;       // take-profit floor (net %)
   hardStopPct: number;         // exit if price drops this % below entry
   trailingStopPct: number;     // exit if price drops this % from the peak
-  maxHoldMin: number;          // exit stale positions after N minutes
-  redExitSec: number;          // sell a red position after this many seconds (TEST and LIVE)
+  maxHoldMin: number;          // exit stale positions after N minutes (0 = disabled)
+  redExitSec: number;          // sell a red position after this many seconds
   dailyLossLimitPct: number;   // pause new buys after losing this % of day-start equity
   cooldownMin: number;         // don't re-buy the same token for N minutes after exit
   minScore: number;            // analyst score needed to buy (0-100)
@@ -45,35 +45,42 @@ export type Config = {
   realisticPaper: boolean;     // paper TP/close settles on the real sell quote (default)
 };
 
+/**
+ * Stable defaults (Nov 2026 cleanup).
+ * - positionPct 5%: meaningful size without over-concentration
+ * - hardStop 7% / trailing 10%: tight enough to limit damage, not so tight that noise stops us out
+ * - takeProfit 2.5%: realistic scalp target for meme volatility
+ * - maxHoldMin 30: prevent zombie positions
+ */
 export const DEFAULTS: Config = {
   appName: 'Grok Bot',
   mode: 'paper',
   dataSource: 'live',
   port: 8787,
   startUsd: 81,
-  positionPct: 1,
+  positionPct: 5,
   minTradeUsd: 0,
   maxPositions: 0,
-  takeProfitPct: 1.8,
-  hardStopPct: 35,
-  trailingStopPct: 60,
-  maxHoldMin: 0,
-  redExitSec: 45,
-  dailyLossLimitPct: 15,
-  cooldownMin: 0.25,
-  minScore: 40,
-  minLiquidityUsd: 800,
+  takeProfitPct: 2.5,
+  hardStopPct: 7,
+  trailingStopPct: 10,
+  maxHoldMin: 30,
+  redExitSec: 60,
+  dailyLossLimitPct: 12,
+  cooldownMin: 1,
+  minScore: 42,
+  minLiquidityUsd: 1200,
   maxLiquidityUsd: 50_000_000,
   minHolders: 40,
-  minAgeMin: 0,
-  maxAgeHours: 0,            // 0 = no age cap (scan new and older tokens)
-  minMcapUsd: 1_000,
-  maxMcapUsd: 500_000_000,
-  maxTopHolderPct: 25,
+  minAgeMin: 1,
+  maxAgeHours: 48,
+  minMcapUsd: 2_000,
+  maxMcapUsd: 50_000_000,
+  maxTopHolderPct: 22,
   slippageBps: 400,
   extraSlippageBps: 50,
   priorityFeeSol: 0.0002,
-  scanIntervalSec: 2.5,
+  scanIntervalSec: 3,
   monitorIntervalSec: 1,
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   liveConfirm: '',
@@ -92,6 +99,8 @@ function fromEnv(): Partial<Config> {
   if (e.START_USD) out.startUsd = Number(e.START_USD);
   if (e.POSITION_PCT) out.positionPct = Number(e.POSITION_PCT);
   if (e.TAKE_PROFIT_PCT) out.takeProfitPct = Number(e.TAKE_PROFIT_PCT);
+  if (e.HARD_STOP_PCT) out.hardStopPct = Number(e.HARD_STOP_PCT);
+  if (e.TRAILING_STOP_PCT) out.trailingStopPct = Number(e.TRAILING_STOP_PCT);
   if (e.RPC_URL) out.rpcUrl = e.RPC_URL;
   if (e.LIVE_CONFIRM) out.liveConfirm = e.LIVE_CONFIRM;
   return out;
@@ -109,26 +118,37 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
     } else if (typeof v === 'string') out[k] = v;
   }
   if (out.startUsd !== undefined) out.startUsd = Math.max(2, out.startUsd);
-  if (out.positionPct !== undefined) out.positionPct = Math.min(100, Math.max(1, out.positionPct));
+  if (out.positionPct !== undefined) out.positionPct = Math.min(25, Math.max(1, out.positionPct));
   if (out.maxPositions !== undefined) out.maxPositions = Math.min(1000, Math.max(0, Math.round(out.maxPositions)));
-  if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0, out.takeProfitPct));
-  if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(80, Math.max(1, out.hardStopPct));
-  if (out.redExitSec !== undefined) out.redExitSec = Math.min(180, Math.max(15, Math.round(out.redExitSec)));
-  if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(80, Math.max(2, out.trailingStopPct));
+  if (out.takeProfitPct !== undefined) out.takeProfitPct = Math.min(50, Math.max(0.5, out.takeProfitPct));
+  if (out.hardStopPct !== undefined) out.hardStopPct = Math.min(25, Math.max(3, out.hardStopPct));
+  if (out.trailingStopPct !== undefined) out.trailingStopPct = Math.min(30, Math.max(3, out.trailingStopPct));
+  if (out.redExitSec !== undefined) out.redExitSec = Math.min(180, Math.max(20, Math.round(out.redExitSec)));
+  if (out.maxHoldMin !== undefined) out.maxHoldMin = Math.min(120, Math.max(0, Math.round(out.maxHoldMin)));
   if (out.mode !== undefined && out.mode !== 'live' && out.mode !== 'live-auto') out.mode = 'paper';
   if (out.dataSource !== undefined && out.dataSource !== 'replay') out.dataSource = 'live';
   return out;
 }
 
-/** Move stock defaults from the pre-restore config to the Nov 17 night
- *  behavior (1% of stack, 1.8% TP floor, 2.5s scan, looser minScore).
- *  Only exact previous defaults are rewritten so user edits stay put. */
+/**
+ * One-time migration: force old conflicting defaults to the new stable set.
+ * Only rewrites values that match known-bad previous defaults so user custom
+ * settings are preserved.
+ */
 export function migrateStockDefaults(file: Partial<Config>): Partial<Config> {
   const out: Partial<Config> = { ...file };
-  if (out.minScore === 48) out.minScore = 40;
-  if (out.positionPct === 8) out.positionPct = 1;
-  if (out.takeProfitPct === 3) out.takeProfitPct = 1.8;
-  if (out.scanIntervalSec === 6) out.scanIntervalSec = 2.5;
+  // Old ultra-loose stops → new tight defaults
+  if (out.hardStopPct === 35 || out.hardStopPct === 8) out.hardStopPct = DEFAULTS.hardStopPct;
+  if (out.trailingStopPct === 60 || out.trailingStopPct === 12) out.trailingStopPct = DEFAULTS.trailingStopPct;
+  // Old micro-size or 8% → 5%
+  if (out.positionPct === 1 || out.positionPct === 8) out.positionPct = DEFAULTS.positionPct;
+  // Old TP values
+  if (out.takeProfitPct === 1.8 || out.takeProfitPct === 3) out.takeProfitPct = DEFAULTS.takeProfitPct;
+  // Old scan / score
+  if (out.scanIntervalSec === 2.5 || out.scanIntervalSec === 6) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
+  if (out.minScore === 40 || out.minScore === 48) out.minScore = DEFAULTS.minScore;
+  // Ensure time stop is enabled
+  if (out.maxHoldMin === 0) out.maxHoldMin = DEFAULTS.maxHoldMin;
   return out;
 }
 
