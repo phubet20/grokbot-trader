@@ -1,25 +1,60 @@
 // Builds the web UI on first start (or if sources are newer than the build).
-// Also restores strategy modules if missing (stable defaults payload).
-import { existsSync, statSync, readdirSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+// If strategy.ts is a barrel-only stub, restore full file from main and patch stable defaults.
+import { existsSync, statSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
-import { inflateSync } from 'node:zlib';
 
 const root = new URL('..', import.meta.url).pathname;
-
-// --- strategy restore (idempotent) ---
-const part1Path = join(root, 'server/strategy-part1.ts');
-const part2Path = join(root, 'server/strategy-part2.ts');
 const stratPath = join(root, 'server/strategy.ts');
-const p1Payload = join(root, 'scripts/strategy-payload-part1.txt');
-const p2Payload = join(root, 'scripts/strategy-payload-part2.txt');
-if ((!existsSync(part1Path) || !existsSync(part2Path)) && existsSync(p1Payload) && existsSync(p2Payload)) {
-  const dec = (b64) => inflateSync(Buffer.from(b64, 'base64')).toString('utf8');
-  mkdirSync(join(root, 'server'), { recursive: true });
-  writeFileSync(part1Path, dec(readFileSync(p1Payload, 'utf8').trim()));
-  writeFileSync(part2Path, dec(readFileSync(p2Payload, 'utf8').trim()));
-  writeFileSync(stratPath, `// Higher-selectivity entries and structured exits.\n// Risk numbers stay consistent with server/config.ts DEFAULTS.\nexport * from './strategy-part1.ts';\nexport * from './strategy-part2.ts';\n`);
-  console.log('[strategy] restored modules with stable defaults (hard 7% / trail 10% / TP 2.5%)');
+
+// --- strategy restore + stable defaults patch ---
+function needsStrategyRestore() {
+  if (!existsSync(stratPath)) return true;
+  const t = readFileSync(stratPath, 'utf8');
+  // Barrel stub or incomplete rewrite
+  if (t.includes("export * from './strategy-part1")) return true;
+  if (!t.includes('export function liveExit')) return true;
+  if (!t.includes('export function firstPullback')) return true;
+  return false;
+}
+
+function patchStableDefaults(src) {
+  // Replace known old STRAT_DEFAULTS risk numbers with stable set.
+  let out = src;
+  out = out.replace(/hardStopPct:\s*3([,\s])/, 'hardStopPct: 7$1');
+  out = out.replace(/trailingStopPct:\s*5([,\s])/, 'trailingStopPct: 10$1');
+  out = out.replace(/takeProfitPct:\s*3([,\s])/, 'takeProfitPct: 2.5$1');
+  out = out.replace(/maxHoldMin:\s*12([,\s])/, 'maxHoldMin: 30$1');
+  out = out.replace(/partialPct:\s*50([,\s])/, 'partialPct: 0$1');
+  out = out.replace(/breakevenAtPct:\s*1\.8([,\s])/, 'breakevenAtPct: 1.5$1');
+  out = out.replace(/minAgeMin:\s*3([,\s])/, 'minAgeMin: 1$1');
+  out = out.replace(/minLiq:\s*12_000/, 'minLiq: 1_200');
+  out = out.replace(/minMcap:\s*8_000/, 'minMcap: 2_000');
+  out = out.replace(/maxMcap:\s*15_000_000/, 'maxMcap: 50_000_000');
+  out = out.replace(/minBuyRatio5:\s*0\.55/, 'minBuyRatio5: 0.52');
+  out = out.replace(/minTx5:\s*8([,\s])/, 'minTx5: 4$1');
+  if (!out.includes('Risk numbers here must stay consistent')) {
+    out = out.replace(
+      '// Used by the engine and the tape backtester so research and production stay aligned.\n',
+      '// Used by the engine and the tape backtester so research and production stay aligned.\n// Risk numbers here must stay consistent with server/config.ts DEFAULTS.\n'
+    );
+  }
+  return out;
+}
+
+if (needsStrategyRestore()) {
+  try {
+    const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
+    const src = execSync(`curl -fsSL --max-time 30 ${JSON.stringify(url)}`, { encoding: 'utf8', maxBuffer: 5_000_000 });
+    if (src && src.includes('export function liveExit')) {
+      writeFileSync(stratPath, patchStableDefaults(src));
+      console.log('[strategy] restored from main and patched stable defaults (hard 7% / trail 10% / TP 2.5%)');
+    } else {
+      console.warn('[strategy] download did not look valid; left existing file');
+    }
+  } catch (e) {
+    console.warn('[strategy] restore failed:', e?.message || e);
+  }
 }
 
 // --- web build ---
