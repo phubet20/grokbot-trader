@@ -7,19 +7,16 @@ import { join } from 'node:path';
 const root = new URL('..', import.meta.url).pathname;
 const stratPath = join(root, 'server/strategy.ts');
 
-// --- strategy restore + stable defaults patch ---
 function needsStrategyRestore() {
   if (!existsSync(stratPath)) return true;
   const t = readFileSync(stratPath, 'utf8');
-  // Barrel stub or incomplete rewrite
-  if (t.includes("export * from './strategy-part1")) return true;
+  if (t.includes("export * from './strategy-part")) return true;
   if (!t.includes('export function liveExit')) return true;
   if (!t.includes('export function firstPullback')) return true;
   return false;
 }
 
 function patchStableDefaults(src) {
-  // Replace known old STRAT_DEFAULTS risk numbers with stable set.
   let out = src;
   out = out.replace(/hardStopPct:\s*3([,\s])/, 'hardStopPct: 7$1');
   out = out.replace(/trailingStopPct:\s*5([,\s])/, 'trailingStopPct: 10$1');
@@ -45,7 +42,12 @@ function patchStableDefaults(src) {
 if (needsStrategyRestore()) {
   try {
     const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
-    const src = execSync(`curl -fsSL --max-time 30 ${JSON.stringify(url)}`, { encoding: 'utf8', maxBuffer: 5_000_000 });
+    let src = '';
+    try {
+      src = execSync(`curl -fsSL --max-time 30 '${url}'`, { encoding: 'utf8', maxBuffer: 5_000_000 });
+    } catch {
+      src = await (await fetch(url)).text();
+    }
     if (src && src.includes('export function liveExit')) {
       writeFileSync(stratPath, patchStableDefaults(src));
       console.log('[strategy] restored from main and patched stable defaults (hard 7% / trail 10% / TP 2.5%)');
@@ -60,6 +62,7 @@ if (needsStrategyRestore()) {
 // --- web build ---
 const dist = join(root, 'web/dist/index.html');
 function newest(dir) {
+  if (!existsSync(dir)) return 0;
   let t = 0;
   for (const f of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, f.name);
@@ -67,7 +70,10 @@ function newest(dir) {
   }
   return t;
 }
-const needs = !existsSync(dist) || newest(join(root, 'web/src')) > statSync(dist).mtimeMs;
+let needs = !existsSync(dist);
+if (!needs && existsSync(join(root, 'web/src'))) {
+  try { needs = newest(join(root, 'web/src')) > statSync(dist).mtimeMs; } catch { needs = true; }
+}
 if (needs) {
   if (!existsSync(join(root, 'web/node_modules'))) execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
   console.log('[build] building web UI...');
