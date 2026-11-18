@@ -42,12 +42,7 @@ function patchStableDefaults(src) {
 if (needsStrategyRestore()) {
   try {
     const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
-    let src = '';
-    try {
-      src = execSync(`curl -fsSL --max-time 30 '${url}'`, { encoding: 'utf8', maxBuffer: 5_000_000 });
-    } catch {
-      src = await (await fetch(url)).text();
-    }
+    const src = execSync(`curl -fsSL --max-time 30 '${url}'`, { encoding: 'utf8', maxBuffer: 5_000_000 });
     if (src && src.includes('export function liveExit')) {
       writeFileSync(stratPath, patchStableDefaults(src));
       console.log('[strategy] restored from main and patched stable defaults (hard 7% / trail 10% / TP 2.5%)');
@@ -70,11 +65,11 @@ function newest(dir) {
   }
   return t;
 }
-let needs = !existsSync(dist);
-if (!needs && existsSync(join(root, 'web/src'))) {
-  try { needs = newest(join(root, 'web/src')) > statSync(dist).mtimeMs; } catch { needs = true; }
+let needsBuild = !existsSync(dist);
+if (!needsBuild && existsSync(join(root, 'web/src'))) {
+  try { needsBuild = newest(join(root, 'web/src')) > statSync(dist).mtimeMs; } catch { needsBuild = true; }
 }
-if (needs) {
+if (needsBuild) {
   if (!existsSync(join(root, 'web/node_modules'))) execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
   console.log('[build] building web UI...');
   execSync('npx vite build', { cwd: join(root, 'web'), stdio: 'inherit' });
