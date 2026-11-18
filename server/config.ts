@@ -129,10 +129,11 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
   return out;
 }
 
+/** Only rewrite known stock defaults from older builds — never overwrite intentional custom values. */
 export function migrateStockDefaults(file: Partial<Config>): Partial<Config> {
   const out: Partial<Config> = { ...file };
-  if (out.hardStopPct === 35 || out.hardStopPct === 8 || out.hardStopPct === 7) out.hardStopPct = DEFAULTS.hardStopPct;
-  if (out.trailingStopPct === 60 || out.trailingStopPct === 12 || out.trailingStopPct === 10) out.trailingStopPct = DEFAULTS.trailingStopPct;
+  if (out.hardStopPct === 35 || out.hardStopPct === 8) out.hardStopPct = DEFAULTS.hardStopPct;
+  if (out.trailingStopPct === 60 || out.trailingStopPct === 10) out.trailingStopPct = DEFAULTS.trailingStopPct;
   if (out.positionPct === 1 || out.positionPct === 5) out.positionPct = DEFAULTS.positionPct;
   if (out.takeProfitPct === 1.8 || out.takeProfitPct === 3 || out.takeProfitPct === 2.5) out.takeProfitPct = DEFAULTS.takeProfitPct;
   if (out.scanIntervalSec === 2.5 || out.scanIntervalSec === 6 || out.scanIntervalSec === 3) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
