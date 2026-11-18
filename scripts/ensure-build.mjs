@@ -97,6 +97,81 @@ function patchEnginePause(src) {
   return src;
 }
 
+/** Sell each coin as soon as its own TP/exit fires — do not batch TPs. */
+function patchEngineImmediateSell(src) {
+  if (src.includes('Sell each coin independently')) return src;
+  const oldLoop = `        if (d.exit && d.kind === 'take_profit') { tpMarks.push({ p, markNet }); continue; }
+        if (d.exit && d.partial) { void this.closePosition(p, d.kind!, d.reason, partialFrac); continue; }
+        if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);
+      }
+      // Prefer a live sell quote, but if it fails or times out, close on the mark-based net.
+      if (tpMarks.length) {
+        await poolRun(tpMarks, 3, async ({ p, markNet }) => {
+          if (this.selling.has(p.id)) return;
+          const quoted = await this.quotedNetPnlPct(p);
+          // Live always attempts the on-chain sell once the target is reached.
+          if (this.isLiveBookPos(p)) {
+            const net = (quoted != null && quoted >= target) ? quoted : markNet;
+            if (net < target) return;
+            await this.closePosition(p, 'take_profit', \`take profit +\${net.toFixed(1)}% net (target +\${target}%)\`, 1);
+            return;
+          }
+          const realistic = this.cfg.realisticPaper !== false;
+          if (realistic) {
+            // Only close when a real sell quote is in profit. No mark fallback.
+            if (quoted == null || quoted < target) return;
+            await this.closePosition(p, 'take_profit', \`take profit +\${quoted.toFixed(1)}% net (quote, target +\${target}%)\`, 1);
+            return;
+          }
+          const useQuote = quoted != null && quoted >= target;
+          const net = useQuote ? quoted! : markNet;
+          if (net < target) return;
+          const how = useQuote ? 'quote' : 'mark';
+          await this.closePosition(p, 'take_profit', \`take profit +\${net.toFixed(1)}% net (\${how}, target +\${target}%)\`, 1);
+        });
+      }`;
+  // Use non-template form matching source file literally
+  const oldA = "        if (d.exit && d.kind === 'take_profit') { tpMarks.push({ p, markNet }); continue; }\n        if (d.exit && d.partial) { void this.closePosition(p, d.kind!, d.reason, partialFrac); continue; }\n        if (d.exit) void this.closePosition(p, d.kind!, d.reason, 1);";
+  const newA = "        // Sell each coin independently as soon as its own exit fires (no TP batching).\n        if (d.exit && d.partial) { void this.closePosition(p, d.kind!, d.reason, partialFrac); continue; }\n        if (d.exit) { void this.closePosition(p, d.kind!, d.reason, 1); continue; }\n        // Immediate mark TP: fire sell for this coin only, right now.\n        if (markNet >= target) { void this.closePosition(p, 'take_profit', `take profit +${markNet.toFixed(1)}% net (target +${target}%)`, 1); }";
+  if (!src.includes(oldA)) return src;
+  let out = src.replace(oldA, newA);
+  // Neutralize the old batch block so it becomes a no-op if still present
+  out = out.replace(
+    /if \(tpMarks\.length\) \{[\s\S]*?await poolRun\(tpMarks, 3, async \(\{ p, markNet \}\) => \{[\s\S]*?\}\);\s*\}/,
+    '/* tpMarks batch removed — each coin sells independently above */'
+  );
+  return out;
+}
+
+/** Quiet push: only profitable sells (and optional buy count is handled in push.ts). */
+function patchEngineNotify(src) {
+  if (src.includes('notify only profitable sells')) return src;
+  let out = src;
+  // SELL notify: only when pnl > 0
+  out = out.replace(
+    "void notifyTrade({ side: 'SELL', symbol: p.symbol, sizeUsd: proceedsUsd, price: exitPrice, pnlPct: t.pnlPct });",
+    "// notify only profitable sells\nif (pnlUsd > 0) void notifyTrade({ side: 'SELL', symbol: p.symbol, sizeUsd: proceedsUsd, price: exitPrice, pnlPct: t.pnlPct, pnlUsd });"
+  );
+  // BUY notify: suppress per-fill spam (push.ts can still expose buy count via state)
+  out = out.replace(
+    /void notifyTrade\(\{ side: 'BUY', symbol: c\.symbol, sizeUsd: [^}]+\}\);/g,
+    "/* buy push suppressed — UI shows buy count */"
+  );
+  out = out.replace(
+    /void notifyTrade\(\{ side: 'BUY', symbol: c\.symbol, sizeUsd: costSol \* this\.solPrice, price \}\);/g,
+    "/* buy push suppressed */"
+  );
+  return out;
+}
+
+function applyEnginePatches(src) {
+  let out = src;
+  out = patchEnginePause(out);
+  out = patchEngineImmediateSell(out);
+  out = patchEngineNotify(out);
+  return out;
+}
+
 async function restoreStrategy() {
   if (!needsStrategyRestore()) return;
   const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
@@ -109,14 +184,21 @@ async function restoreStrategy() {
 }
 
 async function restoreEngine() {
-  if (!needsEngineRestore()) return;
-  const res = await fetch(ENGINE_RAW, { signal: AbortSignal.timeout(45000) });
-  if (!res.ok) throw new Error('engine HTTP ' + res.status);
-  let src = await res.text();
-  if (!src.includes('Orchestrates the 5 agents')) throw new Error('unexpected engine content');
-  src = patchEnginePause(src);
-  writeFileSync(enginePath, src);
-  console.log('[engine] restored from known-good commit and pause behavior patched');
+  let src;
+  if (needsEngineRestore()) {
+    const res = await fetch(ENGINE_RAW, { signal: AbortSignal.timeout(45000) });
+    if (!res.ok) throw new Error('engine HTTP ' + res.status);
+    src = await res.text();
+    if (!src.includes('Orchestrates the 5 agents')) throw new Error('unexpected engine content');
+    console.log('[engine] downloaded known-good engine');
+  } else {
+    src = readFileSync(enginePath, 'utf8');
+  }
+  const patched = applyEnginePatches(src);
+  if (patched !== src || needsEngineRestore()) {
+    writeFileSync(enginePath, patched);
+    console.log('[engine] written with pause + immediate per-coin sell + quiet profit push');
+  }
 }
 
 function buildWeb() {
