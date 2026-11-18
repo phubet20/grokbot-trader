@@ -1,5 +1,5 @@
 // Builds the web UI on first start (or if sources are newer than the build).
-// If strategy.ts is a barrel-only stub, restore full file from main and patch stable defaults.
+// If strategy.ts is incomplete, restore from main and patch stable defaults.
 import { existsSync, statSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -39,38 +39,43 @@ function patchStableDefaults(src) {
   return out;
 }
 
-if (needsStrategyRestore()) {
-  try {
-    const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
-    const src = execSync(`curl -fsSL --max-time 30 '${url}'`, { encoding: 'utf8', maxBuffer: 5_000_000 });
-    if (src && src.includes('export function liveExit')) {
-      writeFileSync(stratPath, patchStableDefaults(src));
-      console.log('[strategy] restored from main and patched stable defaults (hard 7% / trail 10% / TP 2.5%)');
-    } else {
-      console.warn('[strategy] download did not look valid; left existing file');
-    }
-  } catch (e) {
-    console.warn('[strategy] restore failed:', e?.message || e);
-  }
+async function restoreStrategy() {
+  if (!needsStrategyRestore()) return;
+  const url = 'https://raw.githubusercontent.com/phubet20/grokbot-trader/main/server/strategy.ts';
+  const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const src = await res.text();
+  if (!src.includes('export function liveExit')) throw new Error('unexpected strategy content');
+  writeFileSync(stratPath, patchStableDefaults(src));
+  console.log('[strategy] restored from main and patched stable defaults (hard 7% / trail 10% / TP 2.5%)');
 }
 
-// --- web build ---
-const dist = join(root, 'web/dist/index.html');
-function newest(dir) {
-  if (!existsSync(dir)) return 0;
-  let t = 0;
-  for (const f of readdirSync(dir, { withFileTypes: true })) {
-    const p = join(dir, f.name);
-    t = Math.max(t, f.isDirectory() ? newest(p) : statSync(p).mtimeMs);
+function buildWeb() {
+  const dist = join(root, 'web/dist/index.html');
+  function newest(dir) {
+    if (!existsSync(dir)) return 0;
+    let t = 0;
+    for (const f of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, f.name);
+      t = Math.max(t, f.isDirectory() ? newest(p) : statSync(p).mtimeMs);
+    }
+    return t;
   }
-  return t;
-}
-let needsBuild = !existsSync(dist);
-if (!needsBuild && existsSync(join(root, 'web/src'))) {
-  try { needsBuild = newest(join(root, 'web/src')) > statSync(dist).mtimeMs; } catch { needsBuild = true; }
-}
-if (needsBuild) {
-  if (!existsSync(join(root, 'web/node_modules'))) execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
+  let needsBuild = !existsSync(dist);
+  if (!needsBuild && existsSync(join(root, 'web/src'))) {
+    try { needsBuild = newest(join(root, 'web/src')) > statSync(dist).mtimeMs; } catch { needsBuild = true; }
+  }
+  if (!needsBuild) return;
+  if (!existsSync(join(root, 'web/package.json'))) {
+    console.warn('[build] web/package.json missing; skip UI build');
+    return;
+  }
+  if (!existsSync(join(root, 'web/node_modules'))) {
+    execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
+  }
   console.log('[build] building web UI...');
   execSync('npx vite build', { cwd: join(root, 'web'), stdio: 'inherit' });
 }
+
+await restoreStrategy().catch((e) => console.warn('[strategy] restore failed:', e?.message || e));
+buildWeb();
