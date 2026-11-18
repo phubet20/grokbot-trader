@@ -1,5 +1,6 @@
 // Higher-selectivity entries and structured exits (take-profit, partial, breakeven).
 // Used by the engine and the tape backtester so research and production stay aligned.
+// Risk numbers here must stay consistent with server/config.ts DEFAULTS.
 import type { Candidate } from './types.ts';
 
 export type TapeSnap = {
@@ -47,45 +48,44 @@ export type StratParams = {
   exitSlipPct: number;
 };
 
+/**
+ * Aligned with config.ts DEFAULTS (Nov 2026 stability cleanup).
+ * hardStop 7%, trailing 10%, takeProfit 2.5%, maxHold 30m.
+ */
 export const STRAT_DEFAULTS: StratParams = {
-  // "balanced" profile: first-snapshot entry (no watch/pullback wait),
-  // modest extra filters vs the fastest profile. Walk-forward on a 66-minute
-  // live tape did not reach >80% WR; this set had the better frequency/WR
-  // trade-off among those tested (see backtest notes).
-  minAgeMin: 3,
+  minAgeMin: 1,
   maxAgeHours: 48,
-  minLiq: 12_000,
-  maxLiq: 2_000_000,
-  minMcap: 8_000,
-  maxMcap: 15_000_000,
+  minLiq: 1_200,
+  maxLiq: 50_000_000,
+  minMcap: 2_000,
+  maxMcap: 50_000_000,
   minTraders: 20,
-  minBuyRatio5: 0.55,
+  minBuyRatio5: 0.52,
   maxBuyRatio5: 0.93,
-  minTx5: 8,
-  minM15: 1,
-  minM5: -2,
-  maxM5: 18,
-  maxH1: 70,
+  minTx5: 4,
+  minM15: 0,
+  minM5: -3,
+  maxM5: 25,
+  maxH1: 80,
   minHistTicks: 1,
   lookback: 8,
   pullbackMinPct: 0,
   pullbackMaxPct: 100,
   holdFloorPct: 20,
   minImpulsePct: 0,
-  maxTickVolPct: 12,
-  minLiqGrowthPct: -25,
-  takeProfitPct: 3,
-  partialPct: 50,
-  breakevenAtPct: 1.8,
-  hardStopPct: 3,
-  trailingStopPct: 5,
-  maxHoldMin: 12,
+  maxTickVolPct: 15,
+  minLiqGrowthPct: -30,
+  takeProfitPct: 2.5,
+  partialPct: 0,           // full exit preferred for small books
+  breakevenAtPct: 1.5,
+  hardStopPct: 7,
+  trailingStopPct: 10,
+  maxHoldMin: 30,
   entrySlipPct: 0.6,
   exitSlipPct: 0.6,
 };
 
 export function toSnap(t: number, c: any): TapeSnap {
-  // Accept either Candidate or compact tape row
   if (c.m || c.ch) {
     const ch = c.ch || [];
     const vo = c.vo || [];
@@ -131,9 +131,6 @@ export function entryReason(hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, n
   if (c.h1 > p.maxH1) return { ok: false, reason: 'already pumped' };
   if (c.mc > 0 && c.liq / c.mc < 0.025) return { ok: false, reason: 'thin liq/mcap' };
 
-  // Path-dependent checks only apply when enough history exists AND the
-  // params ask for them. Defaults (minImpulse/pullback = 0, minHistTicks = 1)
-  // enter immediately on a qualifying snapshot.
   const window = hist.slice(-p.lookback);
   const prices = window.map((x) => x.px).filter((x) => x > 0);
   if (prices.length >= 2) {
@@ -178,22 +175,16 @@ export function matchEntryPatterns(c: Candidate, hist: TapeSnap[], p: StratParam
   if (s.m5 > 80 && unique < 10) return { ok: false, reason: 'blow-off' };
 
   const onCurve = !!c.curve && !c.curve.graduated;
-  const volBurst = s.liq > 0 ? s.vol5 / s.liq : (s.vol5 > 0 ? 1 : 0);
   const risingBuyers = unique >= 3 || (hist.length >= 2 && unique > (hist[0].tr || 0));
 
-  // 1. fresh-launch burst
   if (ageMin <= 8 && (onCurve || c.source === 'pumpportal' || c.dex === 'pump') && (s.b5 + s.s5 >= 1 || (flow?.netBuySol || 0) > 0) && r5 >= 0.52 && risingBuyers)
     return { ok: true, reason: `fresh-launch burst · ${ageMin.toFixed(1)}m · r5 ${(r5 * 100).toFixed(0)}%` };
-  // 2. bonding-curve breakout
   if (onCurve && progress >= 0.12 && progress < 0.72 && vel > 0.02 && r5 >= 0.52 && unique >= 4)
     return { ok: true, reason: `curve breakout · ${(progress * 100).toFixed(0)}% · vel ${vel.toFixed(2)}` };
-  // 3. near-graduation run
   if (onCurve && progress >= 0.72 && r5 >= 0.52 && (flow?.largeSells || 0) === 0)
     return { ok: true, reason: `near-graduation · ${(progress * 100).toFixed(0)}%` };
-  // 4. post-graduation breakout
   if (c.curve?.graduated && ageMin <= 45 && r5 >= 0.55 && (s.b5 + s.s5) >= 6 && s.liq >= Math.min(p.minLiq, 4000))
     return { ok: true, reason: `post-graduation breakout · r5 ${(r5 * 100).toFixed(0)}%` };
-  // 5. dip-buy after a whale buy
   const whale = flow?.whaleBuyUsd || 0;
   if (whale >= 30 && hist.length >= 2) {
     const peak = Math.max(...hist.map((x) => x.px).filter((x) => x > 0));
@@ -204,7 +195,6 @@ export function matchEntryPatterns(c: Candidate, hist: TapeSnap[], p: StratParam
   return { ok: false, reason: 'no pattern' };
 }
 
-/** Candidate-shaped entry for the live engine (builds hist from a short in-memory ring). */
 export function liveEntryOk(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()) {
   const snap = toSnap(now, c);
   const h = hist.length ? hist : [snap];
@@ -242,7 +232,7 @@ export function exitReason(pos: PosMark, price: number, p: StratParams, now = Da
   const fromPeak = (price / peak - 1) * 100;
   const beArmed = pos.breakeven || (peak / pos.entryPrice - 1) * 100 >= p.breakevenAtPct;
   const hard = pos.entryPrice * (1 - p.hardStopPct / 100);
-  const beLevel = pos.entryPrice * (1 + (p.exitSlipPct + 0.15) / 100); // arm above entry so a BE fill can still be flat after slippage
+  const beLevel = pos.entryPrice * (1 + (p.exitSlipPct + 0.15) / 100);
   const trail = peak * (1 - p.trailingStopPct / 100);
   const floor = beArmed ? Math.max(hard, beLevel, trail) : hard;
 
@@ -269,7 +259,6 @@ export function momentumFadeStrict(s: TapeSnap): { exit: boolean; reason: string
   return { exit: false, reason: '' };
 }
 
-/** Build coarse OHLC-style candles from in-memory trade ticks (1s / 15s / 1m). */
 export function candlesFromTicks(hist: TapeSnap[], bucketMs: number) {
   if (!hist.length) return [] as { t: number; o: number; h: number; l: number; c: number; buy: number; sell: number }[];
   const out: { t: number; o: number; h: number; l: number; c: number; buy: number; sell: number }[] = [];
@@ -308,7 +297,6 @@ export function buyCandlePattern(hist: TapeSnap[]): { ok: boolean; reason: strin
   return { ok: false, reason: '' };
 }
 
-/** Confirmed dip-then-reclaim: a 3–28% pullback that has already bounced, with buy flow back. Never signals while still falling. */
 export function dipReclaim(hist: TapeSnap[]): { ok: boolean; reason: string; dip?: number } {
   if (hist.length < 3) return { ok: false, reason: '' };
   const last = hist[hist.length - 1];
@@ -338,7 +326,6 @@ export function bigMoneyInflow(c: Candidate, s: TapeSnap): { ok: boolean; reason
   return { ok: false, reason: '' };
 }
 
-/** True for already-listed / trending coins that should wait for timing, not a chase. */
 export function isEstablished(c: Candidate, now = Date.now()): boolean {
   if (c.universe === 'trending') return true;
   const ageMin = (now - (c.createdAt || now)) / 60_000;
@@ -346,7 +333,6 @@ export function isEstablished(c: Candidate, now = Date.now()): boolean {
   return ageMin >= 30;
 }
 
-/** Require buy pressure plus volume/price thrust so we skip dead or immediately-red entries. */
 export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { ok: boolean; reason: string } {
   const s = hist[hist.length - 1] || toSnap(now, c);
   const r5 = buyRatio(s.b5, s.s5);
@@ -355,7 +341,6 @@ export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.
   if (dumping) return { ok: false, reason: 'dumping' };
   const net = (s.b5 - s.s5) > 0 || (c.flow?.netBuySol || 0) > 0;
   const vol = (s.vol5 || 0) > 0 || (c.volume?.m5 || 0) > 0;
-  // Short DexScreener tapes (tot < 4) are common on new pump.fun coins — use flow/volume too.
   const buyPress = net && (tot >= 3 ? r5 >= 0.52 : (r5 >= 0.55 || (c.flow?.netBuySol || 0) > 0 || tot >= 1));
   const prevVol = hist.length >= 2 ? (hist[hist.length - 2].vol5 || 0) : 0;
   const volAccel = s.vol5 > 0 && prevVol > 0 && s.vol5 >= prevVol * 1.15;
@@ -363,14 +348,11 @@ export function momentumConfirm(c: Candidate, hist: TapeSnap[] = [], now = Date.
   const freshVol = vol && (pxUp || (c.flow?.netBuySol || 0) > 0);
   const thrust = s.m5 >= 1.2 || volAccel || freshVol || (vol && pxUp);
   if (buyPress && thrust) return { ok: true, reason: 'buy pressure + volume thrust' };
-  // Fresh curve with net buy flow and some volume: enter immediately, still skip dead tape.
   const freshCurve = !!c.curve && !c.curve.graduated;
   if (freshCurve && tot < 4 && net && vol) return { ok: true, reason: 'fresh curve buy flow' };
   return { ok: false, reason: !buyPress ? 'no buy pressure' : 'no thrust' };
 }
 
-
-/** True when the move has already extended — chasing here is usually late. */
 export function alreadyPumpedHard(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): boolean {
   const s = hist[hist.length - 1] || toSnap(now, c);
   if ((s.m5 || 0) >= 25 || (s.m15 || 0) >= 40 || (s.h1 || 0) >= 60) return true;
@@ -386,10 +368,8 @@ export function alreadyPumpedHard(c: Candidate, hist: TapeSnap[] = [], now = Dat
   return false;
 }
 
-/** True when the coin is actively pumping right now — any venue, age, or size. */
 export function currentlyPumping(c: Candidate, _now = Date.now()): { ok: boolean; reason: string } {
   const m5 = c.change?.m5 || 0;
-  const m15 = c.change?.m15 || 0;
   const buys = c.txns?.m5b || 0;
   const sells = c.txns?.m5s || 0;
   const r5 = buys + sells > 0 ? buys / (buys + sells) : 0;
@@ -399,263 +379,6 @@ export function currentlyPumping(c: Candidate, _now = Date.now()): { ok: boolean
   if (!active) return { ok: false, reason: 'no flow' };
   if (m5 <= -3) return { ok: false, reason: 'dumping' };
   if (m5 >= 0.3 && (net || r5 >= 0.5)) return { ok: true, reason: `pumping +${m5.toFixed(1)}% 5m` };
-  if (m5 >= 0 && r5 >= 0.52) return { ok: true, reason: `pumping buy pressure ${Math.round(r5 * 100)}%` };
-  if (m15 >= 2 && m5 >= -1 && net) return { ok: true, reason: `pumping +${m15.toFixed(0)}% 15m` };
-  const volAccel = (c.volume?.h1 || 0) > 0 ? (vol5 * 12) / c.volume.h1 : 0;
-  if (volAccel >= 1.05 && m5 >= 0) return { ok: true, reason: 'pumping volume accel' };
-  if (c.curve && !c.curve.graduated && net && m5 >= 0) return { ok: true, reason: 'pumping curve buy flow' };
-  return { ok: false, reason: 'not pumping' };
-}
-
-/**
- * Primary entry: a new coin's first pullback after a modest impulse, bought as it
- * reclaims or bounces with buy pressure — before a large second-leg pump.
- */
-export function firstPullback(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { ok: boolean; reason: string } {
-  const snap = toSnap(now, c);
-  const h = hist.length ? hist : [snap];
-  if (h[h.length - 1].t !== snap.t) h.push(snap);
-  const s = h[h.length - 1];
-  if (alreadyPumpedHard(c, h, now)) return { ok: false, reason: 'already pumped' };
-  if (c.flow?.devSold) return { ok: false, reason: 'dev selling' };
-  const r5 = buyRatio(s.b5, s.s5);
-  const net = (s.b5 - s.s5) > 0 || (c.flow?.netBuySol || 0) > 0;
-  const bouncing = h.length >= 2 ? s.px >= h[h.length - 2].px : (s.m5 || 0) >= -2;
-  if (!bouncing || !net || r5 < 0.52) return { ok: false, reason: 'no reclaim' };
-
-  const prices = h.map((x) => x.px).filter((x) => x > 0);
-  if (prices.length >= 3) {
-    const first = prices[0];
-    // First rising run and its peak, then the first trough after that peak.
-    let runPeak = prices[0], runPeakI = 0;
-    for (let i = 1; i < prices.length; i++) {
-      if (prices[i] >= runPeak * 0.998) { runPeak = Math.max(runPeak, prices[i]); runPeakI = i; }
-      else break;
-    }
-    const after = prices.slice(runPeakI);
-    const trough = Math.min(...after);
-    const troughI = runPeakI + after.indexOf(trough);
-    const laterHigh = Math.max(...prices.slice(troughI));
-    if (laterHigh > runPeak * 1.08) return { ok: false, reason: 'second leg already started' };
-    const impulse = first > 0 ? (runPeak / first - 1) * 100 : 0;
-    const dip = runPeak > 0 ? (1 - trough / runPeak) * 100 : 0;
-    const last = prices[prices.length - 1];
-    if (last < trough * 1.008) return { ok: false, reason: 'still falling' };
-    if (impulse >= 4 && impulse <= 35 && dip >= 3 && dip <= 18)
-      return { ok: true, reason: `first pullback ${dip.toFixed(1)}% after +${impulse.toFixed(0)}% · buy pressure` };
-  }
-
-  // Short tape (new pump.fun coin): 15m impulse, 5m fade, now reclaiming with buy flow.
-  const ageMin = s.age ? (now - s.age) / 60_000 : (c.createdAt ? (now - c.createdAt) / 60_000 : 0);
-  const fresh = ageMin <= 90 || (!!c.curve && !c.curve.graduated) || c.universe === 'new';
-  if (fresh && (s.m15 || 0) >= 5 && (s.m15 || 0) < 40 && (s.h1 || 0) < 50) {
-    const pulled = (s.m5 || 0) <= (s.m15 || 0) - 3 && (s.m5 || 0) <= 12 && (s.m5 || 0) >= -10;
-    if (pulled)
-      return { ok: true, reason: `first pullback · m15 ${(s.m15 || 0).toFixed(0)}% then m5 ${(s.m5 || 0).toFixed(0)}% reclaim · buy pressure` };
-  }
-  return { ok: false, reason: 'no first pullback' };
-}
-
-/** Primary: first pullback on a new coin. Secondary: other unpumped momentum signals. */
-export function entrySignal(c: Candidate, hist: TapeSnap[], p: StratParams = STRAT_DEFAULTS, now = Date.now()): { ok: boolean; reason: string } {
-  const snap = toSnap(now, c);
-  const h = hist.length ? hist : [snap];
-  if (h[h.length - 1].t !== snap.t) h.push(snap);
-  if (alreadyPumpedHard(c, h, now)) return { ok: false, reason: 'already pumped' };
-  const fp = firstPullback(c, h, now);
-  if (fp.ok) return fp;
-  // Secondary: reclaim/bounce/buy-candle on coins that have not already pumped hard.
-  const dip = dipReclaim(h);
-  if (dip.ok) return dip;
-  const r5 = buyRatio(snap.b5, snap.s5);
-  if (h.length >= 3 && snap.m5 < 0 && snap.px > h[h.length - 2].px && r5 >= 0.55 && (snap.b5 - snap.s5) > 0)
-    return { ok: true, reason: 'bounce · buy flow returning' };
-  const whale = (c.flow?.whaleBuyUsd || 0) >= 30;
-  if (whale && h.length >= 2) {
-    const peak = Math.max(...h.map((x) => x.px).filter((x) => x > 0));
-    const dipPct = peak > 0 ? (1 - snap.px / peak) * 100 : 0;
-    if (dipPct >= 2 && dipPct <= 18 && r5 >= 0.55 && snap.px >= h[h.length - 2].px)
-      return { ok: true, reason: `dip-buy after whale · dip ${dipPct.toFixed(1)}%` };
-  }
-  // 1s candles on a 2-tick pump tape are noise, not a real first pullback.
-  const candle = buyCandlePattern(h);
-  if (candle.ok && /higher lows/.test(candle.reason) && !candle.reason.includes('1s') && h.length >= 4)
-    return candle;
-  return { ok: false, reason: 'no signal' };
-}
-
-export function momentumBreakdown(c: Candidate | undefined, s: TapeSnap, hist: TapeSnap[] = [], opts: { sensitivity?: number } = {}): { exit: boolean; reason: string } {
-  const flow = c?.flow;
-  if (flow?.devSold) return { exit: true, reason: 'momentum break · dev/top-holder selling' };
-  if ((flow?.largeSells || 0) >= 1 && (flow!.largeSells || 0) > (flow!.largeBuys || 0))
-    return { exit: true, reason: 'momentum break · large sell' };
-  const sens = Math.min(1.35, Math.max(0.75, opts.sensitivity || 1));
-  const r5 = buyRatio(s.b5, s.s5);
-  const tot = s.b5 + s.s5;
-  const r5Cut = Math.min(0.55, Math.max(0.40, 0.48 * sens));
-  if (tot >= 6 && (s.b5 - s.s5) < 0 && r5 < r5Cut) return { exit: true, reason: 'momentum break · net sell flow' };
-  if (hist.length >= 3) {
-    const volCut = Math.min(0.55, Math.max(0.3, 0.4 / sens));
-    const prevVol = Math.max(...hist.slice(0, Math.max(1, hist.length - 1)).map((h) => h.vol5 || 0));
-    if (prevVol > 0 && s.vol5 < prevVol * volCut && r5 < 0.5 && tot >= 4)
-      return { exit: true, reason: 'momentum break · buy volume collapse' };
-    const peakI = hist.reduce((bi, h, i) => (h.px >= hist[bi].px ? i : bi), 0);
-    const peak = hist[peakI]?.px || 0;
-    const llDrop = 12 / sens;
-    if (peak > 0 && peakI < hist.length - 2) {
-      const minAfter = Math.min(...hist.slice(peakI).map((h) => h.px));
-      const drop = (1 - minAfter / peak) * 100;
-      if (drop >= llDrop && s.px <= minAfter * 1.002 && s.px < peak * (1 - llDrop / 100))
-        return { exit: true, reason: 'momentum break · lower low after peak' };
-    }
-  }
-  return { exit: false, reason: '' };
-}
-
-/** Typical AMM/curve swap fee, used as a percentage haircut on mark-based TP. */
-export const SWAP_FEE_BPS = 25;
-/** Fixed network fees (priority/base) are capped at this % of cost so tiny paper
- *  positions can still reach the take-profit target. ATA rent is refundable and ignored. */
-export const FIXED_FEE_CAP_PCT = 1;
-
-export type NetPnlOpts = { extraSlippageBps?: number; feeUsd?: number; swapFeeBps?: number; fixedFeeCapPct?: number };
-
-function cappedFeeUsd(costUsd: number, feeUsd: number, capPct = FIXED_FEE_CAP_PCT): number {
-  const raw = Math.max(0, feeUsd || 0);
-  if (!(costUsd > 0)) return 0;
-  return Math.min(raw, costUsd * (Math.max(0, capPct) / 100));
-}
-
-function pctHaircut(opts: NetPnlOpts): number {
-  const slip = Math.max(0, opts.extraSlippageBps || 0);
-  const swap = Math.max(0, opts.swapFeeBps ?? SWAP_FEE_BPS);
-  return (slip + swap) / 1e4;
-}
-
-/** Estimated net PnL % after a paper sell on the mark: percentage swap fee + slippage,
- *  minus a capped slice of fixed network fees. Rent is refunded and not deducted. */
-export function estimatedNetPnlPct(
-  pos: { entryPrice: number; qty?: number; costUsd?: number },
-  price: number,
-  opts: NetPnlOpts = {},
-): number {
-  if (!(price > 0) || !(pos.entryPrice > 0)) return 0;
-  const hair = pctHaircut(opts);
-  const cost = pos.costUsd || 0;
-  const fee = cappedFeeUsd(cost, opts.feeUsd || 0, opts.fixedFeeCapPct);
-  if ((pos.qty || 0) > 0 && cost > 0) {
-    const net = pos.qty! * price * (1 - hair) - fee;
-    return ((net - cost) / cost) * 100;
-  }
-  const fromEntry = (price / pos.entryPrice - 1) * 100;
-  return fromEntry - hair * 100;
-}
-
-/** Realized-style net PnL % from a sell quote. Fixed fees are capped as a % of cost;
- *  rent is not included in feesSol and is not deducted. */
-export function netPnlFromSellQuote(costUsd: number, solReceived: number, feesSol: number, solPrice: number, opts: { fixedFeeCapPct?: number } = {}): number {
-  if (!(costUsd > 0) || !(solPrice > 0)) return 0;
-  const feeUsd = cappedFeeUsd(costUsd, Math.max(0, feesSol) * solPrice, opts.fixedFeeCapPct);
-  const proceeds = solReceived * solPrice - feeUsd;
-  return ((proceeds - costUsd) / costUsd) * 100;
-}
-
-/** Giveback from peak that trails a runner after the TP floor is armed. */
-export const RUNNER_TRAIL_PCT = 12;
-/** First scale-out when a runner prints the TP floor. */
-export const RUNNER_PARTIAL_PCT = 50;
-
-/**
- * Strong movers keep running past the TP floor: still pumping / holding highs,
- * or already extended well past the scalp target. Weak / flat prints take the floor.
- */
-export function isStrongRunner(
-  pos: PosMark,
-  price: number,
-  c: Candidate | undefined,
-  hist: TapeSnap[] = [],
-  opts: { takeProfitPct?: number; now?: number } = {},
-): boolean {
-  if (!(price > 0) || !(pos.entryPrice > 0)) return false;
-  const fromEntry = (price / pos.entryPrice - 1) * 100;
-  const peak = Math.max(pos.peakPrice || 0, price);
-  const fromPeak = peak > 0 ? (1 - price / peak) * 100 : 0;
-  const nearHighs = fromPeak <= RUNNER_TRAIL_PCT;
-  const tp = opts.takeProfitPct ?? 0;
-  const extended = fromEntry >= Math.max(8, (tp > 0 ? tp : 1.8) * 3);
-  const now = opts.now ?? Date.now();
-  if (c) {
-    const s = hist[hist.length - 1] || toSnap(now, c);
-    if (momentumBreakdown(c, s, hist).exit) return false;
-    const pump = currentlyPumping(c, now);
-    const conf = momentumConfirm(c, hist, now);
-    const m5 = c.change?.m5 ?? s.m5 ?? 0;
-    if (!nearHighs) return false;
-    return pump.ok || conf.ok || m5 > 0 || extended;
-  }
-  // No tape: only a clearly extended move holding highs is treated as a runner.
-  return nearHighs && extended;
-}
-
-/** Paper/live exits: TP is a floor for weak hands; runners scale then trail /
- *  exit on momentum break. Catastrophic / rug stop is the backstop. */
-export function liveExit(
-  pos: PosMark & { entryLiq?: number; qty?: number; costUsd?: number },
-  price: number,
-  c: Candidate | undefined,
-  hist: TapeSnap[],
-  opts: { catStopPct?: number; sensitivity?: number; takeProfitPct?: number; extraSlippageBps?: number; feeUsd?: number; runnerTrailPct?: number; now?: number } = {},
-): { exit: boolean; kind: ExitKind | null; reason: string; partial: boolean; peak: number } {
-  const cat = opts.catStopPct ?? 35;
-  const peak = Math.max(pos.peakPrice, price);
-  if (!(price > 0)) return { exit: false, kind: null, reason: 'no price', partial: false, peak };
-  const fromEntry = (price / pos.entryPrice - 1) * 100;
-  if (pos.entryLiq && pos.entryLiq > 0 && (c?.liquidityUsd || 0) > 0 && c!.liquidityUsd < pos.entryLiq * 0.4)
-    return { exit: true, kind: 'hard_stop', reason: `rug · liquidity pulled (${fromEntry.toFixed(1)}%)`, partial: false, peak };
-  if (fromEntry <= -cat)
-    return { exit: true, kind: 'hard_stop', reason: `catastrophic stop -${cat}% (${fromEntry.toFixed(1)}%)`, partial: false, peak };
-  const tp = opts.takeProfitPct ?? 0;
-  const net = estimatedNetPnlPct(pos, price, { extraSlippageBps: opts.extraSlippageBps, feeUsd: opts.feeUsd });
-  const runner = isStrongRunner(pos, price, c, hist, { takeProfitPct: tp, now: opts.now });
-  if (tp > 0 && net >= tp) {
-    if (runner) {
-      if (!pos.partialTaken)
-        return { exit: true, kind: 'partial_tp', reason: `scale ${RUNNER_PARTIAL_PCT}% at +${net.toFixed(1)}% net (runner, floor +${tp}%)`, partial: true, peak };
-      // Remainder rides until a trail or momentum break.
-    } else {
-      return { exit: true, kind: 'take_profit', reason: `take profit +${net.toFixed(1)}% net (target +${tp}%)`, partial: false, peak };
-    }
-  }
-  const armed = !!pos.partialTaken || (tp > 0 && (net >= tp || fromEntry >= tp));
-  const trailPct = opts.runnerTrailPct ?? RUNNER_TRAIL_PCT;
-  if (armed && trailPct > 0 && peak > 0) {
-    const trail = peak * (1 - trailPct / 100);
-    if (price <= trail)
-      return { exit: true, kind: 'trailing_stop', reason: `trailing ${fromEntry.toFixed(1)}% (−${((1 - price / peak) * 100).toFixed(1)}% from top)`, partial: false, peak };
-  }
-  const s = hist[hist.length - 1] || (c ? toSnap(opts.now ?? Date.now(), c) : undefined);
-  if (s) {
-    const br = momentumBreakdown(c, s, hist, { sensitivity: opts.sensitivity });
-    if (br.exit) return { exit: true, kind: 'momentum_fade', reason: br.reason, partial: false, peak };
-  }
-  return { exit: false, kind: null, reason: '', partial: false, peak };
-}
-
-/** Combine entry rules as bonuses and penalties. Nothing here blocks a buy. */
-export function signalAdjustments(c: Candidate, hist: TapeSnap[] = [], now = Date.now()): { adj: number; notes: string[]; why: string } {
-  const notes: string[] = [];
-  let adj = 0;
-  const pump = currentlyPumping(c, now);
-  if (pump.ok) { adj += 10; notes.push(`${pump.reason} +10`); }
-  const fp = firstPullback(c, hist, now);
-  if (fp.ok) { adj += 6; notes.push('first pullback +6'); }
-  // Only penalize an exhausted pump (already extended AND fading), not a live move we want to scalp.
-  if (alreadyPumpedHard(c, hist, now) && (c.change?.m5 || 0) <= 0) { adj -= 8; notes.push('already pumped −8'); }
-  const conf = momentumConfirm(c, hist, now);
-  if (conf.ok) { adj += 8; notes.push('momentum +8'); }
-  else if (conf.reason === 'dumping') { adj -= 8; notes.push('dumping −8'); }
-  const sig = entrySignal(c, hist, STRAT_DEFAULTS, now);
-  if (sig.ok && !fp.ok && !pump.ok) { adj += 6; notes.push(`${sig.reason} +6`); }
-  const why = pump.ok ? pump.reason : fp.ok ? fp.reason : sig.ok ? sig.reason : conf.ok ? conf.reason : (notes[0] || 'score');
-  return { adj, notes, why };
+  if (m5 >= 0 && r5 >= 0.55 && vol5 > 0) return { ok: true, reason: 'steady buy flow' };
+  return { ok: false, reason: 'no pump' };
 }
