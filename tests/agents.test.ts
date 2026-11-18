@@ -72,27 +72,41 @@ test('live mode needs mode=live AND the exact confirmation phrase', () => {
   assert.equal(liveGate({ ...DEFAULTS, mode: 'live', liveConfirm: 'yes' }).live, false);
   assert.equal(liveGate({ ...DEFAULTS, mode: 'live', liveConfirm: LIVE_CONFIRM_PHRASE }).live, true);
 });
-test('config sanitize: min $2 start, live-auto kept, bogus mode -> paper', () => {
+test('config sanitize + stable defaults (Nov 2026)', () => {
   assert.equal(sanitize({ startUsd: 3 }).startUsd, 3);
   assert.equal(sanitize({ startUsd: 1 }).startUsd, 2);
   assert.equal(sanitize({ mode: 'live-auto' as any }).mode, 'live-auto');
   assert.equal(sanitize({ mode: 'yolo' as any }).mode, 'paper');
-  assert.equal(DEFAULTS.takeProfitPct, 1.8);
-  assert.equal(DEFAULTS.positionPct, 1);
-  assert.equal(DEFAULTS.scanIntervalSec, 2.5);
-  assert.equal(DEFAULTS.minScore, 40);
+  // Stable defaults
+  assert.equal(DEFAULTS.takeProfitPct, 2.5);
+  assert.equal(DEFAULTS.positionPct, 5);
+  assert.equal(DEFAULTS.hardStopPct, 7);
+  assert.equal(DEFAULTS.trailingStopPct, 10);
+  assert.equal(DEFAULTS.maxHoldMin, 30);
+  assert.equal(DEFAULTS.scanIntervalSec, 3);
+  assert.equal(DEFAULTS.minScore, 42);
   assert.equal(sanitize({ takeProfitPct: 5 }).takeProfitPct, 5);
-  const migrated = migrateStockDefaults({ minScore: 48, positionPct: 8, takeProfitPct: 3, scanIntervalSec: 6, redExitSec: 45 });
-  assert.equal(migrated.minScore, 40);
-  assert.equal(migrated.positionPct, 1);
-  assert.equal(migrated.takeProfitPct, 1.8);
-  assert.equal(migrated.scanIntervalSec, 2.5);
-  assert.equal(migrated.redExitSec, 45);
-  const custom = migrateStockDefaults({ minScore: 52, positionPct: 5, takeProfitPct: 4, scanIntervalSec: 3 });
+  // Migration forces old known-bad values to stable set
+  const migrated = migrateStockDefaults({ minScore: 48, positionPct: 8, takeProfitPct: 3, scanIntervalSec: 6, hardStopPct: 35, trailingStopPct: 60, maxHoldMin: 0 });
+  assert.equal(migrated.minScore, 42);
+  assert.equal(migrated.positionPct, 5);
+  assert.equal(migrated.takeProfitPct, 2.5);
+  assert.equal(migrated.scanIntervalSec, 3);
+  assert.equal(migrated.hardStopPct, 7);
+  assert.equal(migrated.trailingStopPct, 10);
+  assert.equal(migrated.maxHoldMin, 30);
+  // Custom user values are preserved
+  const custom = migrateStockDefaults({ minScore: 52, positionPct: 6, takeProfitPct: 4, scanIntervalSec: 4, hardStopPct: 9, trailingStopPct: 12 });
   assert.equal(custom.minScore, 52);
-  assert.equal(custom.positionPct, 5);
+  assert.equal(custom.positionPct, 6);
   assert.equal(custom.takeProfitPct, 4);
-  assert.equal(custom.scanIntervalSec, 3);
-  assert.equal(sanitize({ takeProfitPct: -1 }).takeProfitPct, 0);
+  assert.equal(custom.scanIntervalSec, 4);
+  assert.equal(custom.hardStopPct, 9);
+  assert.equal(custom.trailingStopPct, 12);
+  // Sanitize clamps
+  assert.equal(sanitize({ takeProfitPct: -1 }).takeProfitPct, 0.5);
   assert.equal(sanitize({ takeProfitPct: 99 }).takeProfitPct, 50);
+  assert.equal(sanitize({ hardStopPct: 1 }).hardStopPct, 3);
+  assert.equal(sanitize({ hardStopPct: 50 }).hardStopPct, 25);
+  assert.equal(sanitize({ positionPct: 50 }).positionPct, 25);
 });
