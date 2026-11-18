@@ -193,13 +193,16 @@ export function evaluateExit(p: RiskParams, pos: Pick<Position, 'entryPrice' | '
 }
 
 export function momentumEntryOk(c: Candidate): boolean {
+  // Small-book gate: only coins that are already pumping with real buy pressure.
   const b5 = c.txns.m5b, s5 = c.txns.m5s;
   const r5 = b5 + s5 > 0 ? b5 / (b5 + s5) : 0;
   const volAccel = c.volume.h1 > 0 ? (c.volume.m5 * 12) / c.volume.h1 : (c.volume.m5 > 0 ? 2 : 0);
-  if (c.change.m5 < 2) return false;
-  if (c.change.m5 > 80) return false; // blow-off
-  if (r5 < 0.55) return false;
-  if (volAccel < 0.9) return false;
+  if (c.change.m5 < 4) return false;          // need clear 5m lift
+  if (c.change.m5 > 55) return false;         // avoid late blow-off
+  if ((c.change.m15 || 0) < 1) return false;  // 15m still positive
+  if (r5 < 0.58) return false;                // buy-side dominance
+  if ((b5 + s5) < 10) return false;           // enough flow
+  if (volAccel < 1.0) return false;           // volume accelerating
   return true;
 }
 
