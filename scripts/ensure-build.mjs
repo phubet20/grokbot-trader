@@ -1,5 +1,6 @@
 // Builds the web UI on first start (or if sources are newer than the build).
 // Restores strategy.ts / engine.ts if incomplete (e.g. truncated push).
+// Engine/strategy restore must succeed even if the web build fails.
 import { existsSync, statSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -31,7 +32,6 @@ function needsEngineRestore() {
 
 function patchStableDefaults(src) {
   let out = src;
-  // Momentum-scalp profile (matches server/config.ts DEFAULTS).
   out = out.replace(/hardStopPct:\s*\d+(\.\d+)?([,\s])/, 'hardStopPct: 6$2');
   out = out.replace(/trailingStopPct:\s*\d+(\.\d+)?([,\s])/, 'trailingStopPct: 7$2');
   out = out.replace(/takeProfitPct:\s*\d+(\.\d+)?([,\s])/, 'takeProfitPct: 2$2');
@@ -54,7 +54,6 @@ function patchStableDefaults(src) {
 }
 
 function patchEnginePause(src) {
-  // If still using force-resume-on-pause, rewrite to respect explicit stop.
   if (src.includes('stays paused after restart until you change it')) return src;
   const old = `  setRunning(r: boolean) {
     this.wallet.running = r;
@@ -140,11 +139,15 @@ function buildWeb() {
     console.warn('[build] web/package.json missing; skip UI build');
     return;
   }
-  if (!existsSync(join(root, 'web/node_modules'))) {
-    execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
+  try {
+    if (!existsSync(join(root, 'web/node_modules'))) {
+      execSync('npm install --no-audit --no-fund', { cwd: join(root, 'web'), stdio: 'inherit' });
+    }
+    console.log('[build] building web UI...');
+    execSync('npx vite build', { cwd: join(root, 'web'), stdio: 'inherit' });
+  } catch (e) {
+    console.warn('[build] web UI build failed (server can still run):', e?.message || e);
   }
-  console.log('[build] building web UI...');
-  execSync('npx vite build', { cwd: join(root, 'web'), stdio: 'inherit' });
 }
 
 await restoreEngine().catch((e) => console.warn('[engine] restore failed:', e?.message || e));
