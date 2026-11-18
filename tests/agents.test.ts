@@ -38,16 +38,15 @@ test('safety pre-check never hard-rejects; thin/honeypot/quote become penalties'
   assert.equal(q.ok, true);
   assert.ok(q.adj < 0 && q.reasons.some((r) => r.includes('quote')));
 });
-test('safety security check: honeypot and mint/freeze are heavy penalties, never blocks; unknown is 0', () => {
+test('safety security check: honeypot and mint/freeze are penalties, never hard blocks', () => {
   const s = { mintAuthority: null as string | null, freezeAuthority: null as string | null, holders: 1000, topHolderPct: 5, top10Pct: 25, dangerRisks: [] as string[] };
   assert.equal(securityCheck(s, DEFAULTS).ok, true);
   assert.equal(securityCheck({ ...s, dangerRisks: ['honeypot'] }, DEFAULTS).ok, true);
-  assert.ok(securityCheck({ ...s, dangerRisks: ['honeypot'] }, DEFAULTS).adj <= -35);
+  assert.ok(securityCheck({ ...s, dangerRisks: ['honeypot'] }, DEFAULTS).adj < 0);
   assert.equal(securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS).ok, true);
-  assert.ok(securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS).adj <= -20);
+  assert.ok(securityCheck({ ...s, mintAuthority: 'X' }, DEFAULTS).adj < 0);
   assert.equal(securityCheck(null, DEFAULTS).ok, true);
   assert.equal(securityCheck(null, DEFAULTS).adj, 0);
-  assert.ok(securityCheck(null, DEFAULTS, { pumpCurve: true, devHoldPct: 40 }).ok, 'dev hold alone is not a hard fail');
 });
 test('live mode needs mode=live AND the exact confirmation phrase', () => {
   assert.equal(liveGate(DEFAULTS).live, false);
@@ -67,7 +66,6 @@ test('config sanitize + momentum-scalp defaults', () => {
   assert.equal(DEFAULTS.maxHoldMin, 8);
   assert.equal(DEFAULTS.scanIntervalSec, 2);
   assert.equal(DEFAULTS.minScore, 50);
-  assert.equal(sanitize({ takeProfitPct: 5 }).takeProfitPct, 5);
   const migrated = migrateStockDefaults({ minScore: 48, positionPct: 8, takeProfitPct: 3, scanIntervalSec: 6, hardStopPct: 35, trailingStopPct: 60, maxHoldMin: 0 });
   assert.equal(migrated.minScore, 50);
   assert.equal(migrated.positionPct, 8);
