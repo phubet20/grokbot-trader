@@ -32,18 +32,18 @@ function needsEngineRestore() {
 
 function patchStableDefaults(src) {
   let out = src;
-  out = out.replace(/hardStopPct:\s*\d+(\.\d+)?([,\s])/, 'hardStopPct: 6$2');
-  out = out.replace(/trailingStopPct:\s*\d+(\.\d+)?([,\s])/, 'trailingStopPct: 7$2');
-  out = out.replace(/takeProfitPct:\s*\d+(\.\d+)?([,\s])/, 'takeProfitPct: 2$2');
-  out = out.replace(/maxHoldMin:\s*\d+([,\s])/, 'maxHoldMin: 8$1');
+  out = out.replace(/hardStopPct:\s*\d+(\.\d+)?([,\s])/, 'hardStopPct: 5$2');
+  out = out.replace(/trailingStopPct:\s*\d+(\.\d+)?([,\s])/, 'trailingStopPct: 5$2');
+  out = out.replace(/takeProfitPct:\s*\d+(\.\d+)?([,\s])/, 'takeProfitPct: 3.5$2');
+  out = out.replace(/maxHoldMin:\s*\d+([,\s])/, 'maxHoldMin: 5$1');
   out = out.replace(/partialPct:\s*50([,\s])/, 'partialPct: 0$1');
-  out = out.replace(/breakevenAtPct:\s*1\.8([,\s])/, 'breakevenAtPct: 1.2$1');
-  out = out.replace(/minAgeMin:\s*3([,\s])/, 'minAgeMin: 1$1');
-  out = out.replace(/minLiq:\s*[\d_]+/, 'minLiq: 3_000');
-  out = out.replace(/minMcap:\s*[\d_]+/, 'minMcap: 5_000');
-  out = out.replace(/maxMcap:\s*[\d_]+/, 'maxMcap: 30_000_000');
-  out = out.replace(/minBuyRatio5:\s*0\.\d+/, 'minBuyRatio5: 0.58');
-  out = out.replace(/minTx5:\s*\d+([,\s])/, 'minTx5: 10$1');
+  out = out.replace(/breakevenAtPct:\s*[\d.]+([,\s])/, 'breakevenAtPct: 1.5$1');
+  out = out.replace(/minAgeMin:\s*\d+([,\s])/, 'minAgeMin: 1$1');
+  out = out.replace(/minLiq:\s*[\d_]+/, 'minLiq: 5_000');
+  out = out.replace(/minMcap:\s*[\d_]+/, 'minMcap: 8_000');
+  out = out.replace(/maxMcap:\s*[\d_]+/, 'maxMcap: 25_000_000');
+  out = out.replace(/minBuyRatio5:\s*0\.\d+/, 'minBuyRatio5: 0.60');
+  out = out.replace(/minTx5:\s*\d+([,\s])/, 'minTx5: 12$1');
   if (!out.includes('Risk numbers here must stay consistent')) {
     out = out.replace(
       '// Used by the engine and the tape backtester so research and production stay aligned.\n',
@@ -142,7 +142,7 @@ async function restoreStrategy() {
   const src = await res.text();
   if (!src.includes('export function liveExit')) throw new Error('unexpected strategy content');
   writeFileSync(stratPath, patchStableDefaults(src));
-  console.log('[strategy] restored from main and patched scalp defaults (hard 6% / trail 7% / TP 2% / hold 8m)');
+  console.log('[strategy] restored from main and patched scalp defaults (hard 5% / trail 5% / TP 3.5% / hold 5m (live))');
 }
 
 async function restoreEngine() {
