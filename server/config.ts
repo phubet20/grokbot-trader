@@ -1,6 +1,6 @@
 // Central configuration. Single source of truth for all risk and runtime params.
 // MODE is "paper" unless explicitly changed AND confirmed (see liveGate()).
-// Paper and live-auto use the SAME entry/exit profile — paper is the dry-run of live.
+// Live-auto uses this scalp profile. Tuned for real fees/slippage, not paper cosmetics.
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -47,9 +47,14 @@ export type Config = {
 };
 
 /**
- * Momentum-scalp defaults (Nov 2026).
- * Same profile for paper and live-auto: short holds, tight stops, only coins
- * that are already moving. Tuned for small books that cannot sit in dead coins.
+ * Live-money momentum scalp (Nov 2026).
+ *
+ * Design for real Solana fills (not paper):
+ * - TP high enough that round-trip fees + impact still leave net profit
+ * - Stops tight so losers do not sit through meme dumps
+ * - Larger ticket % so fixed fees are a smaller share of size
+ * - Cap concurrent positions; strict score + liquidity so weak coins never enter
+ * - Slightly higher priority fee so exits land when the book is moving
  */
 export const DEFAULTS: Config = {
   appName: 'Grok Bot',
@@ -57,29 +62,32 @@ export const DEFAULTS: Config = {
   dataSource: 'live',
   port: 8787,
   startUsd: 81,
-  positionPct: 8,
+  // Fewer, fuller tickets beat many fee-eaten micro trades on small books.
+  positionPct: 12,
   minTradeUsd: 0,
-  maxPositions: 0,
-  takeProfitPct: 2,
-  hardStopPct: 6,
-  trailingStopPct: 7,
-  maxHoldMin: 8,
-  redExitSec: 35,
-  dailyLossLimitPct: 12,
-  cooldownMin: 1,
-  minScore: 50,
-  minLiquidityUsd: 3000,
+  // Hard cap concurrent risk on live capital.
+  maxPositions: 3,
+  // Gross move must clear ~1–1.5% round-trip friction on small size.
+  takeProfitPct: 3.5,
+  hardStopPct: 5,
+  trailingStopPct: 5,
+  maxHoldMin: 5,
+  redExitSec: 25,
+  dailyLossLimitPct: 10,
+  cooldownMin: 2,
+  minScore: 55,
+  minLiquidityUsd: 5_000,
   maxLiquidityUsd: 50_000_000,
-  minHolders: 50,
+  minHolders: 60,
   minAgeMin: 1,
-  maxAgeHours: 24,
-  minMcapUsd: 5_000,
-  maxMcapUsd: 30_000_000,
-  maxTopHolderPct: 20,
-  slippageBps: 400,
-  extraSlippageBps: 50,
-  priorityFeeSol: 0.0002,
-  scanIntervalSec: 2,
+  maxAgeHours: 18,
+  minMcapUsd: 8_000,
+  maxMcapUsd: 25_000_000,
+  maxTopHolderPct: 18,
+  slippageBps: 500,
+  extraSlippageBps: 75,
+  priorityFeeSol: 0.00035,
+  scanIntervalSec: 2.5,
   monitorIntervalSec: 1,
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   liveConfirm: '',
@@ -132,18 +140,25 @@ export function sanitize(c: Partial<Config>): Partial<Config> {
 /** Only rewrite known stock defaults from older builds — never overwrite intentional custom values. */
 export function migrateStockDefaults(file: Partial<Config>): Partial<Config> {
   const out: Partial<Config> = { ...file };
-  if (out.hardStopPct === 35 || out.hardStopPct === 8) out.hardStopPct = DEFAULTS.hardStopPct;
-  if (out.trailingStopPct === 60 || out.trailingStopPct === 10) out.trailingStopPct = DEFAULTS.trailingStopPct;
-  if (out.positionPct === 1 || out.positionPct === 5) out.positionPct = DEFAULTS.positionPct;
-  if (out.takeProfitPct === 1.8 || out.takeProfitPct === 3 || out.takeProfitPct === 2.5) out.takeProfitPct = DEFAULTS.takeProfitPct;
-  if (out.scanIntervalSec === 2.5 || out.scanIntervalSec === 6 || out.scanIntervalSec === 3) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
-  if (out.minScore === 40 || out.minScore === 48 || out.minScore === 42) out.minScore = DEFAULTS.minScore;
-  if (out.maxHoldMin === 0 || out.maxHoldMin === 30) out.maxHoldMin = DEFAULTS.maxHoldMin;
-  if (out.redExitSec === 60 || out.redExitSec === 45) out.redExitSec = DEFAULTS.redExitSec;
-  if (out.minLiquidityUsd === 1200) out.minLiquidityUsd = DEFAULTS.minLiquidityUsd;
-  if (out.minHolders === 40) out.minHolders = DEFAULTS.minHolders;
-  if (out.maxAgeHours === 48) out.maxAgeHours = DEFAULTS.maxAgeHours;
-  if (out.minMcapUsd === 2000) out.minMcapUsd = DEFAULTS.minMcapUsd;
+  // Previous stock / pre-live-scalp values → new live-money scalp
+  if (out.hardStopPct === 35 || out.hardStopPct === 8 || out.hardStopPct === 6) out.hardStopPct = DEFAULTS.hardStopPct;
+  if (out.trailingStopPct === 60 || out.trailingStopPct === 10 || out.trailingStopPct === 7) out.trailingStopPct = DEFAULTS.trailingStopPct;
+  if (out.positionPct === 1 || out.positionPct === 5 || out.positionPct === 8) out.positionPct = DEFAULTS.positionPct;
+  if (out.takeProfitPct === 1.8 || out.takeProfitPct === 2 || out.takeProfitPct === 2.5 || out.takeProfitPct === 3) out.takeProfitPct = DEFAULTS.takeProfitPct;
+  if (out.scanIntervalSec === 2 || out.scanIntervalSec === 6 || out.scanIntervalSec === 3) out.scanIntervalSec = DEFAULTS.scanIntervalSec;
+  if (out.minScore === 40 || out.minScore === 48 || out.minScore === 42 || out.minScore === 50) out.minScore = DEFAULTS.minScore;
+  if (out.maxHoldMin === 0 || out.maxHoldMin === 30 || out.maxHoldMin === 8) out.maxHoldMin = DEFAULTS.maxHoldMin;
+  if (out.redExitSec === 60 || out.redExitSec === 45 || out.redExitSec === 35) out.redExitSec = DEFAULTS.redExitSec;
+  if (out.maxPositions === 0) out.maxPositions = DEFAULTS.maxPositions;
+  if (out.dailyLossLimitPct === 12 || out.dailyLossLimitPct === 15) out.dailyLossLimitPct = DEFAULTS.dailyLossLimitPct;
+  if (out.cooldownMin === 0.25 || out.cooldownMin === 1) out.cooldownMin = DEFAULTS.cooldownMin;
+  if (out.minLiquidityUsd === 1200 || out.minLiquidityUsd === 3000) out.minLiquidityUsd = DEFAULTS.minLiquidityUsd;
+  if (out.minHolders === 40 || out.minHolders === 50) out.minHolders = DEFAULTS.minHolders;
+  if (out.maxAgeHours === 48 || out.maxAgeHours === 24) out.maxAgeHours = DEFAULTS.maxAgeHours;
+  if (out.minMcapUsd === 2000 || out.minMcapUsd === 5000) out.minMcapUsd = DEFAULTS.minMcapUsd;
+  if (out.maxTopHolderPct === 25 || out.maxTopHolderPct === 20) out.maxTopHolderPct = DEFAULTS.maxTopHolderPct;
+  if (out.slippageBps === 400) out.slippageBps = DEFAULTS.slippageBps;
+  if (out.priorityFeeSol === 0.0002) out.priorityFeeSol = DEFAULTS.priorityFeeSol;
   return out;
 }
 
